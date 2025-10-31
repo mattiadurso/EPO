@@ -4,11 +4,10 @@
 
 # I might want to use pypose, kornia and/or pytorch3d for this.
 import os
+from pickle import load
 import time
 import torch
 import torch.nn as nn
-
-import warnings
 
 import warnings
 
@@ -26,14 +25,15 @@ warnings.filterwarnings(
 
 
 from tqdm import tqdm
-from adjuster.helpers import (
-    build_view_graph_from_frustums,
+from helpers.load import (
     find_images,
-    load_and_preprocess_images_square,
-    load_and_preprocess_depths_square,
+    load_and_preprocess_images,
+    load_and_preprocess_depths,
 )
-
-from adjuster.extractors import CannyEdgeDetector
+from helpers.frustum import build_view_graph_from_frustums
+from extractors.canny import CannyEdgeDetector
+from modules.camera import Camera
+from modules.pose import Pose
 
 
 class Adjuster(nn.Module):
@@ -69,6 +69,11 @@ class Adjuster(nn.Module):
                 device=device,
             )
 
+        # what to train
+        self.grad_q = False
+        self.grad_t = True
+        self.grad_k = True
+
     def forward(
         self,
         images_path,
@@ -76,6 +81,8 @@ class Adjuster(nn.Module):
         reconstruction,
         max_steps=5_000,
         lr=1e-4,
+        single_camera_per_folder=True,
+        load_with_pad=True,
     ):
         """
         Main optimization loop.
@@ -85,6 +92,10 @@ class Adjuster(nn.Module):
             reconstruction (pycolmap.Reconstruction): Initial COLMAP reconstruction.
             max_steps (int): Maximum number of optimization steps.
             lr (float): Learning rate for the optimizer.
+            single_camera_per_folder (bool): If True, assumes that images in the same folder share the same camera intrinsics.
+            If False, each image has its own camera.
+            load_with_pad (bool): If True, images are resized to square with padding. Depth maps are resized accordingly.
+            Use this if images might have different aspect ratios, otherwise not needed, just waste of memory.
         """
         timings = {}
         time_start = time.time()
@@ -105,11 +116,12 @@ class Adjuster(nn.Module):
         # Load Images as dict {image_name: image_tensor}
         s_time = time.time()
         image_path_list = find_images(images_path)
-        images = load_and_preprocess_images_square(
+        images = load_and_preprocess_images(
             image_path_list,
             images_path,
             target_size=self.images_size,
             max_workers=self.max_workers,
+            load_with_pad=load_with_pad,
         )
         timings["load_images"] = time.time() - s_time
 
@@ -125,16 +137,22 @@ class Adjuster(nn.Module):
 
         # Load poses and intrinsics
         s_time = time.time()
-        images, intrinsics = self.read_cameras_from_reconstruction(recon, images)
+        images, intrinsics = self.read_cameras_from_reconstruction(
+            recon,
+            images,
+            single_camera_per_folder=single_camera_per_folder,
+            load_with_pad=load_with_pad,
+        )
         timings["load_poses_and_intrinsics"] = time.time() - s_time
 
         # Load depth maps
         s_time = time.time()
-        images = load_and_preprocess_depths_square(
+        images = load_and_preprocess_depths(
             depths_path,
             images,
             target_size=self.images_size,
             max_workers=self.max_workers,
+            load_with_pad=load_with_pad,
         )
         timings["load_depth_maps"] = time.time() - s_time
 
@@ -144,7 +162,12 @@ class Adjuster(nn.Module):
 
         if True:
             # # Optimizer
-            # NOTE: VGGT Translation is prone to error. An alternating round of optimization only for it? or bilirnear cost function
+            # NOTE: VGGT Translation is prone to error. An alternating round of optimization only for it? or bilinear cost function
+            # Start from optimizing only translations and intrinsics and depth
+            # create a wrapper class to load images, poses etc= like a custom reconstruction class
+            # then optimize using pypose optimizers (LM)?
+            # move loading functions to helpers.py or load.py
+            ###############
 
             # optimizer = torch.optim.Adam(self.parameters(), lr=lr)
 
@@ -204,15 +227,19 @@ class Adjuster(nn.Module):
             # return depth_maps, reconstruction
             pass
 
-    def print_timings(self, timings):
-        print("=" * 40)
-        print("Timings:")
-        print("-" * 40)
-
+    def print_timings(self, timings, w=None):
         # Define column widths
         key_width = 30
         val_width = 10
         perc_width = 8
+
+        # Calculate total width: key + value + percentage + spaces between
+        if w is None:
+            w = key_width + val_width + perc_width + 4  # +2 for spacing
+
+        print("\n" + "=" * w)
+        print("Timings:")
+        print("-" * w)
 
         for key, value in timings.items():
             if key == "total":
@@ -221,46 +248,44 @@ class Adjuster(nn.Module):
                 f"{key:<{key_width}}{value:>{val_width}.2f} s {((value / timings['total']) * 100):>{perc_width}.1f}%"
             )
 
-        print("-" * 40)
+        print("-" * w)
         print(f"{'total':<{key_width}}{timings['total']:>{val_width}.2f} s")
-        print("=" * 40)
+        print("=" * w)
 
-    def process_camera(self, camera):
+    def process_camera(self, camera, load_with_pad=False):
         # Convert a single pycolmap.Camera to torch tensor
+        cam_id = camera.camera_id
         model = camera.model.name
         params = camera.params
         width = camera.width
         height = camera.height
 
-        if model == "SIMPLE_PINHOLE" or model == "SIMPLE_RADIAL":
-            fx = params[0]
-            fy = params[0]
-            cx = params[1]
-            cy = params[2]
-        elif model == "PINHOLE" or model == "RADIAL":
-            fx = params[0]
-            fy = params[1]
-            cx = params[2]
-            cy = params[3]
+        if model == "SIMPLE_PINHOLE":  # or model == "SIMPLE_RADIAL":
+            f = params[0]
+            cx, cy = params[1], params[2]
+
+        elif model == "PINHOLE":  # or model == "RADIAL":
+            f = torch.tensor([params[0], params[1]], dtype=torch.float32)
+            cx, cy = params[2], params[3]
+
         else:
             raise NotImplementedError(f"Camera model {model} not supported.")
 
         # Account for padding when making square
         max_dim = max(width, height)
-        pad_x = (max_dim - width) // 2
-        pad_y = (max_dim - height) // 2
+        pad_x = (max_dim - width) // 2 if load_with_pad else 0
+        pad_y = (max_dim - height) // 2 if load_with_pad else 0
 
         # Scale factor after resize
         scale = self.images_size / max_dim
 
         # Apply padding shift + scale
-        fx = fx * scale
-        fy = fy * scale
+        f = f * scale
         cx = (cx + pad_x) * scale
         cy = (cy + pad_y) * scale
 
-        K = torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=torch.float32)
-        return K
+        params = torch.cat([f, torch.tensor([cx, cy], dtype=torch.float32)], dim=0)
+        return cam_id, model, params
 
     def process_pose(self, image):
         # Convert a single pycolmap.Image to torch tensor
@@ -270,33 +295,80 @@ class Adjuster(nn.Module):
             image.cam_from_world.translation, dtype=torch.float32
         ).unsqueeze(1)
 
-        # Build extrinsic matrix [R|t] (world-to-camera)
-        # This is correct for projection: x_cam = R * x_world + t
-        extrinsics = torch.cat([R, t], dim=1)  # 3x4 matrix
+        return R, t, image.camera_id
 
-        # Only build 4x4 if you need homogeneous coordinates
-        P = torch.cat(
-            [
-                extrinsics,
-                torch.tensor([[0, 0, 0, 1]], dtype=torch.float32),
-            ],
-            dim=0,
-        )
+    def read_cameras_from_reconstruction(
+        self,
+        reconstruction,
+        images,
+        single_camera_per_folder=False,
+        load_with_pad=False,
+    ):
 
-        return P, image.camera_id
-
-    def read_cameras_from_reconstruction(self, reconstruction, images):
-        # Read cameras intrinsics
         intrinsics = {}
-        for cam in reconstruction.cameras.values():
-            intrinsics[cam.camera_id] = self.process_camera(cam)
 
+        # Read cameras intrinsics
+        if single_camera_per_folder:
+            # Reading cameras from images (to handle multiple images with same camera)
+            for image in reconstruction.images.values():
+                _, model, new_params = self.process_camera(image.camera, load_with_pad)
+                cam_id = image.name.split("/")[
+                    0
+                ]  # assuming image names are like "cam_id/image_name"
+
+                # I want to stack params of same cam_id to then averaged them
+                if cam_id not in intrinsics:
+                    intrinsics[cam_id] = {
+                        "cam_id": cam_id,
+                        "model": model,
+                        "parameters": [new_params],  # Changed: store as list initially
+                    }
+                else:
+                    # Append new params to the list
+                    intrinsics[cam_id]["parameters"].append(new_params)
+
+            # Average params for each cam_id
+            for cam_id in intrinsics.keys():
+                params = intrinsics[cam_id]["parameters"]
+                if len(params) == 1:
+                    # only one image with this cam_id
+                    intrinsics[cam_id]["parameters"] = params[0]
+                else:
+                    # multiple images with this cam_id - stack and average
+                    intrinsics[cam_id]["parameters"] = torch.stack(params, dim=0).mean(
+                        dim=0
+                    )
+        else:  # one camera per image
+            # Reading cameras from images
+            for cam in reconstruction.cameras.values():
+                cam_id, model, new_params = self.process_camera(cam)
+                intrinsics[cam.camera_id] = {
+                    "cam_id": cam_id,
+                    "model": model,
+                    "parameters": new_params,
+                }
+        # Sort dict by keys
+        intrinsics = dict(sorted(intrinsics.items()))
+
+        # Convert to Camera objects
+        for cam_id in intrinsics.keys():
+            intrinsics[cam_id] = Camera(**intrinsics[cam_id], grad=self.grad_k)
+
+        # Read poses from images
         for image in reconstruction.images.values():
-            pose, cam_id = self.process_pose(image)
+            R, t, cam_id = self.process_pose(image)
+            pose = Pose(R=R, t=t, grad_q=self.grad_q)
+
+            if single_camera_per_folder:
+                cam_id = image.name.split("/")[0]
+            else:
+                cam_id = image.camera_id
+
             images[image.name].update({"P": pose, "cam_id": cam_id})
 
         return images, intrinsics
 
-    def update_reconstruction(self):
-        # Update pycolmap.Reconstruction with new poses and intrinsics from torch tensors
+    def update_reconstruction(self, ext="txt"):
+        """Create a new / update pycolmap.Reconstruction with optimized poses
+        and intrinsics and save it."""
         pass
