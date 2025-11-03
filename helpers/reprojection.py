@@ -116,7 +116,7 @@ def compute_121_reprojection(
     return kpts0, kpts1, tot
 
 
-def filter_viewgraph_by_reprojection(
+def filter_viewgraph_by_reprojection_old(
     viewgraph,
     images,
     intrinsics,
@@ -174,5 +174,70 @@ def filter_viewgraph_by_reprojection(
 
         if perc >= th or len(kpt0) >= min_points:
             filtered_viewgraph.append((i, j))
+
+    return filtered_viewgraph
+
+
+@torch.no_grad()
+def filter_viewgraph_by_reprojection(
+    viewgraph,
+    images,
+    intrinsics,
+    th=0.025,
+    min_points=100,
+    border=0,
+    sampling_factor=10,
+    reprojection_error=3.0,
+    device="cuda",
+):
+    """
+    Filters a viewgraph by filtering the percentage of points survived to a round-trip of reprojection.
+    """
+
+    # Pre-cache all projection matrices and intrinsics in float16 (MAJOR speedup)
+    cached_P = {
+        name: img_data["P"].projection_matrix().half()
+        for name, img_data in images.items()
+    }
+    cached_K = {
+        cam_id: cam.intrinsic_matrix().half() for cam_id, cam in intrinsics.items()
+    }
+
+    filtered_viewgraph = []
+
+    for i, j in tqdm(viewgraph, desc="Filtering viewgraph"):
+        ix1, iy1, ix2, iy2, ih, iw = [int(x) for x in images[i]["coords"]]
+        jx1, jy1, jx2, jy2, jh, jw = [int(x) for x in images[j]["coords"]]
+
+        # Convert depth to float16
+        Z1 = images[i]["depth"][iy1:iy2, ix1:ix2][None].half()
+        Z2 = images[j]["depth"][jy1:jy2, jx1:jx2][None].half()
+
+        # Use cached matrices (already in float16)
+        data = {
+            "P0": cached_P[i][None],
+            "P1": cached_P[j][None],
+            "K0": cached_K[images[i]["cam_id"]][None],
+            "K1": cached_K[images[j]["cam_id"]][None],
+            "depth0": Z1,
+            "depth1": Z2,
+        }
+
+        with torch.amp.autocast(device_type=device, dtype=torch.float16):
+            kpt0, _, tot_kpts = compute_121_reprojection(
+                data,
+                images[i]["image"],
+                images[j]["image"],
+                reprojection_error=reprojection_error,
+                border=border,
+                sampling_factor=sampling_factor,
+                verbose=False,
+                device=device,
+            )
+
+        if tot_kpts > 0:  # Avoid division by zero
+            perc = len(kpt0) / tot_kpts
+            if perc >= th or len(kpt0) >= min_points:
+                filtered_viewgraph.append((i, j))
 
     return filtered_viewgraph

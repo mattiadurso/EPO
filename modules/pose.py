@@ -15,18 +15,12 @@ class Pose:
         super().__init__()
 
         # Convert rotation to quaternion
-        q = self.rotation_matrix_to_quaternion(R)
-        t_vec = t.squeeze().reshape(3)
+        q = self.rotation_matrix_to_quaternion(R).detach().clone().float().to(device)
+        self.q = nn.Parameter(q, requires_grad=grad_q)
 
-        # Create leaf parameters - critical for optimization
-        self.q = nn.Parameter(
-            q.clone().detach().to(device),
-            requires_grad=False,
-        )
-        self.t = nn.Parameter(
-            t_vec.clone().detach().to(device),
-            requires_grad=grad_t,
-        )
+        # Translation vector
+        t_vec = t.squeeze().reshape(3).detach().clone().float().to(device)
+        self.t = nn.Parameter(t_vec, requires_grad=grad_t)
 
     def normalize_quat(self, quaternion):
         """Normalize a quaternion."""
