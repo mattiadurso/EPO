@@ -30,6 +30,13 @@ from helpers.load import (
     load_and_preprocess_images,
     load_and_preprocess_depths,
 )
+from losses.loss import (
+    compute_distance_field,
+    sample_distance_field,
+)
+
+from mylib.from_eslibutils import reproject_2D_2D
+from helpers.reprojection import filter_viewgraph_by_reprojection
 from helpers.frustum import build_view_graph_from_frustums
 from extractors.canny import CannyEdgeDetector
 from modules.camera import Camera
@@ -51,12 +58,24 @@ class Adjuster(nn.Module):
     """
 
     def __init__(
-        self, detector="canny", device="cuda", max_workers=-1, detector_params={}
+        self,
+        reconstruction,
+        images_path,
+        depths_path,
+        lr=1e-5,
+        single_camera_per_folder=True,
+        load_with_pad=True,
+        detector="canny",
+        device="cuda",
+        max_workers=-1,
+        detector_params={},
     ):
         super().__init__()
 
         self.max_workers = os.cpu_count() if max_workers < 0 else max_workers
         self.images_size = 518  # square size to which images are resized
+        self.device = device
+        self.lr = lr
 
         # Edge extractor
         if detector == "canny":
@@ -74,15 +93,122 @@ class Adjuster(nn.Module):
         self.grad_t = True
         self.grad_k = True
 
+        # Loading
+        self.timings = {}
+        time_start = time.time()
+
+        ## View graph
+        s_time = time.time()
+        recon, viewgraph = build_view_graph_from_frustums(
+            reconstruction,
+            z_near_default=0.1,
+            z_far_default=5.0,
+            max_view_angle_deg=70.0,
+            distance_factor=2,
+            verbose=False,
+        )
+        self.timings["viewgraph"] = time.time() - s_time
+
+        ## Load Images as dict {image_name: image_tensor}
+        s_time = time.time()
+        image_path_list = find_images(images_path)
+        images = load_and_preprocess_images(
+            image_path_list,
+            images_path,
+            target_size=self.images_size,
+            max_workers=self.max_workers,
+            load_with_pad=load_with_pad,
+            device=self.device,
+        )
+        self.timings["load_images"] = time.time() - s_time
+
+        ## Load poses and intrinsics
+        s_time = time.time()
+        images, intrinsics = self.read_cameras_from_reconstruction(
+            recon,
+            images,
+            single_camera_per_folder=single_camera_per_folder,
+            load_with_pad=load_with_pad,
+        )
+        self.timings["load_poses_and_intrinsics"] = time.time() - s_time
+
+        ## Load depth maps
+        s_time = time.time()
+        images = load_and_preprocess_depths(
+            depths_path,
+            images,
+            target_size=self.images_size,
+            max_workers=self.max_workers,
+            load_with_pad=load_with_pad,
+            device=self.device,
+        )
+        self.timings["load_depth_maps"] = time.time() - s_time
+
+        ## Extract edges
+        s_time = time.time()
+        for image_name in tqdm(images.keys(), desc=f"Extracting edges"):
+            img_tensor = images[image_name]["image"].unsqueeze(0).to(self.device)
+            edges_map = self.edge_extractor(img_tensor)
+            edges = edges_map.squeeze().nonzero().flip(dims=(1, 0)).float()  # (N, 2)
+            images[image_name].update(
+                {"edges_map": edges_map.squeeze(), "edges": edges}
+            )
+        self.timings["extract_edges"] = time.time() - s_time
+
+        # Compute Distance Fields
+        s_time = time.time()
+        for image_name in tqdm(images.keys(), desc="Computing distance fields"):
+            edges_map = images[image_name]["edges_map"]
+            dt_field = compute_distance_field(
+                edges_map,
+                device=self.device,
+            )
+            images[image_name].update({"dt_field": dt_field})
+        self.timings["compute_distance_fields"] = time.time() - s_time
+
+        # Filter viewgraph by reprojection
+        s_time = time.time()
+        viewgraph = filter_viewgraph_by_reprojection(
+            viewgraph,
+            images,
+            intrinsics,
+            th=0.025,
+            sampling_factor=10,
+            reprojection_error=3.0,
+        )
+        self.timings["filter_viewgraph"] = time.time() - s_time
+
+        self.images = images
+        self.viewgraph = viewgraph
+        self.intrinsics = intrinsics
+        self.loss_list = []
+
+        # Create optimizer
+        params_to_optimize = []
+
+        # Add intrinsics parameters (Camera objects)
+        for cam_id, camera in self.intrinsics.items():
+            params_to_optimize.extend(camera.parameters())
+
+        # Add pose parameters (Pose objects)
+        for image_name, image_data in self.images.items():
+            params_to_optimize.extend(image_data["P"].parameters())
+
+        total_params = sum(p.numel() for p in params_to_optimize)
+        print(f"\nTotal parameters to optimize: {total_params:,}")
+
+        # Create optimizer with collected parameters
+        self.optimizer = torch.optim.Adam(params_to_optimize, lr=self.lr)
+        self.scaler = torch.cuda.amp.GradScaler()
+
+        self.timings["total_loading"] = time.time() - time_start
+        self.timings["total_optimization"] = 0
+
     def forward(
         self,
-        images_path,
-        depths_path,
-        reconstruction,
-        max_steps=5_000,
-        lr=1e-4,
-        single_camera_per_folder=True,
-        load_with_pad=True,
+        max_steps=100,
+        quick_mode=True,
+        max_pairs=512,
     ):
         """
         Main optimization loop.
@@ -96,160 +222,159 @@ class Adjuster(nn.Module):
             If False, each image has its own camera.
             load_with_pad (bool): If True, images are resized to square with padding. Depth maps are resized accordingly.
             Use this if images might have different aspect ratios, otherwise not needed, just waste of memory.
+            quick_mode (bool): If True, reduces the number of optimization steps and speeds up the process.
+            max_pairs (int): Maximum number of image pairs to consider from the viewgraph. Only used if quick_mode is True.
         """
-        timings = {}
         time_start = time.time()
-        # assert use_photo_loss or use_edge_loss, "At least one loss must be used."
 
-        # View graph
-        s_time = time.time()
-        recon, viewgraph = build_view_graph_from_frustums(
-            reconstruction,
-            z_near_default=0.1,
-            z_far_default=5.0,
-            max_view_angle_deg=70.0,
-            distance_factor=2,
-            verbose=False,
-        )
-        timings["viewgraph"] = time.time() - s_time
-
-        # Load Images as dict {image_name: image_tensor}
-        s_time = time.time()
-        image_path_list = find_images(images_path)
-        images = load_and_preprocess_images(
-            image_path_list,
-            images_path,
-            target_size=self.images_size,
-            max_workers=self.max_workers,
-            load_with_pad=load_with_pad,
-        )
-        timings["load_images"] = time.time() - s_time
-
-        # Extract edges
-        s_time = time.time()
-        for image_name in tqdm(images.keys(), desc="Extracting edges"):
-            img_tensor = (
-                images[image_name]["image"].unsqueeze(0).to(self.edge_extractor.device)
+        if quick_mode and len(self.viewgraph) > max_pairs:
+            print(
+                f"Quick mode ON. Down-sampling viewgraph from {len(self.viewgraph):,} to {max_pairs:,} pair. "
             )
-            edges = self.edge_extractor(img_tensor)
-            images[image_name].update({"edges": edges.squeeze().cpu()})
-        timings["extract_edges"] = time.time() - s_time
 
-        # Load poses and intrinsics
-        s_time = time.time()
-        images, intrinsics = self.read_cameras_from_reconstruction(
-            recon,
-            images,
-            single_camera_per_folder=single_camera_per_folder,
-            load_with_pad=load_with_pad,
-        )
-        timings["load_poses_and_intrinsics"] = time.time() - s_time
+        # # Loop
+        bar = tqdm(range(max_steps), desc="Adjusting poses and depth maps")
+        for _ in bar:
+            # initialize loss
+            with torch.amp.autocast(device_type=self.device, dtype=torch.bfloat16):
+                loss = 0.0
+                self.optimizer.zero_grad()
 
-        # Load depth maps
-        s_time = time.time()
-        images = load_and_preprocess_depths(
-            depths_path,
-            images,
-            target_size=self.images_size,
-            max_workers=self.max_workers,
-            load_with_pad=load_with_pad,
-        )
-        timings["load_depth_maps"] = time.time() - s_time
+                # Loop over pairs
+                if len(self.viewgraph) > max_pairs and quick_mode:
+                    sampled_indices = torch.randperm(len(self.viewgraph))[:max_pairs]
+                    sampled_viewgraph = [self.viewgraph[i] for i in sampled_indices]
+                else:
+                    sampled_viewgraph = self.viewgraph
 
-        timings["total"] = time.time() - time_start
-        self.print_timings(timings)
-        return images, viewgraph, intrinsics
+                for pair in sampled_viewgraph:
+                    i, j = pair
+                    image_i = self.images[i]
+                    image_j = self.images[j]
+                    K_i = self.intrinsics[image_i["cam_id"]]
+                    K_j = self.intrinsics[image_j["cam_id"]]
 
-        if True:
-            # # Optimizer
-            # NOTE: VGGT Translation is prone to error. An alternating round of optimization only for it? or bilinear cost function
-            # Start from optimizing only translations and intrinsics and depth
-            # create a wrapper class to load images, poses etc= like a custom reconstruction class
-            # then optimize using pypose optimizers (LM)?
-            # move loading functions to helpers.py or load.py
-            ###############
+                    # project edges 1->2
+                    edges_12 = reproject_2D_2D(
+                        xy0=image_i["edges"][None],
+                        depthmap0=image_i["depth"][None],
+                        P0=image_i["P"].projection_matrix()[None],
+                        P1=image_j["P"].projection_matrix()[None],
+                        K0=K_i.intrinsic_matrix()[None],
+                        K1=K_j.intrinsic_matrix()[None],
+                        img1_shape=image_j["image"].shape[-2:],
+                    )
 
-            # optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+                    # project edges 2->1
+                    edges_21 = reproject_2D_2D(
+                        xy0=image_j["edges"][None],
+                        depthmap0=image_j["depth"][None],
+                        P0=image_j["P"].projection_matrix()[None],
+                        P1=image_i["P"].projection_matrix()[None],
+                        K0=K_j.intrinsic_matrix()[None],
+                        K1=K_i.intrinsic_matrix()[None],
+                        img1_shape=image_i["image"].shape[-2:],
+                    )
 
-            # # Loop
-            # bar = tqdm(range(max_steps), desc="Adjusting poses and depth maps")
-            # for step in bar:
-            #     # initialize loss
-            #     loss = 0
-            #     optimizer.zero_grad()
+                    # Remove batch dimension before sampling
+                    edges_12 = edges_12.squeeze(0)  # (N, 2)
+                    edges_21 = edges_21.squeeze(0)  # (N, 2)
 
-            #     # Loop over pairs
-            #     for pair in pairs:
-            #         image_1, image_2, _ = pair
+                    # Filter out NaN values
+                    valid_12 = ~torch.isnan(edges_12).any(dim=1)
+                    valid_21 = ~torch.isnan(edges_21).any(dim=1)
+                    edges_12 = edges_12[valid_12]
+                    edges_21 = edges_21[valid_21]
 
-            #         # compute losses
-            #         if use_photo_loss:
-            #             # self.project_image(...) / self.project_patches
-            #             ...
-            #             photo_loss = ...
-            #             loss += photo_loss
+                    # compute loss
+                    edge_loss_12 = sample_distance_field(
+                        image_j["dt_field"], edges_12, device=self.device
+                    ).mean()
 
-            #         if use_edge_loss:
-            #             # project edges 1->2
-            #             edges_12 = self.project_edges(
-            #                 images_edges[image_1],
-            #                 poses[image_1],
-            #                 poses[image_2],
-            #                 intrinsics[image_1],
-            #                 intrinsics[image_2],
-            #                 depth_maps[image_1],
-            #             )
+                    edge_loss_21 = sample_distance_field(
+                        image_i["dt_field"], edges_21, device=self.device
+                    ).mean()
 
-            #             # project edges 2->1
-            #             edges_21 = self.project_edges(
-            #                 images_edges[image_2],
-            #                 poses[image_2],
-            #                 poses[image_1],
-            #                 intrinsics[image_2],
-            #                 intrinsics[image_1],
-            #                 depth_maps[image_2],
-            #             )
+                    # heuristic to reset translations that diverged too much
+                    # ...
+                    # continue
 
-            #             ...
-            #             edge_loss = ...
-            #             loss += edge_loss
+                    edge_loss = edge_loss_12 + edge_loss_21
+                    loss += edge_loss
 
-            #     # Backpropagate and update (for all poses, intrinsics, depth maps)
-            #     loss.backward()
-            #     optimizer.step()
+            loss /= len(sampled_viewgraph)
+            self.loss_list.append(loss.item())
 
-            #     bar.set_postfix(
-            #         loss=f"{loss.item():.6f}",
-            #         photo=f"{photo_loss.item():.6f}",
-            #         edge=f"{edge_loss.item():.6f}",
-            #     )
+            # Backpropagate and update (for all poses, intrinsics, depth maps)
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
-            # return depth_maps, reconstruction
-            pass
+            bar.set_postfix(
+                loss=f"{loss.item():.6f}",
+                # photo=f"{photo_loss.item():.6f}",
+                # edge=f"{edge_loss.item():.6f}",
+            )
 
-    def print_timings(self, timings, w=None):
-        # Define column widths
+            # print(f"Loss: {loss.item():.6f}")
+
+        self.timings["total_optimization"] += time.time() - time_start
+        self.print_summary()
+
+    def print_summary(self, w=None):
+        # Column widths
         key_width = 30
         val_width = 10
         perc_width = 8
 
-        # Calculate total width: key + value + percentage + spaces between
+        # Total line width
         if w is None:
-            w = key_width + val_width + perc_width + 4  # +2 for spacing
+            w = key_width + val_width + perc_width + 4
 
         print("\n" + "=" * w)
-        print("Timings:")
+        print(f"{'Summary':^{w}}")
         print("-" * w)
 
-        for key, value in timings.items():
-            if key == "total":
+        # Compute total
+        self.timings["total"] = (
+            self.timings["total_loading"] + self.timings["total_optimization"]
+        )
+
+        # Header row
+        print(f"{'Stage':<{key_width}}{'Time (s)':>{val_width}}{'%':>{perc_width+2}}")
+        print("-" * w)
+
+        # Per-key entries
+        for key, value in self.timings.items():
+            if key in ["total", "total_loading"]:
                 continue
+            perc = (value / self.timings["total"]) * 100
             print(
-                f"{key:<{key_width}}{value:>{val_width}.2f} s {((value / timings['total']) * 100):>{perc_width}.1f}%"
+                f"{key:<{key_width}}{value:>{val_width}.2f}  {perc:>{perc_width}.1f}%"
             )
 
         print("-" * w)
-        print(f"{'total':<{key_width}}{timings['total']:>{val_width}.2f} s")
+        print(f"{'Total':<{key_width}}{self.timings['total']:>{val_width}.2f}")
+        print("-" * w)
+
+        # Loss summary
+        initial_loss = self.loss_list[0]
+        final_loss = self.loss_list[-1]
+        delta = initial_loss - final_loss
+
+        print(
+            f"{'Initial loss:':<{key_width}}{initial_loss:>{val_width + perc_width + 4}.6f}"
+        )
+        print(
+            f"{'Final loss:':<{key_width}}{final_loss:>{val_width + perc_width + 4}.6f}"
+        )
+        print(
+            f"{'Loss reduction:':<{key_width}}{delta:>{val_width + perc_width + 4}.6f}"
+        )
+        print(
+            f"{'Total steps:':<{key_width}}{len(self.loss_list):>{val_width + perc_width + 4}d}"
+        )
+
         print("=" * w)
 
     def process_camera(self, camera, load_with_pad=False):
@@ -343,21 +468,23 @@ class Adjuster(nn.Module):
             for cam in reconstruction.cameras.values():
                 cam_id, model, new_params = self.process_camera(cam)
                 intrinsics[cam.camera_id] = {
-                    "cam_id": cam_id,
-                    "model": model,
-                    "parameters": new_params,
+                    "cam_id": cam_id.to(self.device),
+                    "model": model.to(self.device),
+                    "parameters": new_params.to(self.device),
                 }
         # Sort dict by keys
         intrinsics = dict(sorted(intrinsics.items()))
 
         # Convert to Camera objects
         for cam_id in intrinsics.keys():
-            intrinsics[cam_id] = Camera(**intrinsics[cam_id], grad=self.grad_k)
+            intrinsics[cam_id] = Camera(
+                **intrinsics[cam_id], grad=self.grad_k, device=self.device
+            )
 
         # Read poses from images
         for image in reconstruction.images.values():
             R, t, cam_id = self.process_pose(image)
-            pose = Pose(R=R, t=t, grad_q=self.grad_q)
+            pose = Pose(R=R, t=t, grad_q=self.grad_q, device=self.device)
 
             if single_camera_per_folder:
                 cam_id = image.name.split("/")[0]
@@ -372,3 +499,17 @@ class Adjuster(nn.Module):
         """Create a new / update pycolmap.Reconstruction with optimized poses
         and intrinsics and save it."""
         pass
+
+
+if __name__ == "__main__":
+
+    adjuster = Adjuster()
+
+    out = adjuster(
+        "/home/mattia/Desktop/datasets/mydataset/data/vienna_state_opera/frames",
+        depths_path="/home/mattia/Desktop/Repos/vggt/wrapper_output/vienna_state_opera/sparse/depth_maps",
+        reconstruction="/home/mattia/Desktop/Repos/vggt/wrapper_output/vienna_state_opera/sparse",
+        single_camera_per_folder=True,
+        load_with_pad=False,
+        max_steps=1,
+    )
