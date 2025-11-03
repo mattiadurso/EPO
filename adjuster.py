@@ -4,11 +4,11 @@
 
 # I might want to use pypose, kornia and/or pytorch3d for this.
 import os
-from pickle import load
 import time
+import numpy as np
 import torch
 import torch.nn as nn
-
+import pycolmap
 import warnings
 
 # Ignore the cuDNN warning
@@ -204,6 +204,10 @@ class Adjuster(nn.Module):
         self.timings["total_loading"] = time.time() - time_start
         self.timings["total_optimization"] = 0
 
+        # # At this point I might get rid of rgb images to save memory
+        # for image_name in self.images.keys():
+        #     self.images[image_name].pop("image")
+
     def forward(
         self,
         max_steps=100,
@@ -358,8 +362,8 @@ class Adjuster(nn.Module):
         print("-" * w)
 
         # Loss summary
-        initial_loss = self.loss_list[0]
-        final_loss = self.loss_list[-1]
+        initial_loss = self.loss_list[0] if len(self.loss_list) > 0 else 0.0
+        final_loss = self.loss_list[-1] if len(self.loss_list) > 0 else 0.0
         delta = initial_loss - final_loss
 
         print(
@@ -371,9 +375,8 @@ class Adjuster(nn.Module):
         print(
             f"{'Loss reduction:':<{key_width}}{delta:>{val_width + perc_width + 4}.6f}"
         )
-        print(
-            f"{'Total steps:':<{key_width}}{len(self.loss_list):>{val_width + perc_width + 4}d}"
-        )
+        steps = 0 if len(self.loss_list) == 0 else len(self.loss_list)
+        print(f"{'Total steps:':<{key_width}}{steps:>{val_width + perc_width + 4}d}")
 
         print("=" * w)
 
@@ -495,10 +498,128 @@ class Adjuster(nn.Module):
 
         return images, intrinsics
 
-    def update_reconstruction(self, ext="txt"):
-        """Create a new / update pycolmap.Reconstruction with optimized poses
-        and intrinsics and save it."""
-        pass
+    def build_reconstruction(self, output_path="optimized_reconstruction"):
+        """
+        Create a pycolmap.Reconstruction from images and intrinsics dictionaries.
+
+        Args:
+            images: dict with image_name -> {P: Pose, cam_id: int, scale: float, ...}
+            intrinsics: dict with cam_id -> Camera
+            output_path: path to save the reconstruction
+        """
+        # Create empty reconstruction
+        reconstruction = pycolmap.Reconstruction()
+
+        # 1. Add cameras - we need to handle different scales per image
+        # Group images by camera to find the appropriate scale
+        camera_scales = {}
+        for image_name, image_data in self.images.items():
+            cam_id = image_data["cam_id"]
+            scale = image_data.get("scale", 1.0)
+
+            if cam_id not in camera_scales:
+                camera_scales[cam_id] = []
+            camera_scales[cam_id].append(scale)
+
+        # Use median scale for each camera
+        for cam_id in camera_scales:
+            camera_scales[cam_id] = np.median(camera_scales[cam_id])
+
+        for cam_id, camera in self.intrinsics.items():
+            # Get camera parameters as numpy array
+            params = camera.params.detach().cpu().numpy()
+
+            # Get scale for this camera
+            scale = camera_scales.get(cam_id, 1.0)
+
+            # Apply inverse scaling to focal lengths (scale back to original)
+            if camera.model == "PINHOLE":
+                params = params.copy()
+                params[0] /= scale  # fx
+                params[1] /= scale  # fy
+                params[2] /= scale  # cx
+                params[3] /= scale  # cy
+                model = pycolmap.CameraModelId.PINHOLE
+            elif camera.model == "SIMPLE_PINHOLE":
+                params = params.copy()
+                params[0] /= scale  # f
+                params[1] /= scale  # cx
+                params[2] /= scale  # cy
+                model = pycolmap.CameraModelId.SIMPLE_PINHOLE
+            else:
+                raise ValueError(f"Unsupported camera model: {camera.model}")
+
+            # Get image dimensions from first image with this cam_id
+            sample_image = next(
+                (img for img in self.images.values() if img["cam_id"] == cam_id), None
+            )
+
+            if sample_image is None:
+                print(f"Warning: No images found for camera {cam_id}, skipping...")
+                continue
+
+            height, width = sample_image["image"].shape[-2:]
+
+            # Scale image dimensions back to original
+            width = int(width / scale)
+            height = int(height / scale)
+
+            # Convert cam_id to int for COLMAP
+            cam_id_int = int(cam_id) if isinstance(cam_id, str) else cam_id
+
+            # Create and register camera
+            cam = pycolmap.Camera(
+                model=model,
+                width=width,
+                height=height,
+                params=params,
+                camera_id=cam_id_int,
+            )
+            reconstruction.add_camera(cam)
+
+        # 2. Add images (poses)
+        for image_id, (image_name, image_data) in enumerate(
+            self.images.items(), start=1
+        ):
+            pose = image_data["P"]
+            cam_id = image_data["cam_id"]
+            scale = image_data.get("scale", 1.0)
+
+            # Convert cam_id to int for COLMAP
+            cam_id_int = int(cam_id) if isinstance(cam_id, str) else cam_id
+
+            # Get rotation matrix and translation
+            q = pose.q.detach().cpu().numpy()
+            t = pose.t.detach().cpu().numpy().squeeze()
+
+            # Apply inverse scaling to translation (scale back to original)
+            t = t / scale
+
+            # use xyzw -> wxyz
+            q = np.roll(q, shift=3)
+
+            # Create image
+            img = pycolmap.Image(
+                id=image_id,
+                name=image_name,
+                camera_id=cam_id_int,
+                cam_from_world=pycolmap.Rigid3d(
+                    rotation=pycolmap.Rotation3d(q), translation=t
+                ),
+            )
+            reconstruction.add_image(img)
+
+        # 3. Info reconstruction
+        print(f"Cameras: {len(reconstruction.cameras)}")
+        print(f"Images: {len(reconstruction.images)}")
+        print(f"Points3D: {len(reconstruction.points3D)}")
+
+        # 4. Save reconstruction
+        if output_path is not None:
+            reconstruction.write_text(output_path)
+            print(f"Reconstruction saved to: {output_path}")
+
+        return reconstruction
 
 
 if __name__ == "__main__":
