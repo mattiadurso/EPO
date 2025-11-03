@@ -116,7 +116,12 @@ def _process_single_image(
 
 
 def load_and_preprocess_images(
-    image_path_list, images_path, target_size=1024, max_workers=20, load_with_pad=True
+    image_path_list,
+    images_path,
+    target_size=1024,
+    max_workers=20,
+    load_with_pad=True,
+    device="cuda",
 ):
     """
     Load and preprocess images by center padding to square and resizing to target size.
@@ -164,7 +169,10 @@ def load_and_preprocess_images(
             as_completed(futures), total=len(futures), desc="Loading images"
         ):
             image_name, img_tensor, coords = future.result()
-            images_dict[image_name] = {"image": img_tensor, "coords": coords}
+            images_dict[image_name] = {
+                "image": img_tensor.to(device),
+                "coords": torch.from_numpy(coords).to(device),
+            }
 
     return images_dict
 
@@ -243,7 +251,12 @@ def _process_single_depth(
 
 
 def load_and_preprocess_depths(
-    depth_path, images_dict, target_size=518, max_workers=20, load_with_pad=False
+    depth_path,
+    images_dict,
+    target_size=518,
+    max_workers=20,
+    load_with_pad=False,
+    device="cuda",
 ):
     """
     Load and preprocess depth maps by center padding to square and resizing to target size.
@@ -288,7 +301,7 @@ def load_and_preprocess_depths(
             image_name, depth_tensor = future.result()
 
             if depth_tensor is not None:
-                images_dict[image_name].update({"depth": depth_tensor})
+                images_dict[image_name].update({"depth": depth_tensor.to(device)})
             else:
                 print(f"Warning: Depth map not found for {image_name}")
 
