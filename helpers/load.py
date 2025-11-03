@@ -112,7 +112,7 @@ def _process_single_image(
     # Get image relative path wrt images_path
     image_name = Path(image_path).relative_to(images_path).as_posix()
 
-    return image_name, img_tensor, coords
+    return image_name, img_tensor, coords, scale
 
 
 def load_and_preprocess_images(
@@ -168,10 +168,11 @@ def load_and_preprocess_images(
         for future in tqdm(
             as_completed(futures), total=len(futures), desc="Loading images"
         ):
-            image_name, img_tensor, coords = future.result()
+            image_name, img_tensor, coords, scale = future.result()
             images_dict[image_name] = {
                 "image": img_tensor.to(device),
                 "coords": torch.from_numpy(coords).to(device),
+                "scale": scale,
             }
 
     return images_dict
