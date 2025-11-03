@@ -240,7 +240,7 @@ class Adjuster(nn.Module):
         bar = tqdm(range(max_steps), desc="Adjusting poses and depth maps")
         for _ in bar:
             # initialize loss
-            with torch.amp.autocast(device_type=self.device, dtype=torch.bfloat16):
+            with torch.amp.autocast(device_type=self.device, dtype=torch.float16):
                 loss = 0.0
                 self.optimizer.zero_grad()
 
@@ -251,6 +251,7 @@ class Adjuster(nn.Module):
                 else:
                     sampled_viewgraph = self.viewgraph
 
+                # self.pair_losses = []
                 for pair in sampled_viewgraph:
                     i, j = pair
                     image_i = self.images[i]
@@ -305,6 +306,7 @@ class Adjuster(nn.Module):
 
                     edge_loss = edge_loss_12 + edge_loss_21
                     loss += edge_loss
+                    # self.pair_losses.append((i, j, edge_loss.item()))
 
             loss /= len(sampled_viewgraph)
             self.loss_list.append(loss.item())
