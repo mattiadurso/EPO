@@ -148,4 +148,4 @@ def build_view_graph_from_frustums(
             for i, j in out_pairs:
                 f.write(f"{i} {j}\n")
 
-    return recon, out_pairs
+    return out_pairs

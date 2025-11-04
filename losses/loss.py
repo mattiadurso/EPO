@@ -1,6 +1,7 @@
 import torch
 
 
+@torch.no_grad()
 def compute_distance_field(
     edges_map: torch.Tensor,
     device="cuda",
@@ -50,33 +51,44 @@ def sample_distance_field(
     """
     Sample the distance field at given edge coordinates.
     Args:
-        dt_field: Tensor of shape (H, W) with the distance field.
-        edge_coords: Tensor of shape (N, 2) with edge coordinates (x, y) to sample.
+        dt_field: Tensor of shape (B, H, W) or (H, W) with the distance field.
+        edge_coords: Tensor of shape (B, N, 2) or (N, 2) with edge coordinates (x, y) to sample.
         device: Device to use for computation.
         sampling_mode: Sampling mode for grid_sample ('bilinear' or 'nearest').
     Returns:
-        sampled_dists: Tensor of shape (N,) with sampled distances at edge coordinates.
+        sampled_dists: Tensor of shape (B, N) or (N,) with sampled distances at edge coordinates.
     """
-    dt_field = dt_field.to(device).float().unsqueeze(0).unsqueeze(0)  # to (1, 1, H, W)
+    dt_field = dt_field.to(device).float()
     edge_coords = edge_coords.to(device).float()
 
-    h, w = dt_field.shape[-2], dt_field.shape[-1]
+    # Handle both batched and unbatched inputs
+    if dt_field.dim() == 2:
+        dt_field = dt_field.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        edge_coords = edge_coords.unsqueeze(0)  # (1, N, 2)
+        unbatched = True
+    else:
+        dt_field = dt_field.unsqueeze(1)  # (B, 1, H, W)
+        unbatched = False
+
+    b, _, h, w = dt_field.shape
 
     # Normalize coordinates to [-1, 1] for grid_sample
-    # edge_coords is (x, y), grid_sample expects (x, y) in that order
-    norm_x = (edge_coords[:, 0] / (w - 1)) * 2 - 1
-    norm_y = (edge_coords[:, 1] / (h - 1)) * 2 - 1
+    norm_x = (edge_coords[..., 0] / (w - 1)) * 2 - 1
+    norm_y = (edge_coords[..., 1] / (h - 1)) * 2 - 1
 
-    # Stack as [x, y] - this is correct for grid_sample
-    grid = (
-        torch.stack([norm_x, norm_y], dim=1).unsqueeze(0).unsqueeze(0)
-    )  # (1, 1, N, 2)
+    # Stack as [x, y] for grid_sample: (B, N, 2)
+    grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(1)  # (B, 1, N, 2)
 
     sampled_dists = torch.nn.functional.grid_sample(
         dt_field,
         grid,
         mode=sampling_mode,
-        align_corners=True,  # Changed from False to True for exact pixel alignment
+        align_corners=True,
     )
 
-    return sampled_dists.squeeze()
+    sampled_dists = sampled_dists.squeeze(1)  # (B, N)
+
+    if unbatched:
+        sampled_dists = sampled_dists.squeeze(0)  # (N,)
+
+    return sampled_dists
