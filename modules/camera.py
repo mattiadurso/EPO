@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 
-class Camera:
+class Camera(nn.Module):  # Changed: inherit from nn.Module
     def __init__(
         self,
         cam_id: int,
@@ -14,6 +14,8 @@ class Camera:
         """
         Camera class representing camera intrinsics.
         """
+        super().__init__()  # Added: call parent __init__
+
         self.device = device
         self.grad = grad
         self.id = cam_id
@@ -65,9 +67,11 @@ class Camera:
 
         return K
 
-    def parameters(self):
+    def parameters(self, recurse=True):  # Changed: match nn.Module signature
         """Return list of trainable parameters - only self.params is a leaf tensor"""
-        return [self.params]
+        return iter([self.params])  # Changed: return iterator like nn.Module
+
+    # Removed custom to() method - nn.Module handles this automatically
 
     def __repr__(self):
         return f"Camera(id={self.id}, model={self.model}, parameters={self.params.data.detach().tolist()})"
