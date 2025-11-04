@@ -60,6 +60,7 @@ class CannyEdgeDetector(nn.Module):
             sigma=(sigma, sigma),
         )
 
+    @torch.no_grad()
     def forward(self, images):
         assert images.dim() in [
             4,

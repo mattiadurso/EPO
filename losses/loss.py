@@ -1,7 +1,4 @@
-# Different implementations of the distance transform loss
-
 import torch
-from kornia.contrib.distance_transform import distance_transform
 
 
 def compute_distance_field(
