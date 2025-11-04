@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
+import pypose as pp
 import kornia.geometry.conversions as kgc
 
 
-class Pose:
+class Pose(nn.Module):  # Changed: inherit from nn.Module
     def __init__(
         self,
         R: torch.Tensor,
@@ -16,7 +17,9 @@ class Pose:
 
         # Convert rotation to quaternion
         q = self.rotation_matrix_to_quaternion(R).detach().clone().float().to(device)
-        self.q = nn.Parameter(q, requires_grad=grad_q)
+        q = torch.roll(q, shifts=-1)  # convert wxyz -> to xyzw
+        self.q_param = nn.Parameter(q, requires_grad=grad_q)
+        self.q = pp.SO3(self.q_param)
 
         # Translation vector
         t_vec = t.squeeze().reshape(3).detach().clone().float().to(device)
@@ -38,7 +41,11 @@ class Pose:
 
     def rotation_matrix(self) -> torch.Tensor:
         """Return rotation matrix from quaternion"""
-        return self.quaternion_to_rotation_matrix(self.q)
+        # if self.q is a LieTensor, use its matrix method
+        if isinstance(self.q, pp.LieTensor):
+            return self.q.matrix()
+        else:
+            return self.quaternion_to_rotation_matrix(self.q_param)
 
     def projection_matrix(self, inverse: bool = False) -> torch.Tensor:
         """Return 4x4 projection matrix (P)"""
@@ -56,12 +63,17 @@ class Pose:
 
         return P
 
-    def parameters(self):
-        """Return list of trainable parameters - only leaf tensors"""
-        return [self.q, self.t]
+    def parameters(self, t=True, q=True):
+        """Return iterator of trainable parameters - only leaf tensors"""
+        params = []
+        if q:
+            params.append(self.q_param)
+        if t:
+            params.append(self.t)
+        return iter(params)  # Changed: return iterator instead of list
 
     def __repr__(self):
-        return f"q: {self.q.cpu().detach()} \nt: {self.t.cpu().detach()}"
+        return f"q: {self.q_param.cpu().detach()} \nt: {self.t.cpu().detach()}"
 
     def __str__(self):
         return self.__repr__()

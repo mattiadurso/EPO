@@ -62,15 +62,28 @@ class Adjuster(nn.Module):
         reconstruction,
         images_path,
         depths_path,
-        lr=1e-5,
+        lr=1e-3,
         single_camera_per_folder=True,
         load_with_pad=True,
         detector="canny",
         device="cuda",
         max_workers=-1,
         detector_params={},
+        seed=0,
+        optim="adamw",  # or "sgd", "LM"
+        grad_q=True,
+        grad_t=True,
+        grad_k=True,
     ):
         super().__init__()
+
+        assert detector in ["canny"], f"Detector {detector} not supported."
+        assert optim.lower() in [
+            "adamw",
+            "sgd",
+            "lm",
+        ], f"Optimizer {optim} not supported."
+        self.use_pypose = False
 
         self.max_workers = os.cpu_count() if max_workers < 0 else max_workers
         self.images_size = 518  # square size to which images are resized
@@ -83,15 +96,15 @@ class Adjuster(nn.Module):
                 low_threshold=detector_params.get("low_threshold", 0.15),
                 high_threshold=detector_params.get("high_threshold", 0.25),
                 hysteresis=detector_params.get("hysteresis", True),
-                kernel_size=detector_params.get("kernel_size", 9),
-                sigma=detector_params.get("sigma", 7.0),
+                kernel_size=detector_params.get("kernel_size", 5),
+                sigma=detector_params.get("sigma", 3.0),
                 device=device,
             )
 
         # what to train
-        self.grad_q = False
-        self.grad_t = True
-        self.grad_k = True
+        self.grad_q = grad_q
+        self.grad_t = grad_t
+        self.grad_k = grad_k
 
         # Loading
         self.timings = {}
@@ -103,7 +116,7 @@ class Adjuster(nn.Module):
             reconstruction,
             z_near_default=0.1,
             z_far_default=5.0,
-            max_view_angle_deg=70.0,
+            max_view_angle_deg=30.0,
             distance_factor=2,
             verbose=False,
         )
@@ -187,19 +200,22 @@ class Adjuster(nn.Module):
         params_to_optimize = []
 
         # Add intrinsics parameters (Camera objects)
-        for cam_id, camera in self.intrinsics.items():
-            params_to_optimize.extend(camera.parameters())
+        if self.grad_k:
+            for cam_id, camera in self.intrinsics.items():
+                params_to_optimize.extend(camera.parameters())
 
         # Add pose parameters (Pose objects)
         for image_name, image_data in self.images.items():
-            params_to_optimize.extend(image_data["P"].parameters())
+            params_to_optimize.extend(
+                image_data["P"].parameters(t=self.grad_t, q=self.grad_q)
+            )
 
         total_params = sum(p.numel() for p in params_to_optimize)
         print(f"\nTotal parameters to optimize: {total_params:,}")
 
         # Create optimizer with collected parameters
-        self.optimizer = torch.optim.Adam(params_to_optimize, lr=self.lr)
-        self.scaler = torch.cuda.amp.GradScaler()
+        self.optimizer = self.load_optimizer(optim, params_to_optimize)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=not self.use_pypose)
 
         self.timings["total_loading"] = time.time() - time_start
         self.timings["total_optimization"] = 0
@@ -207,6 +223,9 @@ class Adjuster(nn.Module):
         # # At this point I might get rid of rgb images to save memory
         # for image_name in self.images.keys():
         #     self.images[image_name].pop("image")
+
+        self.seed = seed
+        self.fix_seed()
 
     def forward(
         self,
@@ -233,11 +252,11 @@ class Adjuster(nn.Module):
 
         if quick_mode and len(self.viewgraph) > max_pairs:
             print(
-                f"Quick mode ON. Down-sampling viewgraph from {len(self.viewgraph):,} to {max_pairs:,} pair. "
+                f"Quick mode ON. Down-sampling viewgraph from {len(self.viewgraph):,} to {max_pairs:,} pairs. "
             )
 
         # # Loop
-        bar = tqdm(range(max_steps), desc="Adjusting poses and depth maps")
+        bar = tqdm(range(max_steps), desc="Adjusting poses and intrinsics")
         for _ in bar:
             # initialize loss
             with torch.amp.autocast(device_type=self.device, dtype=torch.float16):
@@ -251,7 +270,6 @@ class Adjuster(nn.Module):
                 else:
                     sampled_viewgraph = self.viewgraph
 
-                # self.pair_losses = []
                 for pair in sampled_viewgraph:
                     i, j = pair
                     image_i = self.images[i]
@@ -286,25 +304,23 @@ class Adjuster(nn.Module):
                     edges_21 = edges_21.squeeze(0)  # (N, 2)
 
                     # Filter out NaN values
-                    valid_12 = ~torch.isnan(edges_12).any(dim=1)
-                    valid_21 = ~torch.isnan(edges_21).any(dim=1)
+                    if edges_12.numel() > 0:
+                        valid_12 = ~torch.isnan(edges_12).any(dim=1)
+                    if edges_21.numel() > 0:
+                        valid_21 = ~torch.isnan(edges_21).any(dim=1)
                     edges_12 = edges_12[valid_12]
                     edges_21 = edges_21[valid_21]
 
                     # compute loss
                     edge_loss_12 = sample_distance_field(
                         image_j["dt_field"], edges_12, device=self.device
-                    ).mean()
+                    )
 
                     edge_loss_21 = sample_distance_field(
                         image_i["dt_field"], edges_21, device=self.device
-                    ).mean()
+                    )
 
-                    # heuristic to reset translations that diverged too much
-                    # ...
-                    # continue
-
-                    edge_loss = edge_loss_12 + edge_loss_21
+                    edge_loss = edge_loss_12.mean() + edge_loss_21.mean()
                     loss += edge_loss
                     # self.pair_losses.append((i, j, edge_loss.item()))
 
@@ -352,7 +368,9 @@ class Adjuster(nn.Module):
 
         # Per-key entries
         for key, value in self.timings.items():
-            if key in ["total", "total_loading"]:
+            if (key in ["total", "total_loading"]) or (
+                key == "total_optimization" and value == 0
+            ):
                 continue
             perc = (value / self.timings["total"]) * 100
             print(
@@ -364,23 +382,72 @@ class Adjuster(nn.Module):
         print("-" * w)
 
         # Loss summary
-        initial_loss = self.loss_list[0] if len(self.loss_list) > 0 else 0.0
-        final_loss = self.loss_list[-1] if len(self.loss_list) > 0 else 0.0
-        delta = initial_loss - final_loss
+        if len(self.loss_list) > 0:
+            initial_loss = self.loss_list[0]
+            final_loss = self.loss_list[-1]
+            delta = initial_loss - final_loss
 
-        print(
-            f"{'Initial loss:':<{key_width}}{initial_loss:>{val_width + perc_width + 4}.6f}"
-        )
-        print(
-            f"{'Final loss:':<{key_width}}{final_loss:>{val_width + perc_width + 4}.6f}"
-        )
-        print(
-            f"{'Loss reduction:':<{key_width}}{delta:>{val_width + perc_width + 4}.6f}"
-        )
-        steps = 0 if len(self.loss_list) == 0 else len(self.loss_list)
-        print(f"{'Total steps:':<{key_width}}{steps:>{val_width + perc_width + 4}d}")
+            print("-" * w)
+            print(
+                f"{'Initial loss:':<{key_width}}{initial_loss:>{val_width + perc_width + 4}.6f}"
+            )
+            print(
+                f"{'Final loss:':<{key_width}}{final_loss:>{val_width + perc_width + 4}.6f}"
+            )
+            print(
+                f"{'Loss reduction:':<{key_width}}{delta:>{val_width + perc_width + 4}.6f}"
+            )
+            steps = 0 if len(self.loss_list) == 0 else len(self.loss_list)
+            print(
+                f"{'Total steps:':<{key_width}}{steps:>{val_width + perc_width + 4}d}"
+            )
 
         print("=" * w)
+
+    def fix_seed(self):
+        torch.manual_seed(self.seed)
+        torch.cuda.manual_seed_all(self.seed)
+
+    def load_optimizer(self, optim_name, params):
+        optim_name = optim_name.lower()
+        self.use_pypose = False
+
+        if optim_name == "adamw":
+            optimizer = torch.optim.AdamW(params, lr=self.lr)
+
+        elif optim_name == "sgd":
+            optimizer = torch.optim.SGD(params, lr=self.lr, momentum=0.9)
+
+        elif optim_name == "lm":
+            try:
+                import pypose as pp
+
+                class ParamWrapper(nn.Module):
+                    def __init__(self, params):
+                        super().__init__()
+                        self.params = nn.ParameterList(params)
+
+                params_wrapper = ParamWrapper(
+                    params
+                )  # workaround to pass all params to pypose
+
+                optimizer = pp.optim.LevenbergMarquardt(
+                    model=params_wrapper,
+                )
+                self.scheduler = pp.optim.scheduler.StopOnPlateau(
+                    optimizer, steps=10, patience=3, decreasing=1e-3, verbose=True
+                )
+
+                self.use_pypose = True
+                print("Using PyPose Levenberg-Marquardt optimizer.")
+
+            except ImportError:
+                print("PyPose not found. Falling back to AdamW.")
+                optimizer = torch.optim.AdamW(params, lr=self.lr)
+        else:
+            raise ValueError(f"Unsupported optimizer: {optim_name}")
+
+        return optimizer
 
     def process_camera(self, camera, load_with_pad=False):
         # Convert a single pycolmap.Camera to torch tensor
@@ -618,6 +685,7 @@ class Adjuster(nn.Module):
 
         # 4. Save reconstruction
         if output_path is not None:
+            os.makedirs(output_path, exist_ok=True)
             reconstruction.write_text(output_path)
             print(f"Reconstruction saved to: {output_path}")
 
@@ -626,13 +694,23 @@ class Adjuster(nn.Module):
 
 if __name__ == "__main__":
 
-    adjuster = Adjuster()
-
-    out = adjuster(
-        "/home/mattia/Desktop/datasets/mydataset/data/vienna_state_opera/frames",
-        depths_path="/home/mattia/Desktop/Repos/vggt/wrapper_output/vienna_state_opera/sparse/depth_maps",
+    adjuster = Adjuster(
         reconstruction="/home/mattia/Desktop/Repos/vggt/wrapper_output/vienna_state_opera/sparse",
+        images_path="/home/mattia/Desktop/datasets/mydataset/data/vienna_state_opera/frames",
+        depths_path="/home/mattia/Desktop/Repos/vggt/wrapper_output/vienna_state_opera/sparse/depth_maps",
         single_camera_per_folder=True,
         load_with_pad=False,
-        max_steps=1,
+        lr=1e-3,
+        grad_q=False,  # better to stay off for VGGT
+        grad_t=True,
+        grad_k=True,
+        optim="lm",
+    )
+
+    adjuster.print_summary()
+
+    out = adjuster(
+        quick_mode=True,
+        max_pairs=512,
+        max_steps=30,
     )
