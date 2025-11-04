@@ -4,12 +4,14 @@
 
 # I might want to use pypose, kornia and/or pytorch3d for this.
 import os
+import gc
 import time
 import numpy as np
 import torch
 import torch.nn as nn
 import pycolmap
 import warnings
+import random
 
 # Ignore the cuDNN warning
 warnings.filterwarnings(
@@ -70,7 +72,7 @@ class Adjuster(nn.Module):
         max_workers=-1,
         detector_params={},
         seed=0,
-        optim="adamw",  # or "sgd", "LM"
+        optim="adamw",  # or "LM"
         grad_q=True,
         grad_t=True,
         grad_k=True,
@@ -80,7 +82,6 @@ class Adjuster(nn.Module):
         assert detector in ["canny"], f"Detector {detector} not supported."
         assert optim.lower() in [
             "adamw",
-            "sgd",
             "lm",
         ], f"Optimizer {optim} not supported."
         self.use_pypose = False
@@ -197,20 +198,30 @@ class Adjuster(nn.Module):
         self.loss_list = []
 
         # Create optimizer
-        params_to_optimize = []
+        params_to_optimize = {}
 
         # Add intrinsics parameters (Camera objects)
         if self.grad_k:
+            k_params = []
             for cam_id, camera in self.intrinsics.items():
-                params_to_optimize.extend(camera.parameters())
+                k_params.extend(camera.parameters())
+            params_to_optimize["k"] = k_params
 
         # Add pose parameters (Pose objects)
+        q_params, t_params = [], []
         for image_name, image_data in self.images.items():
-            params_to_optimize.extend(
-                image_data["P"].parameters(t=self.grad_t, q=self.grad_q)
+            q_params.extend(
+                image_data["P"].parameters(q=True, t=False) if self.grad_q else []
             )
+            t_params.extend(
+                image_data["P"].parameters(q=False, t=True) if self.grad_t else []
+            )
+        params_to_optimize["q"] = q_params
+        params_to_optimize["t"] = t_params
 
-        total_params = sum(p.numel() for p in params_to_optimize)
+        total_params = sum(
+            p.numel() for params_set in params_to_optimize.values() for p in params_set
+        )
         print(f"\nTotal parameters to optimize: {total_params:,}")
 
         # Create optimizer with collected parameters
@@ -220,12 +231,15 @@ class Adjuster(nn.Module):
         self.timings["total_loading"] = time.time() - time_start
         self.timings["total_optimization"] = 0
 
-        # # At this point I might get rid of rgb images to save memory
+        # # At this point I might get rid of rgb images to save memory as not needed for edge loss
         # for image_name in self.images.keys():
         #     self.images[image_name].pop("image")
 
         self.seed = seed
         self.fix_seed()
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def forward(
         self,
@@ -236,15 +250,7 @@ class Adjuster(nn.Module):
         """
         Main optimization loop.
         Args:
-            images_path (str): Path to images.
-            depth_maps (torch.Tensor): Initial depth maps of shape (B, 1, H, W).
-            reconstruction (pycolmap.Reconstruction): Initial COLMAP reconstruction.
             max_steps (int): Maximum number of optimization steps.
-            lr (float): Learning rate for the optimizer.
-            single_camera_per_folder (bool): If True, assumes that images in the same folder share the same camera intrinsics.
-            If False, each image has its own camera.
-            load_with_pad (bool): If True, images are resized to square with padding. Depth maps are resized accordingly.
-            Use this if images might have different aspect ratios, otherwise not needed, just waste of memory.
             quick_mode (bool): If True, reduces the number of optimization steps and speeds up the process.
             max_pairs (int): Maximum number of image pairs to consider from the viewgraph. Only used if quick_mode is True.
         """
@@ -412,28 +418,34 @@ class Adjuster(nn.Module):
         optim_name = optim_name.lower()
         self.use_pypose = False
 
-        if optim_name == "adamw":
-            optimizer = torch.optim.AdamW(params, lr=self.lr)
+        # Build parameter groups only for parameters that exist
+        param_groups = []
+        if "k" in params:
+            param_groups.append({"params": params["k"], "lr": self.lr * 0.5})
+        if "t" in params:
+            param_groups.append({"params": params["t"], "lr": self.lr})
+        if "q" in params:
+            param_groups.append({"params": params["q"], "lr": self.lr * 0.1})
 
-        elif optim_name == "sgd":
-            optimizer = torch.optim.SGD(params, lr=self.lr, momentum=0.9)
+        if optim_name == "adamw":
+            optimizer = torch.optim.AdamW(param_groups, lr=self.lr)
 
         elif optim_name == "lm":
             try:
                 import pypose as pp
 
                 class ParamWrapper(nn.Module):
-                    def __init__(self, params):
+                    def __init__(self, params_dict):
                         super().__init__()
-                        self.params = nn.ParameterList(params)
+                        # Flatten all params from dict
+                        all_params = []
+                        for param_list in params_dict.values():
+                            all_params.extend(param_list)
+                        self.params = nn.ParameterList(all_params)
 
-                params_wrapper = ParamWrapper(
-                    params
-                )  # workaround to pass all params to pypose
+                params_wrapper = ParamWrapper(params)
 
-                optimizer = pp.optim.LevenbergMarquardt(
-                    model=params_wrapper,
-                )
+                optimizer = pp.optim.LevenbergMarquardt(model=params_wrapper)
                 self.scheduler = pp.optim.scheduler.StopOnPlateau(
                     optimizer, steps=10, patience=3, decreasing=1e-3, verbose=True
                 )
@@ -443,9 +455,11 @@ class Adjuster(nn.Module):
 
             except ImportError:
                 print("PyPose not found. Falling back to AdamW.")
-                optimizer = torch.optim.AdamW(params, lr=self.lr)
+                optimizer = torch.optim.AdamW(param_groups, lr=self.lr)
+
         else:
-            raise ValueError(f"Unsupported optimizer: {optim_name}")
+            print(f"Optimizer {optim_name} not recognized. Falling back to AdamW.")
+            optimizer = torch.optim.AdamW(param_groups, lr=self.lr)
 
         return optimizer
 
@@ -540,8 +554,8 @@ class Adjuster(nn.Module):
             for cam in reconstruction.cameras.values():
                 cam_id, model, new_params = self.process_camera(cam)
                 intrinsics[cam.camera_id] = {
-                    "cam_id": cam_id.to(self.device),
-                    "model": model.to(self.device),
+                    "cam_id": cam_id,
+                    "model": model,
                     "parameters": new_params.to(self.device),
                 }
         # Sort dict by keys
@@ -627,7 +641,7 @@ class Adjuster(nn.Module):
                 print(f"Warning: No images found for camera {cam_id}, skipping...")
                 continue
 
-            height, width = sample_image["image"].shape[-2:]
+            height, width = sample_image["depth"].shape[-2:]
 
             # Scale image dimensions back to original
             width = int(width / scale)
@@ -665,7 +679,7 @@ class Adjuster(nn.Module):
             t = t / scale
 
             # use xyzw -> wxyz
-            q = np.roll(q, shift=3)
+            # q = np.roll(q, shift=3)
 
             # Create image
             img = pycolmap.Image(
