@@ -36,9 +36,7 @@ from losses.loss import (
     compute_distance_field,
     sample_distance_field,
 )
-
-from mylib.from_eslibutils import reproject_2D_2D
-from helpers.reprojection import filter_viewgraph_by_reprojection
+from helpers.reprojection import filter_viewgraph_by_reprojection, reproject_2D_2D
 from helpers.frustum import build_view_graph_from_frustums
 from extractors.canny import CannyEdgeDetector
 from modules.camera import Camera
@@ -261,7 +259,7 @@ class Adjuster(nn.Module):
                 f"Quick mode ON. Down-sampling viewgraph from {len(self.viewgraph):,} to {max_pairs:,} pairs. "
             )
 
-        # # Loop
+        # Loop
         bar = tqdm(range(max_steps), desc="Adjusting poses and intrinsics")
         for _ in bar:
             # initialize loss
@@ -385,7 +383,6 @@ class Adjuster(nn.Module):
 
         print("-" * w)
         print(f"{'Total':<{key_width}}{self.timings['total']:>{val_width}.2f}")
-        print("-" * w)
 
         # Loss summary
         if len(self.loss_list) > 0:
