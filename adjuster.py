@@ -109,17 +109,7 @@ class Adjuster(nn.Module):
         self.timings = {}
         time_start = time.time()
 
-        ## View graph
-        s_time = time.time()
-        recon, viewgraph = build_view_graph_from_frustums(
-            reconstruction,
-            z_near_default=0.1,
-            z_far_default=5.0,
-            max_view_angle_deg=30.0,
-            distance_factor=2,
-            verbose=False,
-        )
-        self.timings["viewgraph"] = time.time() - s_time
+        recon = pycolmap.Reconstruction(reconstruction)
 
         ## Load Images as dict {image_name: image_tensor}
         s_time = time.time()
@@ -167,7 +157,7 @@ class Adjuster(nn.Module):
             )
         self.timings["extract_edges"] = time.time() - s_time
 
-        # Compute Distance Fields
+        ## Compute Distance Fields
         s_time = time.time()
         for image_name in tqdm(images.keys(), desc="Computing distance fields"):
             edges_map = images[image_name]["edges_map"]
@@ -178,8 +168,18 @@ class Adjuster(nn.Module):
             images[image_name].update({"dt_field": dt_field})
         self.timings["compute_distance_fields"] = time.time() - s_time
 
-        # Filter viewgraph by reprojection
+        ## Viewgraph from frustums
         s_time = time.time()
+        # Estimate view graph from frustums
+        viewgraph = build_view_graph_from_frustums(
+            recon,
+            z_near_default=0.1,
+            z_far_default=5.0,
+            max_view_angle_deg=30.0,
+            distance_factor=2,
+            verbose=False,
+        )
+        # Filter viewgraph by reprojection
         viewgraph = filter_viewgraph_by_reprojection(
             viewgraph,
             images,
@@ -188,12 +188,11 @@ class Adjuster(nn.Module):
             sampling_factor=10,
             reprojection_error=3.0,
         )
-        self.timings["filter_viewgraph"] = time.time() - s_time
+        self.timings["viewgraph"] = time.time() - s_time
 
         self.images = images
         self.viewgraph = viewgraph
         self.intrinsics = intrinsics
-        self.loss_list = []
 
         # Create optimizer
         params_to_optimize = {}
@@ -201,7 +200,7 @@ class Adjuster(nn.Module):
         # Add intrinsics parameters (Camera objects)
         if self.grad_k:
             k_params = []
-            for cam_id, camera in self.intrinsics.items():
+            for camera in self.intrinsics.values():
                 k_params.extend(camera.parameters())
             params_to_optimize["k"] = k_params
 
@@ -233,6 +232,7 @@ class Adjuster(nn.Module):
         # for image_name in self.images.keys():
         #     self.images[image_name].pop("image")
 
+        self.loss_list = []
         self.seed = seed
         self.fix_seed()
 
@@ -256,7 +256,7 @@ class Adjuster(nn.Module):
 
         if quick_mode and len(self.viewgraph) > max_pairs:
             print(
-                f"Quick mode ON. Down-sampling viewgraph from {len(self.viewgraph):,} to {max_pairs:,} pairs. "
+                f"Quick mode ON. Randomly sampling viewgraph from {len(self.viewgraph):,} to {max_pairs:,} pairs before every iteration."
             )
 
         # Loop
@@ -274,6 +274,10 @@ class Adjuster(nn.Module):
                 else:
                     sampled_viewgraph = self.viewgraph
 
+                # To get compatibility with LM, this should be the forward pass
+                # of a nn.Module class. Also need to store parameter internally.
+                # TODO: Batch this part to speed up, return (N,) DT values.
+                # Then I can mean or pass to LM
                 for pair in sampled_viewgraph:
                     i, j = pair
                     image_i = self.images[i]
@@ -331,18 +335,14 @@ class Adjuster(nn.Module):
             loss /= len(sampled_viewgraph)
             self.loss_list.append(loss.item())
 
-            # Backpropagate and update (for all poses, intrinsics, depth maps)
+            # Backpropagate and update (for all poses and intrinsics)
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
             bar.set_postfix(
-                loss=f"{loss.item():.6f}",
-                # photo=f"{photo_loss.item():.6f}",
-                # edge=f"{edge_loss.item():.6f}",
+                loss=f"{loss.item():.3f}",
             )
-
-            # print(f"Loss: {loss.item():.6f}")
 
         self.timings["total_optimization"] += time.time() - time_start
         self.print_summary()
@@ -578,7 +578,9 @@ class Adjuster(nn.Module):
 
         return images, intrinsics
 
-    def build_reconstruction(self, output_path="optimized_reconstruction"):
+    def build_reconstruction(
+        self, output_path="optimized_reconstruction", save_points=False
+    ):
         """
         Create a pycolmap.Reconstruction from images and intrinsics dictionaries.
 
@@ -586,6 +588,7 @@ class Adjuster(nn.Module):
             images: dict with image_name -> {P: Pose, cam_id: int, scale: float, ...}
             intrinsics: dict with cam_id -> Camera
             output_path: path to save the reconstruction
+            save_points: whether to save 3D points (empty here)
         """
         # Create empty reconstruction
         reconstruction = pycolmap.Reconstruction()
@@ -689,12 +692,19 @@ class Adjuster(nn.Module):
             )
             reconstruction.add_image(img)
 
-        # 3. Info reconstruction
+        # 3. Points3D - empty for now
+        if save_points:
+            print("Saving with empty Points3D...")
+            # TODO:similar to VGGT, unproject depth maps to create points3D
+            pass
+        else:
+            print("Saving without Points3D...")
+
+        # 4. Save reconstruction
         print(f"Cameras: {len(reconstruction.cameras)}")
         print(f"Images: {len(reconstruction.images)}")
         print(f"Points3D: {len(reconstruction.points3D)}")
 
-        # 4. Save reconstruction
         if output_path is not None:
             os.makedirs(output_path, exist_ok=True)
             reconstruction.write_text(output_path)
@@ -712,13 +722,11 @@ if __name__ == "__main__":
         single_camera_per_folder=True,
         load_with_pad=False,
         lr=1e-3,
-        grad_q=False,  # better to stay off for VGGT
+        grad_q=True,
         grad_t=True,
         grad_k=True,
-        optim="lm",
+        optim="adamw",
     )
-
-    adjuster.print_summary()
 
     out = adjuster(
         quick_mode=True,

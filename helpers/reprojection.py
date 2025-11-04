@@ -151,7 +151,7 @@ def filter_viewgraph_by_reprojection(
 
     filtered_viewgraph = []
 
-    for i, j in tqdm(viewgraph, desc="Filtering viewgraph"):
+    for i, j in tqdm(viewgraph, desc="Computing viewgraph"):
         ix1, iy1, ix2, iy2, ih, iw = [int(x) for x in images[i]["coords"]]
         jx1, jy1, jx2, jy2, jh, jw = [int(x) for x in images[j]["coords"]]
 

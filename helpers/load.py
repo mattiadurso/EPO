@@ -313,10 +313,12 @@ def load_reconstruction(recon_path):
     """Load COLMAP reconstruction."""
     if isinstance(recon_path, str):
         recon = pycolmap.Reconstruction(recon_path)
+        path = recon_path
     else:
         recon = recon_path  # already loaded
+        path = None  # No file path available
 
     cams = recon.cameras
     imgs = recon.images
     id_to_name = {img.image_id: img.name for img in imgs.values()}
-    return recon, cams, imgs, id_to_name, recon_path
+    return recon, cams, imgs, id_to_name, path
