@@ -125,11 +125,22 @@ def filter_viewgraph_by_reprojection(
     reprojection_error=3.0,
     device="cuda",
 ):
-    """
-    Filters a viewgraph by filtering the percentage of points survived to a round-trip of reprojection.
-    """
+    """Filters viewgraph with batched reprojection."""
 
-    # Pre-cache all projection matrices and intrinsics in float16 (MAJOR speedup)
+    grid_cache = {}
+
+    def get_or_create_grid(h, w, sampling_factor, border, device):
+        key = (h, w, sampling_factor, border)
+        if key not in grid_cache:
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(border, h - border, sampling_factor, device=device),
+                torch.arange(border, w - border, sampling_factor, device=device),
+                indexing="ij",
+            )
+            grid_cache[key] = torch.stack((grid_x, grid_y), dim=-1).view(-1, 2).float()
+        return grid_cache[key]
+
+    # Pre-cache all data
     cached_P = {
         name: img_data["P"].projection_matrix().half()
         for name, img_data in images.items()
