@@ -179,7 +179,7 @@ class Adjuster(nn.Module):
             distance_factor=2,
             verbose=False,
         )
-        # Filter viewgraph by reprojection
+        # Filter viewgraph by reprojection | This need to be runned as batch and speeded up
         viewgraph = filter_viewgraph_by_reprojection(
             viewgraph,
             images,
@@ -197,29 +197,39 @@ class Adjuster(nn.Module):
         # Create optimizer
         params_to_optimize = {}
 
-        # Add intrinsics parameters (Camera objects)
+        # Collect parameters to optimize
         if self.grad_k:
             k_params = []
             for camera in self.intrinsics.values():
                 k_params.extend(camera.parameters())
             params_to_optimize["k"] = k_params
 
-        # Add pose parameters (Pose objects)
-        q_params, t_params = [], []
-        for image_name, image_data in self.images.items():
-            q_params.extend(
-                image_data["P"].parameters(q=True, t=False) if self.grad_q else []
-            )
-            t_params.extend(
-                image_data["P"].parameters(q=False, t=True) if self.grad_t else []
-            )
-        params_to_optimize["q"] = q_params
-        params_to_optimize["t"] = t_params
+        if self.grad_q:
+            q_params = []
+            for image_name, image_data in self.images.items():
+                q_params.extend(
+                    image_data["P"].parameters(q=True, t=False) if self.grad_q else []
+                )
+            params_to_optimize["q"] = q_params
 
-        total_params = sum(
-            p.numel() for params_set in params_to_optimize.values() for p in params_set
-        )
-        print(f"\nTotal parameters to optimize: {total_params:,}")
+        if self.grad_t:
+            t_params = []
+            for image_name, image_data in self.images.items():
+                t_params.extend(
+                    image_data["P"].parameters(q=False, t=True) if self.grad_t else []
+                )
+            params_to_optimize["t"] = t_params
+
+        total_params = 0
+        print("\nTotal parameters to optimize:")
+        for key in ["k", "t", "q", "z"]:
+            if key not in params_to_optimize:
+                print(f"  {key}: {0:>16,} parameters")
+                continue
+            set_params = sum(p.numel() for p in params_to_optimize[key])
+            print(f"  {key}: {set_params:>16,} parameters")
+
+        print(f"  {'Total':}: {total_params:>12,} parameters\n")
 
         # Create optimizer with collected parameters
         self.optimizer = self.load_optimizer(optim, params_to_optimize)
