@@ -155,6 +155,20 @@ class Adjuster(nn.Module):
             images[image_name].update(
                 {"edges_map": edges_map.squeeze(), "edges": edges}
             )
+
+        # pad with nans to have same number of edges per image
+        max_edges = max([images[img]["edges"].shape[0] for img in images.keys()])
+        for image_name in images.keys():
+            edges = images[image_name]["edges"]
+            n_edges = edges.shape[0]
+            if n_edges < max_edges:
+                pad_size = max_edges - n_edges
+                # pad = torch.full((pad_size, 2), float("nan"), device=edges.device)
+                pad = torch.zeros((pad_size, 2), device=edges.device)
+                edges = torch.cat([edges, pad], dim=0)
+                pad_mask = torch.zeros((max_edges,), device=edges.device)
+                pad_mask[:n_edges] = 1.0
+            images[image_name].update({"edges_padded": edges, "pad_mask": pad_mask})
         self.timings["extract_edges"] = time.time() - s_time
 
         ## Compute Distance Fields
@@ -228,12 +242,12 @@ class Adjuster(nn.Module):
                 continue
             set_params = sum(p.numel() for p in params_to_optimize[key])
             print(f"  {key}: {set_params:>16,} parameters")
+            total_params += set_params
 
         print(f"  {'Total':}: {total_params:>12,} parameters\n")
 
         # Create optimizer with collected parameters
         self.optimizer = self.load_optimizer(optim, params_to_optimize)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=not self.use_pypose)
 
         self.timings["total_loading"] = time.time() - time_start
         self.timings["total_optimization"] = 0
@@ -254,6 +268,7 @@ class Adjuster(nn.Module):
         max_steps=100,
         quick_mode=True,
         max_pairs=512,
+        type="sequential",
     ):
         """
         Main optimization loop.
@@ -272,22 +287,18 @@ class Adjuster(nn.Module):
         # Loop
         bar = tqdm(range(max_steps), desc="Adjusting poses and intrinsics")
         for _ in bar:
-            # initialize loss
-            with torch.amp.autocast(device_type=self.device, dtype=torch.float16):
+            # Sampling viewgraph if in quick mode
+            if len(self.viewgraph) > max_pairs and quick_mode:
+                sampled_indices = torch.randperm(len(self.viewgraph))[:max_pairs]
+                sampled_viewgraph = [self.viewgraph[i] for i in sampled_indices]
+            else:
+                sampled_viewgraph = self.viewgraph
+
+            # Initialize optimizer gradients
+            self.optimizer.zero_grad()
+
+            if type == "sequential":
                 loss = 0.0
-                self.optimizer.zero_grad()
-
-                # Loop over pairs
-                if len(self.viewgraph) > max_pairs and quick_mode:
-                    sampled_indices = torch.randperm(len(self.viewgraph))[:max_pairs]
-                    sampled_viewgraph = [self.viewgraph[i] for i in sampled_indices]
-                else:
-                    sampled_viewgraph = self.viewgraph
-
-                # To get compatibility with LM, this should be the forward pass
-                # of a nn.Module class. Also need to store parameter internally.
-                # TODO: Batch this part to speed up, return (N,) DT values.
-                # Then I can mean or pass to LM
                 for pair in sampled_viewgraph:
                     i, j = pair
                     image_i = self.images[i]
@@ -326,6 +337,7 @@ class Adjuster(nn.Module):
                         valid_12 = ~torch.isnan(edges_12).any(dim=1)
                     if edges_21.numel() > 0:
                         valid_21 = ~torch.isnan(edges_21).any(dim=1)
+
                     edges_12 = edges_12[valid_12]
                     edges_21 = edges_21[valid_21]
 
@@ -340,15 +352,124 @@ class Adjuster(nn.Module):
 
                     edge_loss = edge_loss_12.mean() + edge_loss_21.mean()
                     loss += edge_loss
-                    # self.pair_losses.append((i, j, edge_loss.item()))
 
-            loss /= len(sampled_viewgraph)
+                loss /= len(sampled_viewgraph)
+
+            elif type == "batched":
+                # prepare batched inputs
+                batch = {
+                    "xy0": [],
+                    "depthmap0": [],
+                    "P0": [],
+                    "P1": [],
+                    "K0": [],
+                    "K1": [],
+                }
+                pad_masks = []
+                dt_fields = []
+
+                s_time = time.time()
+                for i, j in sampled_viewgraph:
+                    K_i = self.intrinsics[self.images[i]["cam_id"]]
+                    K_j = self.intrinsics[self.images[j]["cam_id"]]
+
+                    batch["xy0"].append(self.images[i]["edges_padded"])
+                    batch["depthmap0"].append(self.images[i]["depth"])
+                    batch["P0"].append(self.images[i]["P"].projection_matrix())
+                    batch["P1"].append(self.images[j]["P"].projection_matrix())
+                    batch["K0"].append(K_i.intrinsic_matrix())
+                    batch["K1"].append(K_j.intrinsic_matrix())
+
+                    batch["xy0"].append(self.images[j]["edges_padded"])
+                    batch["depthmap0"].append(self.images[j]["depth"])
+                    batch["P0"].append(self.images[j]["P"].projection_matrix())
+                    batch["P1"].append(self.images[i]["P"].projection_matrix())
+                    batch["K0"].append(K_j.intrinsic_matrix())
+                    batch["K1"].append(K_i.intrinsic_matrix())
+
+                    pad_masks.append(self.images[i]["pad_mask"])
+                    pad_masks.append(self.images[j]["pad_mask"])
+
+                    dt_fields.append(self.images[j]["dt_field"])
+                    dt_fields.append(self.images[i]["dt_field"])
+
+                for key in batch:
+                    batch[key] = torch.stack(batch[key], dim=0)
+                batch["img1_shape"] = self.images[list(self.images.keys())[0]]["hw"]
+                pad_masks = torch.stack(pad_masks, dim=0)  # (B,)
+                dt_fields = torch.stack(dt_fields, dim=0)
+                self.timings["batch_preparation"] = time.time() - s_time
+
+                s_time = time.time()
+                # actual inference - keep NaN values
+                edges_reprojected = reproject_2D_2D(**batch)  # (B, N, 2)
+
+                # loss computation - NaN handling INSIDE sample_distance_field
+                edge_loss = sample_distance_field(
+                    dt_fields, edges_reprojected, device=self.device
+                )  # (B, N)
+                self.timings["batch_inference"] = time.time() - s_time
+
+                s_time
+                # --- Equivalent to Sequential Gradient Calculation ---
+                # Process pairs separately to match sequential behavior
+                pair_losses = []
+                for pair_idx in range(0, edge_loss.shape[0], 2):
+                    # Get the two directions for this pair
+                    loss_ij = edge_loss[pair_idx]  # i->j
+                    loss_ji = edge_loss[pair_idx + 1]  # j->i
+
+                    pad_mask_ij = pad_masks[pair_idx]
+                    pad_mask_ji = pad_masks[pair_idx + 1]
+
+                    # Filter NaN from invalid reprojections AND padded points
+                    valid_ij = ~torch.isnan(loss_ij) & (pad_mask_ij > 0)
+                    valid_ji = ~torch.isnan(loss_ji) & (pad_mask_ji > 0)
+
+                    valid_loss_ij = loss_ij[valid_ij]
+                    valid_loss_ji = loss_ji[valid_ji]
+
+                    # Compute mean per direction (not across pair!)
+                    mean_ij = (
+                        valid_loss_ij.mean()
+                        if valid_loss_ij.numel() > 0
+                        else torch.tensor(
+                            0.0,
+                            device=self.device,
+                            dtype=torch.float32,
+                            requires_grad=True,
+                        )
+                    )
+                    mean_ji = (
+                        valid_loss_ji.mean()
+                        if valid_loss_ji.numel() > 0
+                        else torch.tensor(
+                            0.0,
+                            device=self.device,
+                            dtype=torch.float32,
+                            requires_grad=True,
+                        )
+                    )
+
+                    # Sum the two directions for this pair
+                    pair_loss = mean_ij + mean_ji
+                    pair_losses.append(pair_loss)
+
+                # Average across pairs
+                loss = (
+                    torch.stack(pair_losses).mean()
+                    if pair_losses
+                    else torch.tensor(0.0, device=self.device)
+                )
+                self.timings["batch_loss_computation"] = time.time() - s_time
+
+            s_time = time.time()
+            # Backpropagate and update
+            loss.backward()
+            self.optimizer.step()
+            self.timings["backpropagation"] = time.time() - s_time
+
             self.loss_list.append(loss.item())
-
-            # Backpropagate and update (for all poses and intrinsics)
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
 
             bar.set_postfix(
                 loss=f"{loss.item():.3f}",
@@ -738,8 +859,4 @@ if __name__ == "__main__":
         optim="adamw",
     )
 
-    out = adjuster(
-        quick_mode=True,
-        max_pairs=512,
-        max_steps=30,
-    )
+    out = adjuster(quick_mode=True, max_pairs=512, max_steps=2, type="sequential")

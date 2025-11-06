@@ -142,11 +142,11 @@ def filter_viewgraph_by_reprojection(
 
     # Pre-cache all data
     cached_P = {
-        name: img_data["P"].projection_matrix().half()
+        name: img_data["P"].projection_matrix().float()
         for name, img_data in images.items()
     }
     cached_K = {
-        cam_id: cam.intrinsic_matrix().half() for cam_id, cam in intrinsics.items()
+        cam_id: cam.intrinsic_matrix().float() for cam_id, cam in intrinsics.items()
     }
 
     filtered_viewgraph = []
@@ -156,8 +156,8 @@ def filter_viewgraph_by_reprojection(
         jx1, jy1, jx2, jy2, jh, jw = [int(x) for x in images[j]["coords"]]
 
         # Convert depth to float16
-        Z1 = images[i]["depth"][iy1:iy2, ix1:ix2][None].half()
-        Z2 = images[j]["depth"][jy1:jy2, jx1:jx2][None].half()
+        Z1 = images[i]["depth"][iy1:iy2, ix1:ix2][None].float()
+        Z2 = images[j]["depth"][jy1:jy2, jx1:jx2][None].float()
 
         # Use cached matrices (already in float16)
         data = {
@@ -219,7 +219,7 @@ def grid_sample_nan(xy: Tensor, img: Tensor, mode="nearest") -> tuple[Tensor, Te
     if img.dim() == 3:
         # ? remove the channel dimension from the result at the end of the function
         squeeze_result = True
-        img.unsqueeze_(1)
+        img = img.unsqueeze(1)
     else:
         squeeze_result = False
 
@@ -254,8 +254,8 @@ def grid_sample_nan(xy: Tensor, img: Tensor, mode="nearest") -> tuple[Tensor, Te
         sampled[xy_invalid[:, None, :, :].repeat(1, C, 1, 1)] = float("nan")
 
     if squeeze_result:
-        img.squeeze_(1)
-        sampled.squeeze_(1)
+        img = img.squeeze(1)
+        sampled = sampled.squeeze(1)
 
     return sampled, mask_img_nan
 
@@ -264,7 +264,7 @@ def normalize_pixel_coordinates(
     xy: Tensor, shape: tuple[int, int] | Tensor | np.ndarray
 ) -> Tensor:
     """normalize pixel coordinates from -1 to +1. Being (-1,-1) the exact top left corner of the image
-    the coordinates must be given in a way that the center of pixel is at half coordinates (0.5,0.5)
+    the coordinates must be given in a way that the center of pixel is at .float() coordinates (0.5,0.5)
     xy ordered as (x, y) and shape ordered as (H, W)
     Args:
         xy: input coordinates in order (x,y) with the convention top-left pixel center is at coordinates (0.5, 0.5)
