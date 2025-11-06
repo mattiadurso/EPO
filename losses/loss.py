@@ -5,6 +5,7 @@ import torch
 def compute_distance_field(
     edges_map: torch.Tensor,
     device="cuda",
+    dtype=torch.float16,
 ):
     """
     Compute the Euclidean distance field from edges coordinates.
@@ -14,8 +15,8 @@ def compute_distance_field(
     Returns:
         field: Distance field of shape (H, W) showing distance from each pixel to nearest edge.
     """
-    edges_map = edges_map.to(device).float()
-    edges = edges_map.nonzero().flip(dims=(0, 1)).float()
+    edges_map = edges_map.to(device).to(dtype)
+    edges = edges_map.nonzero().flip(dims=(0, 1)).to(dtype)
 
     h, w = edges_map.shape
 

@@ -74,6 +74,7 @@ class Adjuster(nn.Module):
         grad_q=True,
         grad_t=True,
         grad_k=True,
+        viz=False,  # it true del non used stuff during computation
     ):
         super().__init__()
 
@@ -182,8 +183,15 @@ class Adjuster(nn.Module):
             images[image_name].update({"dt_field": dt_field})
         self.timings["compute_distance_fields"] = time.time() - s_time
 
+        # need to store before caching
+        self.images = images
+        self.intrinsics = intrinsics
+
         ## Viewgraph from frustums
         s_time = time.time()
+        # compute and cache P and K matrices once
+        self.P_cache, self.K_cache = None, None
+        self._cache_projection_matrices()
         # Estimate view graph from frustums
         viewgraph = build_view_graph_from_frustums(
             recon,
@@ -201,12 +209,11 @@ class Adjuster(nn.Module):
             th=0.025,
             sampling_factor=10,
             reprojection_error=3.0,
+            P_cache=self.P_cache,
+            K_cache=self.K_cache,
         )
-        self.timings["viewgraph"] = time.time() - s_time
-
-        self.images = images
         self.viewgraph = viewgraph
-        self.intrinsics = intrinsics
+        self.timings["viewgraph"] = time.time() - s_time
 
         # Create optimizer
         params_to_optimize = {}
@@ -253,8 +260,10 @@ class Adjuster(nn.Module):
         self.timings["total_optimization"] = 0
 
         # # At this point I might get rid of rgb images to save memory as not needed for edge loss
-        # for image_name in self.images.keys():
-        #     self.images[image_name].pop("image")
+        if not viz:
+            for image_name in self.images.keys():
+                self.images[image_name].pop("image")
+                self.images[image_name].pop("edges_map")
 
         self.loss_list = []
         self.seed = seed
@@ -284,9 +293,11 @@ class Adjuster(nn.Module):
                 f"Quick mode ON. Randomly sampling viewgraph from {len(self.viewgraph):,} to {max_pairs:,} pairs before every iteration."
             )
 
-        # Loop
         bar = tqdm(range(max_steps), desc="Adjusting poses and intrinsics")
-        for _ in bar:
+        for step in bar:
+            # Update cache at START of each step (after parameters changed)
+            self._cache_projection_matrices()
+
             # Sampling viewgraph if in quick mode
             if len(self.viewgraph) > max_pairs and quick_mode:
                 sampled_indices = torch.randperm(len(self.viewgraph))[:max_pairs]
@@ -303,29 +314,27 @@ class Adjuster(nn.Module):
                     i, j = pair
                     image_i = self.images[i]
                     image_j = self.images[j]
-                    K_i = self.intrinsics[image_i["cam_id"]]
-                    K_j = self.intrinsics[image_j["cam_id"]]
 
                     # project edges 1->2
                     edges_12 = reproject_2D_2D(
                         xy0=image_i["edges"][None],
                         depthmap0=image_i["depth"][None],
-                        P0=image_i["P"].projection_matrix()[None],
-                        P1=image_j["P"].projection_matrix()[None],
-                        K0=K_i.intrinsic_matrix()[None],
-                        K1=K_j.intrinsic_matrix()[None],
-                        img1_shape=image_j["image"].shape[-2:],
+                        P0=self.P_cache[i][None],
+                        P1=self.P_cache[j][None],
+                        K0=self.K_cache[image_i["cam_id"]][None],
+                        K1=self.K_cache[image_j["cam_id"]][None],
+                        img1_shape=image_j["hw"],
                     )
 
                     # project edges 2->1
                     edges_21 = reproject_2D_2D(
                         xy0=image_j["edges"][None],
                         depthmap0=image_j["depth"][None],
-                        P0=image_j["P"].projection_matrix()[None],
-                        P1=image_i["P"].projection_matrix()[None],
-                        K0=K_j.intrinsic_matrix()[None],
-                        K1=K_i.intrinsic_matrix()[None],
-                        img1_shape=image_i["image"].shape[-2:],
+                        P0=self.P_cache[j][None],
+                        P1=self.P_cache[i][None],
+                        K0=self.K_cache[image_j["cam_id"]][None],
+                        K1=self.K_cache[image_i["cam_id"]][None],
+                        img1_shape=image_i["hw"],
                     )
 
                     # Remove batch dimension before sampling
@@ -335,11 +344,11 @@ class Adjuster(nn.Module):
                     # Filter out NaN values
                     if edges_12.numel() > 0:
                         valid_12 = ~torch.isnan(edges_12).any(dim=1)
+                        edges_12 = edges_12[valid_12]
+
                     if edges_21.numel() > 0:
                         valid_21 = ~torch.isnan(edges_21).any(dim=1)
-
-                    edges_12 = edges_12[valid_12]
-                    edges_21 = edges_21[valid_21]
+                        edges_21 = edges_21[valid_21]
 
                     # compute loss
                     edge_loss_12 = sample_distance_field(
@@ -356,6 +365,10 @@ class Adjuster(nn.Module):
                 loss /= len(sampled_viewgraph)
 
             elif type == "batched":
+                # compute and cache projection matrices if not done yet
+                if len(self.loss_list) > 0:
+                    self._cache_projection_matrices()
+
                 # prepare batched inputs
                 batch = {
                     "xy0": [],
@@ -365,27 +378,22 @@ class Adjuster(nn.Module):
                     "K0": [],
                     "K1": [],
                 }
-                pad_masks = []
-                dt_fields = []
+                pad_masks, dt_fields = [], []
 
-                s_time = time.time()
                 for i, j in sampled_viewgraph:
-                    K_i = self.intrinsics[self.images[i]["cam_id"]]
-                    K_j = self.intrinsics[self.images[j]["cam_id"]]
-
                     batch["xy0"].append(self.images[i]["edges_padded"])
                     batch["depthmap0"].append(self.images[i]["depth"])
-                    batch["P0"].append(self.images[i]["P"].projection_matrix())
-                    batch["P1"].append(self.images[j]["P"].projection_matrix())
-                    batch["K0"].append(K_i.intrinsic_matrix())
-                    batch["K1"].append(K_j.intrinsic_matrix())
+                    batch["P0"].append(self.P_cache[i])
+                    batch["P1"].append(self.P_cache[j])
+                    batch["K0"].append(self.K_cache[self.images[i]["cam_id"]])
+                    batch["K1"].append(self.K_cache[self.images[j]["cam_id"]])
 
                     batch["xy0"].append(self.images[j]["edges_padded"])
                     batch["depthmap0"].append(self.images[j]["depth"])
-                    batch["P0"].append(self.images[j]["P"].projection_matrix())
-                    batch["P1"].append(self.images[i]["P"].projection_matrix())
-                    batch["K0"].append(K_j.intrinsic_matrix())
-                    batch["K1"].append(K_i.intrinsic_matrix())
+                    batch["P0"].append(self.P_cache[j])
+                    batch["P1"].append(self.P_cache[i])
+                    batch["K0"].append(self.K_cache[self.images[j]["cam_id"]])
+                    batch["K1"].append(self.K_cache[self.images[i]["cam_id"]])
 
                     pad_masks.append(self.images[i]["pad_mask"])
                     pad_masks.append(self.images[j]["pad_mask"])
@@ -398,9 +406,7 @@ class Adjuster(nn.Module):
                 batch["img1_shape"] = self.images[list(self.images.keys())[0]]["hw"]
                 pad_masks = torch.stack(pad_masks, dim=0)  # (B,)
                 dt_fields = torch.stack(dt_fields, dim=0)
-                self.timings["batch_preparation"] = time.time() - s_time
 
-                s_time = time.time()
                 # actual inference - keep NaN values
                 edges_reprojected = reproject_2D_2D(**batch)  # (B, N, 2)
 
@@ -408,9 +414,7 @@ class Adjuster(nn.Module):
                 edge_loss = sample_distance_field(
                     dt_fields, edges_reprojected, device=self.device
                 )  # (B, N)
-                self.timings["batch_inference"] = time.time() - s_time
 
-                s_time
                 # --- Equivalent to Sequential Gradient Calculation ---
                 # Process pairs separately to match sequential behavior
                 pair_losses = []
@@ -461,13 +465,10 @@ class Adjuster(nn.Module):
                     if pair_losses
                     else torch.tensor(0.0, device=self.device)
                 )
-                self.timings["batch_loss_computation"] = time.time() - s_time
 
-            s_time = time.time()
             # Backpropagate and update
             loss.backward()
             self.optimizer.step()
-            self.timings["backpropagation"] = time.time() - s_time
 
             self.loss_list.append(loss.item())
 
@@ -708,6 +709,17 @@ class Adjuster(nn.Module):
             images[image.name].update({"P": pose, "cam_id": cam_id})
 
         return images, intrinsics
+
+    def _cache_projection_matrices(self):
+        """Cache all P and K matrices to avoid recomputation"""
+        self.P_cache = {}
+        self.K_cache = {}
+
+        for image_name, image_data in self.images.items():
+            self.P_cache[image_name] = image_data["P"].projection_matrix()
+
+        for cam_id, camera in self.intrinsics.items():
+            self.K_cache[cam_id] = camera.intrinsic_matrix()
 
     def build_reconstruction(
         self, output_path="optimized_reconstruction", save_points=False
