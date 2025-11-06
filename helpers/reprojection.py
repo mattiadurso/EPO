@@ -124,12 +124,15 @@ def filter_viewgraph_by_reprojection(
     sampling_factor=10,
     reprojection_error=3.0,
     device="cuda",
+    P_cache=None,
+    K_cache=None,
 ):
     """Filters viewgraph with batched reprojection."""
 
     grid_cache = {}
 
     def get_or_create_grid(h, w, sampling_factor, border, device):
+        """Cache grids by (h, w, sampling_factor, border) to avoid recomputation"""
         key = (h, w, sampling_factor, border)
         if key not in grid_cache:
             grid_y, grid_x = torch.meshgrid(
@@ -140,14 +143,16 @@ def filter_viewgraph_by_reprojection(
             grid_cache[key] = torch.stack((grid_x, grid_y), dim=-1).view(-1, 2).float()
         return grid_cache[key]
 
-    # Pre-cache all data
-    cached_P = {
-        name: img_data["P"].projection_matrix().float()
-        for name, img_data in images.items()
-    }
-    cached_K = {
-        cam_id: cam.intrinsic_matrix().float() for cam_id, cam in intrinsics.items()
-    }
+    # Use cached matrices if provided, otherwise compute
+    if P_cache is None:
+        P_cache = {
+            name: img_data["P"].projection_matrix().float()
+            for name, img_data in images.items()
+        }
+    if K_cache is None:
+        K_cache = {
+            cam_id: cam.intrinsic_matrix().float() for cam_id, cam in intrinsics.items()
+        }
 
     filtered_viewgraph = []
 
@@ -155,37 +160,83 @@ def filter_viewgraph_by_reprojection(
         ix1, iy1, ix2, iy2, ih, iw = [int(x) for x in images[i]["coords"]]
         jx1, jy1, jx2, jy2, jh, jw = [int(x) for x in images[j]["coords"]]
 
-        # Convert depth to float16
+        # Convert depth to float32
         Z1 = images[i]["depth"][iy1:iy2, ix1:ix2][None].float()
         Z2 = images[j]["depth"][jy1:jy2, jx1:jx2][None].float()
 
-        # Use cached matrices (already in float16)
+        # Get cached grid instead of creating new one
+        grid_i = get_or_create_grid(ih, iw, sampling_factor, border, device)
+        grid_j = get_or_create_grid(jh, jw, sampling_factor, border, device)
+
+        # Use cached matrices
         data = {
-            "P0": cached_P[i][None],
-            "P1": cached_P[j][None],
-            "K0": cached_K[images[i]["cam_id"]][None],
-            "K1": cached_K[images[j]["cam_id"]][None],
+            "P0": P_cache[i][None],
+            "P1": P_cache[j][None],
+            "K0": K_cache[images[i]["cam_id"]][None],
+            "K1": K_cache[images[j]["cam_id"]][None],
             "depth0": Z1,
             "depth1": Z2,
         }
 
         with torch.amp.autocast(device_type=device, dtype=torch.float16):
-            kpt0, _, tot_kpts = compute_121_reprojection(
-                data,
-                images[i]["image"],
-                images[j]["image"],
-                reprojection_error=reprojection_error,
-                border=border,
-                sampling_factor=sampling_factor,
-                verbose=False,
-                device=device,
+            # project the points to img1
+            kpts1 = reproject_2D_2D(
+                xy0=grid_i[None],  # ✓ Use cached grid
+                depthmap0=data["depth0"],
+                P0=data["P0"],
+                P1=data["P1"],
+                K0=data["K0"],
+                K1=data["K1"],
+                img1_shape=(jh, jw),
             )
 
-        if tot_kpts > 0:  # Avoid division by zero
+            # back project the points to img0
+            kpts0_back = reproject_2D_2D(
+                xy0=kpts1,
+                depthmap0=data["depth1"],
+                P0=data["P1"],
+                P1=data["P0"],
+                K0=data["K1"],
+                K1=data["K0"],
+                img1_shape=(ih, iw),
+            )
+
+        # Remove NaNs
+        nan_mask = torch.logical_or(
+            torch.isnan(kpts1).any(dim=-1), torch.isnan(kpts0_back).any(dim=-1)
+        )
+        kpts0_valid = grid_i[~nan_mask.squeeze()]
+        kpts1_valid = kpts1[~nan_mask]
+        kpts0_back_valid = kpts0_back[~nan_mask]
+
+        # Check reprojection consistency
+        reprojection_dist = torch.sqrt(
+            ((kpts0_valid - kpts0_back_valid) ** 2).sum(dim=-1)
+        )
+        consistent_mask = reprojection_dist < reprojection_error
+
+        kpts0_consistent = kpts0_valid[consistent_mask]
+
+        # Check border constraints
+        if kpts0_consistent.numel() > 0:
+            mask_x = torch.logical_and(
+                kpts1_valid[:, 0] > border, kpts1_valid[:, 0] < jw - border
+            )
+            mask_y = torch.logical_and(
+                kpts1_valid[:, 1] > border, kpts1_valid[:, 1] < jh - border
+            )
+            mask = torch.logical_and(mask_x, mask_y)
+            kpt0 = kpts0_valid[mask]
+        else:
+            kpt0 = kpts0_consistent
+
+        tot_kpts = grid_i.shape[0]
+        if tot_kpts > 0:
             perc = len(kpt0) / tot_kpts
             if perc >= th or len(kpt0) >= min_points:
                 filtered_viewgraph.append((i, j))
 
+    print(f"Filtered viewgraph: {len(filtered_viewgraph)} pairs retained")
     return filtered_viewgraph
 
 
