@@ -59,7 +59,7 @@ class Adjuster(nn.Module):
 
     def __init__(
         self,
-        reconstruction,
+        reconstruction_path,
         images_path,
         depths_path,
         lr=1e-3,
@@ -83,12 +83,16 @@ class Adjuster(nn.Module):
             "adamw",
             "lm",
         ], f"Optimizer {optim} not supported."
-        self.use_pypose = False
 
         self.max_workers = os.cpu_count() if max_workers < 0 else max_workers
         self.images_size = 518  # square size to which images are resized
         self.device = device
         self.lr = lr
+        self.load_with_pad = load_with_pad
+        self.images_path = images_path
+        self.depths_path = depths_path
+        self.reconstruction_path = reconstruction_path
+        self.single_camera_per_folder = single_camera_per_folder
 
         # Edge extractor
         if detector == "canny":
@@ -110,148 +114,46 @@ class Adjuster(nn.Module):
         self.timings = {}
         time_start = time.time()
 
-        recon = pycolmap.Reconstruction(reconstruction)
+        ## Load Reconstruction
+        self.recon = pycolmap.Reconstruction(self.reconstruction_path)
 
         ## Load Images as dict {image_name: image_tensor}
         s_time = time.time()
-        image_path_list = find_images(images_path)
-        images = load_and_preprocess_images(
-            image_path_list,
-            images_path,
-            target_size=self.images_size,
-            max_workers=self.max_workers,
-            load_with_pad=load_with_pad,
-            device=self.device,
-        )
+        self.image_path_list = find_images(self.images_path)
+        self._load_and_preprocess_images()  # into self.images
         self.timings["load_images"] = time.time() - s_time
 
         ## Load poses and intrinsics
         s_time = time.time()
-        images, intrinsics = self.read_cameras_from_reconstruction(
-            recon,
-            images,
-            single_camera_per_folder=single_camera_per_folder,
-            load_with_pad=load_with_pad,
-        )
+        self._read_cameras_from_reconstruction()  # into self.images and self.intrinsics
         self.timings["load_poses_and_intrinsics"] = time.time() - s_time
 
         ## Load depth maps
         s_time = time.time()
-        images = load_and_preprocess_depths(
-            depths_path,
-            images,
-            target_size=self.images_size,
-            max_workers=self.max_workers,
-            load_with_pad=load_with_pad,
-            device=self.device,
-        )
+        self._load_and_preprocess_depths()
         self.timings["load_depth_maps"] = time.time() - s_time
 
         ## Extract edges
         s_time = time.time()
-        for image_name in tqdm(images.keys(), desc=f"Extracting edges"):
-            img_tensor = images[image_name]["image"].unsqueeze(0).to(self.device)
-            edges_map = self.edge_extractor(img_tensor)
-            edges = edges_map.squeeze().nonzero().flip(dims=(1, 0)).float()  # (N, 2)
-            images[image_name].update(
-                {"edges_map": edges_map.squeeze(), "edges": edges}
-            )
-
-        # pad with nans to have same number of edges per image
-        max_edges = max([images[img]["edges"].shape[0] for img in images.keys()])
-        for image_name in images.keys():
-            edges = images[image_name]["edges"]
-            n_edges = edges.shape[0]
-            if n_edges < max_edges:
-                pad_size = max_edges - n_edges
-                # pad = torch.full((pad_size, 2), float("nan"), device=edges.device)
-                pad = torch.zeros((pad_size, 2), device=edges.device)
-                edges = torch.cat([edges, pad], dim=0)
-                pad_mask = torch.zeros((max_edges,), device=edges.device)
-                pad_mask[:n_edges] = 1.0
-            images[image_name].update({"edges_padded": edges, "pad_mask": pad_mask})
+        self._extract_edges()  # into self.images
         self.timings["extract_edges"] = time.time() - s_time
 
         ## Compute Distance Fields
         s_time = time.time()
-        for image_name in tqdm(images.keys(), desc="Computing distance fields"):
-            edges_map = images[image_name]["edges_map"]
-            dt_field = compute_distance_field(
-                edges_map,
-                device=self.device,
-            )
-            images[image_name].update({"dt_field": dt_field})
+        self._compute_distance_fields()  # into self.images
         self.timings["compute_distance_fields"] = time.time() - s_time
-
-        # need to store before caching
-        self.images = images
-        self.intrinsics = intrinsics
 
         ## Viewgraph from frustums
         s_time = time.time()
         # compute and cache P and K matrices once
         self.P_cache, self.K_cache = None, None
         self._cache_projection_matrices()
-        # Estimate view graph from frustums
-        viewgraph = build_view_graph_from_frustums(
-            recon,
-            z_near_default=0.1,
-            z_far_default=5.0,
-            max_view_angle_deg=30.0,
-            distance_factor=2,
-            verbose=False,
-        )
-        # Filter viewgraph by reprojection | This need to be runned as batch and speeded up
-        viewgraph = filter_viewgraph_by_reprojection(
-            viewgraph,
-            images,
-            intrinsics,
-            th=0.025,
-            sampling_factor=10,
-            reprojection_error=3.0,
-            P_cache=self.P_cache,
-            K_cache=self.K_cache,
-        )
-        self.viewgraph = viewgraph
-        self.timings["viewgraph"] = time.time() - s_time
+        self._compute_viewgraph()
+        self.timings["compute_viewgraph"] = time.time() - s_time
 
         # Create optimizer
-        params_to_optimize = {}
-
-        # Collect parameters to optimize
-        if self.grad_k:
-            k_params = []
-            for camera in self.intrinsics.values():
-                k_params.extend(camera.parameters())
-            params_to_optimize["k"] = k_params
-
-        if self.grad_q:
-            q_params = []
-            for image_name, image_data in self.images.items():
-                q_params.extend(
-                    image_data["P"].parameters(q=True, t=False) if self.grad_q else []
-                )
-            params_to_optimize["q"] = q_params
-
-        if self.grad_t:
-            t_params = []
-            for image_name, image_data in self.images.items():
-                t_params.extend(
-                    image_data["P"].parameters(q=False, t=True) if self.grad_t else []
-                )
-            params_to_optimize["t"] = t_params
-
-        total_params = 0
-        print("\nTotal parameters to optimize:")
-        for key in ["k", "t", "q", "z"]:
-            if key not in params_to_optimize:
-                print(f"  {key}: {0:>16,} parameters")
-                continue
-            set_params = sum(p.numel() for p in params_to_optimize[key])
-            print(f"  {key}: {set_params:>16,} parameters")
-            total_params += set_params
-
-        print(f"  {'Total':}: {total_params:>12,} parameters\n")
+        params_to_optimize = self._collect_parameters_to_optimize()
+        self._print_params_summary(params_to_optimize)
 
         # Create optimizer with collected parameters
         self.optimizer = self.load_optimizer(optim, params_to_optimize)
@@ -293,6 +195,7 @@ class Adjuster(nn.Module):
                 f"Quick mode ON. Randomly sampling viewgraph from {len(self.viewgraph):,} to {max_pairs:,} pairs before every iteration."
             )
 
+        max_steps = max_steps if max_steps > 0 else 100_000
         bar = tqdm(range(max_steps), desc="Adjusting poses and intrinsics")
         for step in bar:
             # Update cache at START of each step (after parameters changed)
@@ -710,17 +613,6 @@ class Adjuster(nn.Module):
 
         return images, intrinsics
 
-    def _cache_projection_matrices(self):
-        """Cache all P and K matrices to avoid recomputation"""
-        self.P_cache = {}
-        self.K_cache = {}
-
-        for image_name, image_data in self.images.items():
-            self.P_cache[image_name] = image_data["P"].projection_matrix()
-
-        for cam_id, camera in self.intrinsics.items():
-            self.K_cache[cam_id] = camera.intrinsic_matrix()
-
     def build_reconstruction(
         self, output_path="optimized_reconstruction", save_points=False
     ):
@@ -854,6 +746,145 @@ class Adjuster(nn.Module):
             print(f"Reconstruction saved to: {output_path}")
 
         return reconstruction
+
+    def _cache_projection_matrices(self):
+        """Cache all P and K matrices to avoid recomputation"""
+        self.P_cache = {}
+        self.K_cache = {}
+
+        for image_name, image_data in self.images.items():
+            self.P_cache[image_name] = image_data["P"].projection_matrix()
+
+        for cam_id, camera in self.intrinsics.items():
+            self.K_cache[cam_id] = camera.intrinsic_matrix()
+
+    def _load_and_preprocess_images(self):
+        self.images = load_and_preprocess_images(
+            self.image_path_list,
+            self.images_path,
+            target_size=self.images_size,
+            max_workers=self.max_workers,
+            load_with_pad=self.load_with_pad,
+            device=self.device,
+        )
+
+    def _read_cameras_from_reconstruction(self):
+        self.images, self.intrinsics = self.read_cameras_from_reconstruction(
+            self.recon,
+            self.images,
+            single_camera_per_folder=self.single_camera_per_folder,
+            load_with_pad=self.load_with_pad,
+        )
+
+    def _load_and_preprocess_depths(self):
+        self.images = load_and_preprocess_depths(
+            self.depths_path,
+            self.images,
+            target_size=self.images_size,
+            max_workers=self.max_workers,
+            load_with_pad=self.load_with_pad,
+            device=self.device,
+        )
+
+    def _extract_edges(self):
+        for image_name in tqdm(self.images.keys(), desc=f"Extracting edges"):
+            img_tensor = self.images[image_name]["image"].unsqueeze(0).to(self.device)
+            edges_map = self.edge_extractor(img_tensor)
+            edges = edges_map.squeeze().nonzero().flip(dims=(1, 0)).float()  # (N, 2)
+            self.images[image_name].update(
+                {"edges_map": edges_map.squeeze(), "edges": edges}
+            )
+
+        # pad with nans to have same number of edges per image
+        max_edges = max(
+            [self.images[img]["edges"].shape[0] for img in self.images.keys()]
+        )
+        for image_name in self.images.keys():
+            edges = self.images[image_name]["edges"]
+            n_edges = edges.shape[0]
+            if n_edges < max_edges:
+                pad_size = max_edges - n_edges
+                # pad = torch.full((pad_size, 2), float("nan"), device=edges.device)
+                pad = torch.zeros((pad_size, 2), device=edges.device)
+                edges = torch.cat([edges, pad], dim=0)
+                pad_mask = torch.zeros((max_edges,), device=edges.device)
+                pad_mask[:n_edges] = 1.0
+            self.images[image_name].update(
+                {"edges_padded": edges, "pad_mask": pad_mask}
+            )
+
+    def _compute_distance_fields(self):
+        for image_name in tqdm(self.images.keys(), desc="Computing distance fields"):
+            edges_map = self.images[image_name]["edges_map"]
+            dt_field = compute_distance_field(
+                edges_map,
+                device=self.device,
+            )
+            self.images[image_name].update({"dt_field": dt_field})
+
+    def _compute_viewgraph(self):
+        # Estimate view graph from frustums
+        viewgraph = build_view_graph_from_frustums(
+            self.recon,
+            z_near_default=0.1,
+            z_far_default=5.0,
+            max_view_angle_deg=30.0,
+            distance_factor=2,
+            verbose=False,
+        )
+        # Filter viewgraph by reprojection | This need to be runned as batch and speeded up
+        viewgraph = filter_viewgraph_by_reprojection(
+            viewgraph,
+            self.images,
+            self.intrinsics,
+            th=0.025,
+            sampling_factor=10,
+            reprojection_error=3.0,
+            P_cache=self.P_cache,
+            K_cache=self.K_cache,
+        )
+        self.viewgraph = viewgraph
+
+    def _collect_parameters_to_optimize(self):
+        params_to_optimize = {}
+
+        # Collect parameters to optimize
+        if self.grad_k:
+            k_params = []
+            for camera in self.intrinsics.values():
+                k_params.extend(camera.parameters())
+            params_to_optimize["k"] = k_params
+
+        if self.grad_q:
+            q_params = []
+            for image_name, image_data in self.images.items():
+                q_params.extend(
+                    image_data["P"].parameters(q=True, t=False) if self.grad_q else []
+                )
+            params_to_optimize["q"] = q_params
+
+        if self.grad_t:
+            t_params = []
+            for image_name, image_data in self.images.items():
+                t_params.extend(
+                    image_data["P"].parameters(q=False, t=True) if self.grad_t else []
+                )
+            params_to_optimize["t"] = t_params
+
+        return params_to_optimize
+
+    def _print_params_summary(self, params_to_optimize):
+        total_params = 0
+        print("\nTotal parameters to optimize:")
+        for key in ["k", "t", "q", "z"]:
+            if key not in params_to_optimize:
+                print(f"  {key}: {0:>16,} parameters")
+                continue
+            set_params = sum(p.numel() for p in params_to_optimize[key])
+            print(f"  {key}: {set_params:>16,} parameters")
+            total_params += set_params
+
+        print(f"  {'Total':}: {total_params:>12,} parameters\n")
 
 
 if __name__ == "__main__":
