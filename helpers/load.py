@@ -173,6 +173,7 @@ def load_and_preprocess_images(
                 "image": img_tensor.to(device),
                 "coords": torch.from_numpy(coords).to(device),
                 "scale": scale,
+                "hw": (img_tensor.shape[-2], img_tensor.shape[-1]),
             }
 
     return images_dict
