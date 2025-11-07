@@ -5,7 +5,7 @@ import torch
 def compute_distance_field(
     edges_map: torch.Tensor,
     device="cuda",
-    dtype=torch.float16,
+    dtype=torch.float32,
 ):
     """
     Compute the Euclidean distance field from edges coordinates.
