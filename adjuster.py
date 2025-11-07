@@ -435,9 +435,10 @@ class Adjuster(nn.Module):
             print(
                 f"{'Loss reduction:':<{key_width}}{delta:>{val_width + perc_width + 4}.6f}"
             )
-            steps = 0 if len(self.loss_list) == 0 else len(self.loss_list)
+            steps = len(self.loss_list)
+            conv = " (converged)" if self.convergence else ""
             print(
-                f"{'Total steps:':<{key_width}}{steps:>{val_width + perc_width + 4}d}"
+                f"{f'Total steps{conv}:':<{key_width}}{steps:>{val_width + perc_width + 4}d}"
             )
 
         print("=" * w)
