@@ -319,6 +319,11 @@ class Adjuster(nn.Module):
 
             bar.set_postfix(
                 loss=f"{loss.item():.4f}",
+                auc5=(
+                    f"{self.auc_list[-1][-1]:.4f}"
+                    if self.gt_path is not None
+                    else "N/A"
+                ),
             )
 
         self.timings["total_optimization"] += time.time() - time_start
