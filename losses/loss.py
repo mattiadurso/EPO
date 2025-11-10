@@ -5,8 +5,9 @@ import torch
 def compute_distance_field(
     edges_map: torch.Tensor,
     device="cuda",
-    dtype=torch.float64,  # large distances (large images) might overflow
+    dtype=torch.float32,  # large distances (large images) might overflow
 ):
+    # TODO: run all this in fp16. carefully normalize EVERITHING in 0-1 range
     """
     Compute the Euclidean distance field from edges coordinates.
     Args:
@@ -15,11 +16,12 @@ def compute_distance_field(
     Returns:
         field: Distance field of shape (H, W) showing distance from each pixel to nearest edge.
     """
+    # dtype = torch.float16 if normalize else dtype
+    h, w = edges_map.shape[-2:]
+
     edges_dtype = edges_map.dtype
     edges_map = edges_map.to(device).to(dtype)
     edges = edges_map.nonzero().flip(dims=(0, 1)).to(dtype)
-
-    h, w = edges_map.shape
 
     # Create a grid of pixel coordinates
     y_coords, x_coords = torch.meshgrid(
@@ -28,9 +30,9 @@ def compute_distance_field(
         indexing="ij",
     )
 
-    pixel_coords = (
-        torch.stack([x_coords.flatten(), y_coords.flatten()], dim=1).to(dtype).to(dtype)
-    )  # (h*w, 2)
+    pixel_coords = torch.stack([x_coords.flatten(), y_coords.flatten()], dim=1).to(
+        dtype
+    )
 
     # Compute distances from all pixels to target points
     pixel_dists = torch.cdist(
@@ -39,9 +41,9 @@ def compute_distance_field(
     min_pixel_dists, _ = torch.min(pixel_dists[0], dim=1)  # (h*w,)
 
     # Reshape to image
-    full_field = min_pixel_dists.view(h, w)
+    full_field = min_pixel_dists.view(h, w).to(edges_dtype)
 
-    return full_field.to(edges_dtype)
+    return full_field
 
 
 def sample_distance_field(

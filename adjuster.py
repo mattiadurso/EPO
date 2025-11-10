@@ -13,6 +13,7 @@ import torch.nn as nn
 import pycolmap
 import warnings
 import random
+import torch.nn.functional as F
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -75,6 +76,7 @@ class Adjuster(nn.Module):
         reconstruction_path,
         images_path,
         depths_path,
+        viewgraph_path=None,  # for testing with GT viewgraph
         lr=1e-3,
         single_camera_per_folder=True,
         load_with_pad=True,
@@ -111,6 +113,7 @@ class Adjuster(nn.Module):
         self.single_camera_per_folder = single_camera_per_folder
         self.convergence = False
         self.gt_path = gt_path
+        self.viewgraph_path = viewgraph_path
         self.auc_list = []
 
         # Edge extractor
@@ -156,7 +159,7 @@ class Adjuster(nn.Module):
         s_time = time.time()
         self._extract_edges()  # into self.images
         self.timings["extract_edges"] = time.time() - s_time
-        print("max edges per image: ", self.max_edges)
+        print(f"max edges per image: {self.max_edges:,}")
 
         ## Compute Distance Fields
         s_time = time.time()
@@ -168,7 +171,13 @@ class Adjuster(nn.Module):
         # compute and cache P and K matrices once
         self.P_cache, self.K_cache = None, None
         self._cache_projection_matrices()
-        self._compute_viewgraph()
+
+        if self.viewgraph_path is None:
+            self._compute_viewgraph()
+        else:
+            self._read_viewgraph()
+        # vg is a lsit of names of image pairs, sort by the the first name
+        self.viewgraph.sort(key=lambda x: (x[0], x[1]))
         self.timings["compute_viewgraph"] = time.time() - s_time
 
         # Create optimizer
@@ -242,11 +251,14 @@ class Adjuster(nn.Module):
         bar = tqdm(range(max_steps), desc="Adjusting poses and intrinsics")
 
         for step in bar:
+            # Initialize optimizer gradients
+            self.optimizer.zero_grad()
+
             # Update cache at START of each step (after parameters changed)
             self._cache_projection_matrices()
 
-            # Initialize optimizer gradients
-            self.optimizer.zero_grad()
+            # Unproject point and put them into "edges3D"
+            # self._unproject_points()
 
             if quick_mode:  # reduce pairs randomly each step
                 if len(self.viewgraph) > batch_size:
@@ -318,7 +330,7 @@ class Adjuster(nn.Module):
                     break
 
             bar.set_postfix(
-                loss=f"{loss.item():.4f}",
+                loss=f"{loss.item():.6f}",
                 auc5=(
                     f"{self.auc_list[-1][-1]:.4f}"
                     if self.gt_path is not None
@@ -782,6 +794,7 @@ class Adjuster(nn.Module):
             "P1": [],
             "K0": [],
             "K1": [],
+            "img1_shape": [],
         }
         pad_masks, dt_fields = [], []
 
@@ -792,6 +805,7 @@ class Adjuster(nn.Module):
             batch["P1"].append(self.P_cache[j])
             batch["K0"].append(self.K_cache[self.images[i]["cam_id"]])
             batch["K1"].append(self.K_cache[self.images[j]["cam_id"]])
+            batch["img1_shape"].append(self.images[j]["hw"])
 
             batch["xy0"].append(self.images[j]["edges_padded"])
             batch["depthmap0"].append(self.images[j]["depth"])
@@ -799,6 +813,7 @@ class Adjuster(nn.Module):
             batch["P1"].append(self.P_cache[i])
             batch["K0"].append(self.K_cache[self.images[j]["cam_id"]])
             batch["K1"].append(self.K_cache[self.images[i]["cam_id"]])
+            batch["img1_shape"].append(self.images[i]["hw"])
 
             pad_masks.append(self.images[i]["pad_mask"])
             pad_masks.append(self.images[j]["pad_mask"])
@@ -807,8 +822,20 @@ class Adjuster(nn.Module):
             dt_fields.append(self.images[i]["dt_field"])
 
         for key in batch:
+            if key in ["img1_shape"]:
+                continue
             batch[key] = torch.stack(batch[key], dim=0)
-        batch["img1_shape"] = self.images[list(self.images.keys())[0]]["hw"]
+
+        # if img_shape us a list of tuple all equal, use a tuple to run faster
+        batch["img1_shape"] = (
+            batch["img1_shape"][0]
+            if all(
+                batch["img1_shape"][k] == batch["img1_shape"][0]
+                for k in range(len(batch["img1_shape"]))
+            )
+            else batch["img1_shape"]
+        )
+
         pad_masks = torch.stack(pad_masks, dim=0)  # (B,)
         dt_fields = torch.stack(dt_fields, dim=0)
 
@@ -899,6 +926,23 @@ class Adjuster(nn.Module):
             load_with_pad=self.load_with_pad,
             device=self.device,
         )
+        # check all depths have the same size
+        depth_shapes = set()
+        for image_name in self.images.keys():
+            depth_shapes.add(self.images[image_name]["depth"].shape[-2:])
+        if len(depth_shapes) > 1:
+            # pad bottom right to make them equal
+            max_h = max([shape[0] for shape in depth_shapes])
+            max_w = max([shape[1] for shape in depth_shapes])
+            for image_name in self.images.keys():
+                depth = self.images[image_name]["depth"]
+                h, w = depth.shape[-2:]
+                if h < max_h or w < max_w:
+                    pad_bottom = max_h - h
+                    pad_right = max_w - w
+                    pad = (0, pad_right, 0, pad_bottom)  # left, right, top, bottom
+                    depth = F.pad(depth, pad, mode="constant", value=depth.max())
+                    self.images[image_name]["depth"] = depth
 
     def _extract_edges(self):
         for image_name in tqdm(self.images.keys(), desc=f"Extracting edges"):
@@ -930,6 +974,7 @@ class Adjuster(nn.Module):
 
     @torch.inference_mode()
     def _compute_distance_fields(self):
+        dt_fields_shapes = []
         for image_name in tqdm(self.images.keys(), desc="Computing distance fields"):
             edges_map = self.images[image_name]["edges_map"]
             dt_field = compute_distance_field(
@@ -937,6 +982,24 @@ class Adjuster(nn.Module):
                 device=self.device,
             )
             self.images[image_name].update({"dt_field": dt_field})
+            dt_fields_shapes.append(dt_field.shape)
+
+        # if dt_fields_shapes is not equal, need to pad right bottom to make them equal
+        if len(set(dt_fields_shapes)) > 1:
+            max_h = max([shape[0] for shape in dt_fields_shapes])
+            max_w = max([shape[1] for shape in dt_fields_shapes])
+            for image_name in self.images.keys():
+                dt_field = self.images[image_name]["dt_field"]
+                h, w = dt_field.shape
+                if h < max_h or w < max_w:
+                    pad_bottom = max_h - h
+                    pad_right = max_w - w
+                    pad = (0, pad_right, 0, pad_bottom)  # left, right, top, bottom
+                    dt_field = F.pad(
+                        dt_field, pad, mode="constant", value=dt_field.max()
+                    )
+                    self.images[image_name]["dt_field"] = dt_field
+
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -963,6 +1026,18 @@ class Adjuster(nn.Module):
             K_cache=self.K_cache,
         )
         self.viewgraph = viewgraph
+
+    def _load_viewgraph(self):
+        """Load viewgraph from a text file formamted as [(img_i, img_j), ...]."""
+        with open(self.viewgraph_path, "r") as f:
+            lines = f.readlines()
+        self.viewgraph = []
+        for line in lines:
+            i, j, _ = line.strip().split()
+            self.viewgraph.append((i, j))
+        print(
+            f"Loaded GT viewgraph with {len(self.viewgraph):,} edges from {viewgraph_path}"
+        )
 
     def _collect_parameters_to_optimize(self):
         params_to_optimize = {}
@@ -1100,20 +1175,25 @@ class Adjuster(nn.Module):
 
 if __name__ == "__main__":
 
+    # british_museum
     reconstruction_path = (
-        "/home/mattia/Desktop/Repos/vggt/wrapper_output/vienna_state_opera/sparse"
+        "/home/mattia/Desktop/Repos/vggt/wrapper_output/british_museum/sparse"
     )
-    images_path = (
-        "/home/mattia/Desktop/datasets/mydataset/data/vienna_state_opera/frames"
-    )
-    depths_path = "/home/mattia/Desktop/Repos/vggt/wrapper_output/vienna_state_opera/sparse/depth_maps"
-    gt_path = "/home/mattia/Desktop/datasets/mydataset/data/vienna_state_opera/colmap/sparse/0"
+    images_path = "/home/mattia/Desktop/Repos/wrapper_factory/benchmarks_2D/imc/data/phototourism/british_museum/set_100/images"
+    depths_path = "/home/mattia/Desktop/Repos/vggt/wrapper_output/british_museum/sparse/depth_maps"
+    gt_path = "/home/mattia/Desktop/Repos/wrapper_factory/benchmarks_2D/imc/data/phototourism/british_museum/set_100/colmap/sparse"
+    detector_params = {
+        "low_threshold": 0.2,
+        "high_threshold": 0.3,
+        "kernel_size": 11,
+        "sigma": 9,
+    }
 
     adjuster = Adjuster(
         reconstruction_path=reconstruction_path,
         images_path=images_path,
         depths_path=depths_path,
-        single_camera_per_folder=True,
+        single_camera_per_folder=False,
         load_with_pad=False,
         lr=5e-3,
         grad_q=True,
@@ -1123,14 +1203,15 @@ if __name__ == "__main__":
         scheduler_params={"factor": 0.5, "patience": 3, "min_lr": 1e-6},
         gt_path=gt_path,
         # viz=True,
+        detector_params=detector_params,
     )
 
     adjuster.print_summary()
 
     adjuster(
-        batch_size=128,  # saturate this value to fully utilize the GPU
+        batch_size=256,  # saturate this value to fully utilize the GPU
         type="batched",  # "sequential" or "batched"
         max_steps=30,
-        quick_mode=False,  # if True, randomly samples of batch_size at each step
+        quick_mode=True,  # if True, randomly samples of batch_size at each step
         gradient_tolerance=1e-6,  # stop if relative change in loss is below this value
     )
