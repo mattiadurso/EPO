@@ -66,16 +66,29 @@ from benchmark_pose import eval_colmap_model
 
 class Adjuster(nn.Module):
     """
-    Currently I am at an early stage of implementing this class. So i'll just describe what it should do.
-
-    Inputs:
-        - images: A batch of images (B, C, H, W)
-        - depth_maps: Initial depth maps (B, 1, H, W)
-        - pycolmap.Reconstruction: A pycolmap reconstruction object containing the initial poses and intrinsics
-                                    (or directly the poses and intrinsics in torch)
-
-    Outputs:
-        optimized depth maps, updated pycolmap.Reconstruction
+    Module to adjust poses and intrinsics of a given reconstruction using edge alignment losses.
+    Args:
+        reconstruction_path (str): Path to the COLMAP reconstruction folder.
+        images_path (str): Path to the folder containing input images.
+        depths_path (str): Path to the folder containing depth maps.
+        viewgraph_path (str, optional): Path to a precomputed viewgraph file. If None, it will be computed from frustums.
+        lr (float, optional): Learning rate for the optimizer. Default is 1e-3.
+        single_camera_per_folder (bool, optional): Whether to assume a single camera per folder. Default is True.
+        load_with_pad (bool, optional): Whether to load images with padding to make them square. Default is True.
+        detector (str, optional): Edge detector to use. Default is "canny".
+        device (str, optional): Device to use for computation. Default is "cuda".
+        max_workers (int, optional): Maximum number of workers for parallel loading. Default is -1 (all available).
+        detector_params (dict, optional): Parameters for the edge detector.
+        seed (int, optional): Random seed for reproducibility. Default is 0.
+        optim (str, optional): Optimizer to use ("adamw" or "lm"). Default is "adamw".
+        scheduler_name (str, optional): Learning rate scheduler name. Default is None.
+        scheduler_params (dict, optional): Parameters for the learning rate scheduler.
+        grad_q (bool, optional): Whether to optimize rotation quaternions. Default is True.
+        grad_t (bool, optional): Whether to optimize translation vectors. Default is True.
+        grad_k (bool, optional): Whether to optimize camera intrinsics. Default is True.
+        grad_z (bool, optional): Whether to optimize depth scale. Default is False.
+        viz (bool, optional): Whether to visualize intermediate results. Default is False.
+        gt_path (str, optional): Path to ground truth data for evaluation. Default is None.
     """
 
     def __init__(
@@ -92,7 +105,6 @@ class Adjuster(nn.Module):
         max_workers=-1,
         detector_params={},
         seed=0,
-        optim="adamw",  # or "LM"
         scheduler_name=None,
         scheduler_params={},
         grad_q=True,
@@ -105,10 +117,6 @@ class Adjuster(nn.Module):
         super().__init__()
 
         assert detector in ["canny"], f"Detector {detector} not supported."
-        assert optim.lower() in [
-            "adamw",
-            "lm",
-        ], f"Optimizer {optim} not supported."
 
         self.max_workers = os.cpu_count() if max_workers < 0 else max_workers
         self.images_size = 518  # square size to which images are resized
@@ -194,7 +202,7 @@ class Adjuster(nn.Module):
         self._print_params_summary(params_to_optimize)
 
         # Create optimizer with collected parameters
-        self._load_optimizer(optim, params_to_optimize)
+        self._load_optimizer(params_to_optimize)
         self._load_scheduler(scheduler_name, self.optimizer, scheduler_params)
         self.scaler = torch.cuda.amp.GradScaler()
 
@@ -1098,8 +1106,7 @@ class Adjuster(nn.Module):
 
         print(f"  {'Total':}: {total_params:>12,} parameters\n")
 
-    def _load_optimizer(self, optim_name, params):
-        optim_name = optim_name.lower()
+    def _load_optimizer(self, params):
         self.use_pypose = False
 
         # Build parameter groups only for parameters that exist
@@ -1113,14 +1120,7 @@ class Adjuster(nn.Module):
         if "q" in params:
             param_groups.append({"params": params["q"], "lr": self.lr * 0.1})
 
-        if optim_name == "adamw":
-            optimizer = torch.optim.AdamW(param_groups, lr=self.lr)
-
-        else:
-            print(f"Optimizer {optim_name} not recognized. Falling back to AdamW.")
-            optimizer = torch.optim.AdamW(param_groups, lr=self.lr)
-
-        self.optimizer = optimizer
+        self.optimizer = torch.optim.AdamW(param_groups, lr=self.lr)
 
     def _load_scheduler(self, name, optimizer, params=None):
         """
