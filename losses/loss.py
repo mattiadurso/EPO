@@ -5,7 +5,7 @@ import torch
 def compute_distance_field(
     edges_map: torch.Tensor,
     device="cuda",
-    dtype=torch.float32,  # large distances (large images) might overflow
+    dtype=torch.float32,
 ):
     # TODO: run all this in fp16. carefully normalize EVERITHING in 0-1 range
     """
@@ -53,8 +53,8 @@ def sample_distance_field(
     sampling_mode="bilinear",
 ):
     """
-    Sample the distance field at given edge coordinates with proper NaN handling.
-    NaN values never multiply with parameters to prevent gradient corruption.
+    Sample the distance field at given edge coordinates.
+    Preserves gradient flow through grid_sample.
 
     Args:
         dt_field: Tensor of shape (B, H, W) or (H, W) with the distance field.
