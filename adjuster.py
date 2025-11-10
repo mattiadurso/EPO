@@ -46,9 +46,9 @@ from losses.loss import (
 from helpers.reprojection import (
     filter_viewgraph_by_reprojection,
     reproject_2D_2D,
-    unproject_to_3D,
     grid_sample_nan,
-    project_3D_2D,
+    unproject_to_world,
+    project_world_to_2D,
 )
 from helpers.frustum import build_view_graph_from_frustums
 from extractors.canny import CannyEdgeDetector
@@ -223,11 +223,11 @@ class Adjuster(nn.Module):
 
     def forward(
         self,
-        max_steps=1000,
+        max_steps=1_000,
         type="batched",
-        gradient_tolerance=1e-4,
+        gradient_tolerance=1e-6,
         quick_mode=True,  # "quick" (sample & backprop) or "full" (accumulate over all)
-        batch_size=512,
+        batch_size=128,  # faster than 64 and 256
     ):
         """
         Main optimization loop.
@@ -240,6 +240,7 @@ class Adjuster(nn.Module):
             gradient_tolerance (float): Tolerance for gradient-based convergence.
             quick_mode (bool): Whether to use quick mode (sample & backprop) or full accumulation.
         """
+        assert type in ["sequential", "batched"], f"Type {type} not supported."
         time_start = time.time()
 
         if quick_mode:
@@ -267,7 +268,7 @@ class Adjuster(nn.Module):
             # Update cache at START of each step (after parameters changed)
             self._cache_projection_matrices()
 
-            # Unproject point and put them into "edges3D"
+            # Unproject point to world coordinates
             self._unproject_edges_to_3D()
 
             if quick_mode:  # reduce pairs randomly each step
@@ -284,8 +285,6 @@ class Adjuster(nn.Module):
                 residuals = self.compute_batched_step(
                     sampled_viewgraph, batch_size=batch_size
                 )  # (num_pairs,)
-            else:
-                raise ValueError(f"Optimization type {type} not supported.")
 
             loss = self._compute_batched_loss(residuals)
 
@@ -311,7 +310,7 @@ class Adjuster(nn.Module):
                     self.scheduler.step()
 
             # Logging
-            self.loss_list.append(loss.item())
+            self.loss_list.append(loss.detach().item())
             current_lr = (
                 self.scheduler.get_last_lr()[0]
                 if self.scheduler is not None
@@ -342,7 +341,7 @@ class Adjuster(nn.Module):
                     break
 
             bar.set_postfix(
-                loss=f"{loss.item():.6f}",
+                loss=f"{self.loss_list[-1]:.6f}",
                 auc5=(
                     f"{self.auc_list[-1][-1]:.4f}"
                     if self.gt_path is not None
@@ -449,6 +448,7 @@ class Adjuster(nn.Module):
     def fix_seed(self):
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
+        np.random.seed(self.seed)
 
     def process_camera(self, camera, load_with_pad=False):
         # Convert a single pycolmap.Camera to torch tensor
@@ -706,8 +706,7 @@ class Adjuster(nn.Module):
     def _create_batched_inputs(self, sampled_viewgraph):
         """Prepare batched inputs for the batched optimization step given a list of pairs from the viewgraph."""
         batch = {
-            "xyz0": [],
-            "P0": [],
+            "xyz_world": [],
             "P1": [],
             "K1": [],
             "img1_shape": [],
@@ -715,14 +714,12 @@ class Adjuster(nn.Module):
         pad_masks, dt_fields = [], []
 
         for i, j in sampled_viewgraph:
-            batch["xyz0"].append(self.images[i]["edges_3D"])
-            batch["P0"].append(self.P_cache[i])
+            batch["xyz_world"].append(self.images[i]["edges_3D"])
             batch["P1"].append(self.P_cache[j])
             batch["K1"].append(self.K_cache[self.images[j]["cam_id"]])
             batch["img1_shape"].append(self.images[j]["hw"])
 
-            batch["xyz0"].append(self.images[j]["edges_3D"])
-            batch["P0"].append(self.P_cache[j])
+            batch["xyz_world"].append(self.images[j]["edges_3D"])
             batch["P1"].append(self.P_cache[i])
             batch["K1"].append(self.K_cache[self.images[i]["cam_id"]])
             batch["img1_shape"].append(self.images[i]["hw"])
@@ -841,7 +838,7 @@ class Adjuster(nn.Module):
             # amp not really helping
             with torch.amp.autocast(device_type=self.device, dtype=torch.float16):
                 s_time = time.time()
-                edges_reprojected = project_3D_2D(**batch)  # (B, N, 2)
+                edges_reprojected = project_world_to_2D(**batch)  # (B, N, 2)
                 self.timings["batched_reprojection"] += time.time() - s_time
 
                 # residuals sampling
@@ -850,6 +847,7 @@ class Adjuster(nn.Module):
                 )  # (B, N)
 
                 # average residuals over valid points per image
+                # TODO: try vectorized version
                 for b in range(residuals.shape[0]):
                     pad_mask = pad_masks[b]
                     edge_loss = residuals[b]
@@ -1077,6 +1075,14 @@ class Adjuster(nn.Module):
                 )
             params_to_optimize["t"] = t_params
 
+        if self.grad_z:
+            z_params = []
+            for image_name, image_data in self.images.items():
+                z_params.extend(
+                    image_data["sampled_depth"].parameters() if self.grad_z else []
+                )
+            params_to_optimize["z"] = z_params
+
         return params_to_optimize
 
     def _print_params_summary(self, params_to_optimize):
@@ -1102,40 +1108,13 @@ class Adjuster(nn.Module):
             param_groups.append({"params": params["t"], "lr": self.lr})
         if "k" in params:
             param_groups.append({"params": params["k"], "lr": self.lr * 0.5})
+        if "z" in params:
+            param_groups.append({"params": params["z"], "lr": self.lr * 0.5})
         if "q" in params:
             param_groups.append({"params": params["q"], "lr": self.lr * 0.1})
-        if "z" in params:
-            param_groups.append({"params": params["z"], "lr": self.lr * 0.1})
 
         if optim_name == "adamw":
             optimizer = torch.optim.AdamW(param_groups, lr=self.lr)
-
-        elif optim_name == "lm":
-            try:
-                import pypose as pp
-
-                class ParamWrapper(nn.Module):
-                    def __init__(self, params_dict):
-                        super().__init__()
-                        # Flatten all params from dict
-                        all_params = []
-                        for param_list in params_dict.values():
-                            all_params.extend(param_list)
-                        self.params = nn.ParameterList(all_params)
-
-                params_wrapper = ParamWrapper(params)
-
-                optimizer = pp.optim.LevenbergMarquardt(model=params_wrapper)
-                self.scheduler = pp.optim.scheduler.StopOnPlateau(
-                    optimizer, steps=10, patience=3, decreasing=1e-3, verbose=True
-                )
-
-                self.use_pypose = True
-                print("Using PyPose Levenberg-Marquardt optimizer.")
-
-            except ImportError:
-                print("PyPose not found. Falling back to AdamW.")
-                optimizer = torch.optim.AdamW(param_groups, lr=self.lr)
 
         else:
             print(f"Optimizer {optim_name} not recognized. Falling back to AdamW.")
@@ -1193,11 +1172,13 @@ class Adjuster(nn.Module):
             edges_2D = image_data["edges_padded"]  # (N, 2)
             depth_map = image_data["sampled_depth"]()  # (1, H, W)
             K = self.K_cache[image_data["cam_id"]]  # Camera
+            P = self.P_cache[image_name]  # Pose
 
-            points_3D = unproject_to_3D(
-                xy=edges_2D[None],
-                K=K[None],
-                depths=depth_map[None],
+            points_3D = unproject_to_world(
+                xy0=edges_2D[None],
+                K0=K[None],
+                depth0=depth_map[None],
+                P0=P[None],
             ).squeeze(
                 0
             )  # (B, N, 3)
