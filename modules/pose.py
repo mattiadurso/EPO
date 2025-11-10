@@ -63,7 +63,7 @@ class Pose(nn.Module):  # Changed: inherit from nn.Module
 
         return P
 
-    def parameters(self, t=True, q=True):
+    def parameters(self, t=True, q=True, recurse: bool = True):
         """Return iterator of trainable parameters - only leaf tensors"""
         params = []
         if q:

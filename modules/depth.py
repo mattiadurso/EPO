@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 
-class Depth(nn.Module):  # Changed: inherit from nn.Module
+class DepthMap(nn.Module):  # Changed: inherit from nn.Module
     def __init__(
         self,
         height: int,
@@ -16,10 +16,8 @@ class Depth(nn.Module):  # Changed: inherit from nn.Module
         self.device = device
         self.grad = grad
 
-        self.depth = depth.to(device)
-
         self.params = nn.Parameter(
-            self.depth.clone().detach().to(device), requires_grad=self.grad
+            depth.clone().detach().to(device), requires_grad=self.grad
         )
         self.hw = (height, width)
 
