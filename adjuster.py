@@ -1165,25 +1165,53 @@ class Adjuster(nn.Module):
             else:
                 self.scheduler.step()
 
-    def _unproject_edges_to_3D(self):
-        """Unproject 2D edges to 3D points for all images."""
-        for image_name in self.images.keys():
-            image_data = self.images[image_name]
-            edges_2D = image_data["edges_padded"]  # (N, 2)
-            depth_map = image_data["sampled_depth"]()  # (1, H, W)
-            K = self.K_cache[image_data["cam_id"]]  # Camera
-            P = self.P_cache[image_name]  # Pose
+    def _unproject_edges_to_3D(self, batch_size=None):
+        """Unproject 2D edges to 3D points for all images as a batch."""
+        # Collect data
+        image_names = list(self.images.keys())
+        B = len(image_names)
+        edges_list, depth_list, K_list, P_list = [], [], [], []
 
-            points_3D = unproject_to_world(
-                xy0=edges_2D[None],
-                K0=K[None],
-                depth0=depth_map[None],
-                P0=P[None],
-            ).squeeze(
-                0
-            )  # (B, N, 3)
+        for name in image_names:
+            data = self.images[name]
+            edges_2D = data["edges_padded"]  # (N, 2)
+            depth_map = data["sampled_depth"]()  # (1, H, W)
+            K = self.K_cache[data["cam_id"]]  # (3, 3)
+            P = self.P_cache[name]  # (4, 4)
 
-            self.images[image_name].update({"edges_3D": points_3D})
+            edges_list.append(edges_2D)
+            depth_list.append(depth_map)
+            K_list.append(K)
+            P_list.append(P)
+
+        # Stack as batch
+        # edges_2D may have varying N — pad or bucket if needed
+        edges_batch = torch.stack(edges_list, dim=0).to(self.device)  # (B, N, 2)
+        depth_batch = torch.stack(depth_list, dim=0).to(self.device)  # (B, 1, H, W)
+        K_batch = torch.stack(K_list, dim=0).to(self.device)  # (B, 3, 3)
+        P_batch = torch.stack(P_list, dim=0).to(self.device)  # (B, 4, 4)
+
+        # Optionally chunk if batch too large for memory
+        if batch_size is None:
+            batch_size = B
+        points_3D_list = []
+
+        for i in range(0, B, batch_size):
+            xy0 = edges_batch[i : i + batch_size]
+            K0 = K_batch[i : i + batch_size]
+            depth0 = depth_batch[i : i + batch_size]
+            P0 = P_batch[i : i + batch_size]
+
+            pts3d = unproject_to_world(
+                xy0=xy0, K0=K0, depth0=depth0, P0=P0
+            )  # (bs, N, 3)
+            points_3D_list.append(pts3d)
+
+        points_3D = torch.cat(points_3D_list, dim=0)  # (B, N, 3)
+
+        # Write back (differentiable tensors)
+        for name, pts3d in zip(image_names, points_3D):
+            self.images[name]["edges_3D"] = pts3d
 
 
 if __name__ == "__main__":
@@ -1209,6 +1237,7 @@ if __name__ == "__main__":
         grad_q=True,
         grad_t=True,
         grad_k=True,
+        grad_z=True,
         scheduler_name="ReduceLROnPlateau",
         scheduler_params={"factor": 0.5, "patience": 3, "min_lr": 1e-6},
         gt_path=gt_path,  # slows down a bit the optimization
@@ -1224,7 +1253,7 @@ if __name__ == "__main__":
     adjuster.print_summary()
 
     adjuster(
-        batch_size=256,  # saturate this value to fully utilize the GPU
+        batch_size=128,  # saturate this value to fully utilize the GPU
         type="batched",  # "sequential" or "batched"
         max_steps=-1,
         quick_mode=False,  # if True, randomly samples of batch_size at each step
