@@ -268,14 +268,16 @@ class Adjuster(nn.Module):
                 sampled_viewgraph = self.viewgraph
 
             if type == "sequential":
-                loss = self.compute_sequential_step(sampled_viewgraph)
+                residuals = self.compute_sequential_step(sampled_viewgraph)
 
             elif type == "batched":
-                loss = self.compute_batched_step(
+                residuals = self.compute_batched_step(
                     sampled_viewgraph, batch_size=batch_size
-                )
+                )  # (num_pairs,)
             else:
                 raise ValueError(f"Optimization type {type} not supported.")
+
+            loss = self._compute_batched_loss(residuals)
 
             # Backpropagate and update using GradScaler if available
             if hasattr(self, "scaler") and self.scaler is not None:
@@ -690,101 +692,6 @@ class Adjuster(nn.Module):
 
         return reconstruction
 
-    def compute_sequential_step(self, sampled_viewgraph):
-        """Compute one optimization step over the sampled viewgraph sequentially and return the loss."""
-        loss = 0.0
-        # Use autocast (not really helping)
-        with torch.amp.autocast(device_type=self.device, dtype=torch.float16):
-            for pair in sampled_viewgraph:
-                i, j = pair
-                image_i = self.images[i]
-                image_j = self.images[j]
-
-                # project edges 1->2
-                edges_12 = reproject_2D_2D(
-                    xy0=image_i["edges"][None],
-                    depthmap0=image_i["depth"][None],
-                    P0=self.P_cache[i][None],
-                    P1=self.P_cache[j][None],
-                    K0=self.K_cache[image_i["cam_id"]][None],
-                    K1=self.K_cache[image_j["cam_id"]][None],
-                    img1_shape=image_j["hw"],
-                )
-
-                # project edges 2->1
-                edges_21 = reproject_2D_2D(
-                    xy0=image_j["edges"][None],
-                    depthmap0=image_j["depth"][None],
-                    P0=self.P_cache[j][None],
-                    P1=self.P_cache[i][None],
-                    K0=self.K_cache[image_j["cam_id"]][None],
-                    K1=self.K_cache[image_i["cam_id"]][None],
-                    img1_shape=image_i["hw"],
-                )
-
-                # Remove batch dimension before sampling
-                edges_12 = edges_12.squeeze(0)  # (N, 2)
-                edges_21 = edges_21.squeeze(0)  # (N, 2)
-
-                # Filter out NaN values
-                if edges_12.numel() > 0:
-                    valid_12 = ~torch.isnan(edges_12).any(dim=1)
-                    edges_12 = edges_12[valid_12]
-
-                if edges_21.numel() > 0:
-                    valid_21 = ~torch.isnan(edges_21).any(dim=1)
-                    edges_21 = edges_21[valid_21]
-
-                # compute loss
-                dt_field_1 = image_i["dt_field"]
-                dt_field_2 = image_j["dt_field"]
-                edge_loss_12 = sample_distance_field(
-                    dt_field_2, edges_12, device=self.device
-                )
-
-                edge_loss_21 = sample_distance_field(
-                    dt_field_1, edges_21, device=self.device
-                )
-
-                edge_loss = edge_loss_12.mean() + edge_loss_21.mean()
-                loss += edge_loss
-
-            loss = loss / len(sampled_viewgraph)
-        return loss
-
-    def compute_batched_step(self, sampled_viewgraph, batch_size=1024):
-        """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss."""
-
-        # divide self.viewgraph in batches if len(self.viewgraph) > batch size
-        sampled_viewgraphs = []
-        if len(sampled_viewgraph) > batch_size:
-            for i in range(0, len(sampled_viewgraph), batch_size):
-                end = min(i + batch_size, len(sampled_viewgraph))
-                sampled_viewgraphs.append(sampled_viewgraph[i:end])
-        else:
-            sampled_viewgraphs.append(sampled_viewgraph)
-
-        loss = 0.0
-        for sampled_viewgraph in sampled_viewgraphs:
-            s_time = time.time()
-            # prepare batched inputs
-            batch, pad_masks, dt_fields = self._create_batched_inputs(sampled_viewgraph)
-            self.timings["prepare_batched_inputs"] += time.time() - s_time
-
-            # actual inference - keep NaN values
-            s_time = time.time()
-            # amp not really helping
-            with torch.amp.autocast(device_type=self.device, dtype=torch.float16):
-                s_time = time.time()
-                edges_reprojected = reproject_2D_2D(**batch)  # (B, N, 2)
-                self.timings["batched_reprojection"] += time.time() - s_time
-
-                loss += self._compute_batched_loss(
-                    edges_reprojected, dt_fields, pad_masks
-                )
-
-        return loss / len(sampled_viewgraphs)
-
     def _create_batched_inputs(self, sampled_viewgraph):
         """Prepare batched inputs for the batched optimization step given a list of pairs from the viewgraph."""
         batch = {
@@ -841,51 +748,139 @@ class Adjuster(nn.Module):
 
         return batch, pad_masks, dt_fields
 
-    def _compute_batched_loss(self, edges_reprojected, dt_fields, pad_masks):
-        """Compute the batched loss given reprojected edges, distance fields and padding masks."""
-        """Can this be vectorized more?"""
+    def compute_sequential_step(self, sampled_viewgraph):
+        """Compute one optimization step over the sampled viewgraph sequentially and return the loss."""
 
+        residuals_list = []
         # Use autocast (not really helping)
+        with torch.amp.autocast(device_type=self.device, dtype=torch.float16):
+            for pair in sampled_viewgraph:
+                i, j = pair
+                image_i = self.images[i]
+                image_j = self.images[j]
+
+                # project edges 1->2
+                edges_12 = reproject_2D_2D(
+                    xy0=image_i["edges"][None],
+                    depthmap0=image_i["depth"][None],
+                    P0=self.P_cache[i][None],
+                    P1=self.P_cache[j][None],
+                    K0=self.K_cache[image_i["cam_id"]][None],
+                    K1=self.K_cache[image_j["cam_id"]][None],
+                    img1_shape=image_j["hw"],
+                )
+
+                # project edges 2->1
+                edges_21 = reproject_2D_2D(
+                    xy0=image_j["edges"][None],
+                    depthmap0=image_j["depth"][None],
+                    P0=self.P_cache[j][None],
+                    P1=self.P_cache[i][None],
+                    K0=self.K_cache[image_j["cam_id"]][None],
+                    K1=self.K_cache[image_i["cam_id"]][None],
+                    img1_shape=image_i["hw"],
+                )
+
+                # Remove batch dimension before sampling
+                edges_12 = edges_12.squeeze(0)  # (N, 2)
+                edges_21 = edges_21.squeeze(0)  # (N, 2)
+
+                # Filter out NaN values
+                if edges_12.numel() > 0:
+                    valid_12 = ~torch.isnan(edges_12).any(dim=1)
+                    edges_12 = edges_12[valid_12]
+
+                if edges_21.numel() > 0:
+                    valid_21 = ~torch.isnan(edges_21).any(dim=1)
+                    edges_21 = edges_21[valid_21]
+
+                # compute loss, clone and detach since they are created without grads
+                dt_field_1 = image_i["dt_field"]
+                dt_field_2 = image_j["dt_field"]
+                edge_loss_12 = sample_distance_field(
+                    dt_field_2, edges_12, device=self.device
+                )
+
+                edge_loss_21 = sample_distance_field(
+                    dt_field_1, edges_21, device=self.device
+                )
+
+                # average over points per image
+                residuals_list.append(edge_loss_12.mean())
+                residuals_list.append(edge_loss_21.mean())
+
+        residuals = torch.stack(residuals_list)  # (num_pairs,)
+        return residuals
+
+    def compute_batched_step(self, sampled_viewgraph, batch_size=1024):
+        """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss."""
+
+        # divide self.viewgraph in batches if len(self.viewgraph) > batch size
+        sampled_viewgraphs = []
+        if len(sampled_viewgraph) > batch_size:
+            for i in range(0, len(sampled_viewgraph), batch_size):
+                end = min(i + batch_size, len(sampled_viewgraph))
+                sampled_viewgraphs.append(sampled_viewgraph[i:end])
+        else:
+            sampled_viewgraphs.append(sampled_viewgraph)
+
+        residuals_list = []
+        for sampled_viewgraph in sampled_viewgraphs:
+            s_time = time.time()
+            # prepare batched inputs
+            batch, pad_masks, dt_fields = self._create_batched_inputs(sampled_viewgraph)
+            self.timings["prepare_batched_inputs"] += time.time() - s_time
+
+            # actual inference - keep NaN values
+            s_time = time.time()
+            # amp not really helping
+            with torch.amp.autocast(device_type=self.device, dtype=torch.float16):
+                s_time = time.time()
+                edges_reprojected = reproject_2D_2D(**batch)  # (B, N, 2)
+                self.timings["batched_reprojection"] += time.time() - s_time
+
+                # residuals sampling
+                residuals = sample_distance_field(
+                    dt_fields, edges_reprojected, device=self.device
+                )  # (B, N)
+
+                # average residuals over valid points per image
+                for b in range(residuals.shape[0]):
+                    pad_mask = pad_masks[b]
+                    edge_loss = residuals[b]
+                    valid = ~torch.isnan(edge_loss) & (pad_mask > 0)
+                    valid_loss = edge_loss[valid]
+                    mean_loss = (
+                        valid_loss.mean()
+                        if valid_loss.numel() > 0
+                        else torch.tensor(0.0, device=self.device)
+                    )
+                    residuals_list.append(mean_loss)
+
+        residuals = torch.stack(residuals_list)  # (num_pairs,)
+
+        return residuals
+
+    def _compute_batched_loss(self, residuals):
+        """Vectorized batched loss computation."""
         s_time = time.time()
-        # loss computation - NaN handling INSIDE sample_distance_field
-        edge_loss = sample_distance_field(
-            dt_fields, edges_reprojected, device=self.device
-        )  # (B, N)
 
-        # --- Equivalent to Sequential Gradient Calculation ---
-        # Process pairs separately to match sequential behavior
-        pair_losses = []
-        for pair_idx in range(0, edge_loss.shape[0], 2):
-            # Get the two directions for this pair
-            loss_ij = edge_loss[pair_idx]  # i->j
-            loss_ji = edge_loss[pair_idx + 1]  # j->i
+        if residuals.numel() == 0:
+            return torch.tensor(0.0, device=self.device)
 
-            pad_mask_ij = pad_masks[pair_idx]
-            pad_mask_ji = pad_masks[pair_idx + 1]
+        # Ensure even number of residuals (forward/backward pairs)
+        assert residuals.shape[0] % 2 == 0, "Residual batch size must be even (pairs)."
 
-            # Filter NaN from invalid reprojections AND padded points
-            valid_ij = ~torch.isnan(loss_ij) & (pad_mask_ij > 0)
-            valid_ji = ~torch.isnan(loss_ji) & (pad_mask_ji > 0)
+        # Group pairs: reshape (num_pairs*2,) -> (num_pairs, 2)
+        residuals_pairs = residuals.view(-1, 2)  # (num_pairs, 2)
 
-            valid_loss_ij = loss_ij[valid_ij]
-            valid_loss_ji = loss_ji[valid_ji]
+        # Sum i->j and j->i directions which are now in the same row
+        pair_losses = residuals_pairs.sum(dim=1)  # (num_pairs,)
 
-            # Compute mean per direction (not across pair!)
-            mean_ij = valid_loss_ij.mean() if valid_loss_ij.numel() > 0 else 0.0
-            mean_ji = valid_loss_ji.mean() if valid_loss_ji.numel() > 0 else 0.0
+        # Mean over pairs
+        loss = pair_losses.mean()
 
-            # Sum the two directions for this pair
-            pair_loss = mean_ij + mean_ji
-            pair_losses.append(pair_loss)
-
-        # Average across pairs
-        loss = (
-            torch.stack(pair_losses).mean()
-            if pair_losses
-            else torch.tensor(0.0, device=self.device)
-        )
         self.timings["batched_loss_computation"] += time.time() - s_time
-
         return loss
 
     def _cache_projection_matrices(self):
@@ -972,7 +967,7 @@ class Adjuster(nn.Module):
             )
         self.max_edges = max_edges
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def _compute_distance_fields(self):
         dt_fields_shapes = []
         for image_name in tqdm(self.images.keys(), desc="Computing distance fields"):
@@ -1003,7 +998,7 @@ class Adjuster(nn.Module):
         gc.collect()
         torch.cuda.empty_cache()
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def _compute_viewgraph(self):
         # Estimate view graph from frustums
         viewgraph = build_view_graph_from_frustums(
@@ -1175,25 +1170,22 @@ class Adjuster(nn.Module):
 
 if __name__ == "__main__":
 
-    # british_museum
+    scene = "vienna_state_opera"
     reconstruction_path = (
-        "/home/mattia/Desktop/Repos/vggt/wrapper_output/british_museum/sparse"
+        f"/home/mattia/Desktop/Repos/vggt/wrapper_output/{scene}/sparse"
     )
-    images_path = "/home/mattia/Desktop/Repos/wrapper_factory/benchmarks_2D/imc/data/phototourism/british_museum/set_100/images"
-    depths_path = "/home/mattia/Desktop/Repos/vggt/wrapper_output/british_museum/sparse/depth_maps"
-    gt_path = "/home/mattia/Desktop/Repos/wrapper_factory/benchmarks_2D/imc/data/phototourism/british_museum/set_100/colmap/sparse"
-    detector_params = {
-        "low_threshold": 0.2,
-        "high_threshold": 0.3,
-        "kernel_size": 11,
-        "sigma": 9,
-    }
+    images_path = f"/home/mattia/Desktop/datasets/mydataset/data/{scene}/frames"
+    depths_path = (
+        f"/home/mattia/Desktop/Repos/vggt/wrapper_output/{scene}/sparse/depth_maps"
+    )
+    gt_path = f"/home/mattia/Desktop/datasets/mydataset/data/{scene}/colmap/sparse/0"
 
     adjuster = Adjuster(
         reconstruction_path=reconstruction_path,
         images_path=images_path,
         depths_path=depths_path,
-        single_camera_per_folder=False,
+        viewgraph_path=None,  # if None, it uses the one in the reconstruction_path
+        single_camera_per_folder=True,
         load_with_pad=False,
         lr=5e-3,
         grad_q=True,
@@ -1201,9 +1193,14 @@ if __name__ == "__main__":
         grad_k=True,
         scheduler_name="ReduceLROnPlateau",
         scheduler_params={"factor": 0.5, "patience": 3, "min_lr": 1e-6},
-        gt_path=gt_path,
+        gt_path=gt_path,  # slows down a bit the optimization
         # viz=True,
-        detector_params=detector_params,
+        detector_params={
+            "low_threshold": 0.20,
+            "high_threshold": 0.25,
+            "kernel_size": 7,
+            "sigma": 2,
+        },
     )
 
     adjuster.print_summary()
@@ -1211,7 +1208,7 @@ if __name__ == "__main__":
     adjuster(
         batch_size=256,  # saturate this value to fully utilize the GPU
         type="batched",  # "sequential" or "batched"
-        max_steps=30,
-        quick_mode=True,  # if True, randomly samples of batch_size at each step
+        max_steps=-1,
+        quick_mode=False,  # if True, randomly samples of batch_size at each step
         gradient_tolerance=1e-6,  # stop if relative change in loss is below this value
     )
