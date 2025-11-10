@@ -220,7 +220,6 @@ def _process_single_depth(
 
     else:
         # Resize such that longest edge is target_size. It might be square if from vggt.
-        # cut
         x1, y1, x2, y2, _, _ = [int(_) for _ in image_info["coords"]]
 
         # estimate pad
