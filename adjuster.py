@@ -1213,6 +1213,40 @@ class Adjuster(nn.Module):
         for name, pts3d in zip(image_names, points_3D):
             self.images[name]["edges_3D"] = pts3d
 
+    def __repr__(self):
+        repr_str = f"Adjuster(\n"
+        repr_str += f"  Reconstruction path: {self.reconstruction_path}\n"
+        repr_str += f"  Images path: {self.images_path}\n"
+        repr_str += f"  Depths path: {self.depths_path}\n"
+        repr_str += f"  Number of images: {len(self.images)}\n"
+        if hasattr(self, "viewgraph"):
+            repr_str += f"  Number of viewgraph edges: {len(self.viewgraph):,}\n"
+
+        total_params = 0
+        params_to_optimize = self._collect_parameters_to_optimize()
+        for key in ["k", "t", "q", "z"]:
+            if key in params_to_optimize:
+                set_params = sum(p.numel() for p in params_to_optimize[key])
+                total_params += set_params
+
+        repr_str += f"  Total parameters to optimize: {total_params:,}\n"
+        converged_str = " (converged)" if getattr(self, "convergence", False) else ""
+        repr_str += (
+            f"  Number of optimization steps: {len(self.loss_list)}{converged_str}\n"
+        )
+
+        if len(self.loss_list) >= 2:
+            initial_loss = self.loss_list[0]
+            final_loss = self.loss_list[-1]
+            delta = initial_loss - final_loss
+            perc_improvement = (
+                (delta / initial_loss) * 100 if initial_loss != 0 else 0.0
+            )
+            repr_str += f"  Loss improvement: {delta:.3f} ({perc_improvement:.2f}%)\n"
+
+        repr_str += f")"
+        return repr_str
+
 
 if __name__ == "__main__":
 
