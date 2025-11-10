@@ -43,18 +43,25 @@ from losses.loss import (
     compute_distance_field,
     sample_distance_field,
 )
-from helpers.reprojection import filter_viewgraph_by_reprojection, reproject_2D_2D
+from helpers.reprojection import (
+    filter_viewgraph_by_reprojection,
+    reproject_2D_2D,
+    unproject_to_3D,
+    grid_sample_nan,
+    project_3D_2D,
+)
 from helpers.frustum import build_view_graph_from_frustums
 from extractors.canny import CannyEdgeDetector
 from modules.camera import Camera
 from modules.pose import Pose
+from modules.depth import DepthMap
 
 
 import sys
 
 sys.path.append("/home/mattia/Desktop/Repos/wrapper_factory/benchmarks_3D")
-from utils_benchmark_pose import *
-from benchmark_pose import *
+# from utils_benchmark_pose import eval_colmap_model
+from benchmark_pose import eval_colmap_model
 
 
 class Adjuster(nn.Module):
@@ -91,6 +98,7 @@ class Adjuster(nn.Module):
         grad_q=True,
         grad_t=True,
         grad_k=True,
+        grad_z=False,
         viz=False,  # it true del non used stuff during computation
         gt_path=None,
     ):
@@ -131,6 +139,7 @@ class Adjuster(nn.Module):
         self.grad_q = grad_q
         self.grad_t = grad_t
         self.grad_k = grad_k
+        self.grad_z = grad_z
 
         # Loading
         self.timings = {}
@@ -150,16 +159,16 @@ class Adjuster(nn.Module):
         self._read_cameras_from_reconstruction()  # into self.images and self.intrinsics
         self.timings["load_poses_and_intrinsics"] = time.time() - s_time
 
-        ## Load depth maps
-        s_time = time.time()
-        self._load_and_preprocess_depths()
-        self.timings["load_depth_maps"] = time.time() - s_time
-
         ## Extract edges
         s_time = time.time()
         self._extract_edges()  # into self.images
         self.timings["extract_edges"] = time.time() - s_time
         print(f"max edges per image: {self.max_edges:,}")
+
+        ## Load depth maps
+        s_time = time.time()
+        self._load_and_preprocess_depths()
+        self.timings["load_depth_maps"] = time.time() - s_time
 
         ## Compute Distance Fields
         s_time = time.time()
@@ -201,6 +210,7 @@ class Adjuster(nn.Module):
         if not viz:
             for image_name in self.images.keys():
                 self.images[image_name].pop("image")
+                self.images[image_name].pop("depth")
                 self.images[image_name].pop("edges_map")
 
         self.loss_list = []
@@ -258,7 +268,7 @@ class Adjuster(nn.Module):
             self._cache_projection_matrices()
 
             # Unproject point and put them into "edges3D"
-            # self._unproject_points()
+            self._unproject_edges_to_3D()
 
             if quick_mode:  # reduce pairs randomly each step
                 if len(self.viewgraph) > batch_size:
@@ -558,6 +568,7 @@ class Adjuster(nn.Module):
 
         return images, intrinsics
 
+    @torch.no_grad()
     def build_reconstruction(
         self, output_path="optimized_reconstruction", save_points=False, verbose=False
     ):
@@ -621,7 +632,7 @@ class Adjuster(nn.Module):
                 print(f"Warning: No images found for camera {cam_id}, skipping...")
                 continue
 
-            height, width = sample_image["depth"].shape[-2:]
+            height, width = sample_image["hw"]
 
             # Scale image dimensions back to original
             width = int(width / scale)
@@ -695,30 +706,24 @@ class Adjuster(nn.Module):
     def _create_batched_inputs(self, sampled_viewgraph):
         """Prepare batched inputs for the batched optimization step given a list of pairs from the viewgraph."""
         batch = {
-            "xy0": [],
-            "depthmap0": [],
+            "xyz0": [],
             "P0": [],
             "P1": [],
-            "K0": [],
             "K1": [],
             "img1_shape": [],
         }
         pad_masks, dt_fields = [], []
 
         for i, j in sampled_viewgraph:
-            batch["xy0"].append(self.images[i]["edges_padded"])
-            batch["depthmap0"].append(self.images[i]["depth"])
+            batch["xyz0"].append(self.images[i]["edges_3D"])
             batch["P0"].append(self.P_cache[i])
             batch["P1"].append(self.P_cache[j])
-            batch["K0"].append(self.K_cache[self.images[i]["cam_id"]])
             batch["K1"].append(self.K_cache[self.images[j]["cam_id"]])
             batch["img1_shape"].append(self.images[j]["hw"])
 
-            batch["xy0"].append(self.images[j]["edges_padded"])
-            batch["depthmap0"].append(self.images[j]["depth"])
+            batch["xyz0"].append(self.images[j]["edges_3D"])
             batch["P0"].append(self.P_cache[j])
             batch["P1"].append(self.P_cache[i])
-            batch["K0"].append(self.K_cache[self.images[j]["cam_id"]])
             batch["K1"].append(self.K_cache[self.images[i]["cam_id"]])
             batch["img1_shape"].append(self.images[i]["hw"])
 
@@ -836,7 +841,7 @@ class Adjuster(nn.Module):
             # amp not really helping
             with torch.amp.autocast(device_type=self.device, dtype=torch.float16):
                 s_time = time.time()
-                edges_reprojected = reproject_2D_2D(**batch)  # (B, N, 2)
+                edges_reprojected = project_3D_2D(**batch)  # (B, N, 2)
                 self.timings["batched_reprojection"] += time.time() - s_time
 
                 # residuals sampling
@@ -938,6 +943,18 @@ class Adjuster(nn.Module):
                     pad = (0, pad_right, 0, pad_bottom)  # left, right, top, bottom
                     depth = F.pad(depth, pad, mode="constant", value=depth.max())
                     self.images[image_name]["depth"] = depth
+
+        # add sampled depth at edges_padded locations
+        for image_name in self.images.keys():
+            edges_padded = self.images[image_name]["edges_padded"]  # (N, 2)
+            depth = self.images[image_name]["depth"]  # (H, W)
+            sampled_depth, _ = grid_sample_nan(edges_padded[None], depth[None])
+            self.images[image_name]["sampled_depth"] = DepthMap(
+                height=self.images[image_name]["hw"][0],
+                width=self.images[image_name]["hw"][1],
+                depth=sampled_depth.squeeze(),  # (N,)
+                grad=self.grad_z,
+            )
 
     def _extract_edges(self):
         for image_name in tqdm(self.images.keys(), desc=f"Extracting edges"):
@@ -1087,6 +1104,8 @@ class Adjuster(nn.Module):
             param_groups.append({"params": params["k"], "lr": self.lr * 0.5})
         if "q" in params:
             param_groups.append({"params": params["q"], "lr": self.lr * 0.1})
+        if "z" in params:
+            param_groups.append({"params": params["z"], "lr": self.lr * 0.1})
 
         if optim_name == "adamw":
             optimizer = torch.optim.AdamW(param_groups, lr=self.lr)
@@ -1166,6 +1185,24 @@ class Adjuster(nn.Module):
                 self.scheduler.step(loss)
             else:
                 self.scheduler.step()
+
+    def _unproject_edges_to_3D(self):
+        """Unproject 2D edges to 3D points for all images."""
+        for image_name in self.images.keys():
+            image_data = self.images[image_name]
+            edges_2D = image_data["edges_padded"]  # (N, 2)
+            depth_map = image_data["sampled_depth"]()  # (1, H, W)
+            K = self.K_cache[image_data["cam_id"]]  # Camera
+
+            points_3D = unproject_to_3D(
+                xy=edges_2D[None],
+                K=K[None],
+                depths=depth_map[None],
+            ).squeeze(
+                0
+            )  # (B, N, 3)
+
+            self.images[image_name].update({"edges_3D": points_3D})
 
 
 if __name__ == "__main__":
