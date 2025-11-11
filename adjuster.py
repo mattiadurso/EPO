@@ -189,6 +189,7 @@ class Adjuster(nn.Module):
         ## Compute Distance Fields
         s_time = time.time()
         self._compute_distance_fields()  # into self.images
+        self._cache_pad_and_dt_fields()
         self.timings["compute_distance_fields"] = time.time() - s_time
 
         ## Viewgraph from frustums
@@ -201,7 +202,7 @@ class Adjuster(nn.Module):
         self._compute_viewgraph()
         # else:
         # self._read_viewgraph()
-        # vg is a lsit of names of image pairs, sort by the the first name
+        # vg is a lsit of names of image pairs, sort by the first name
         self.viewgraph.sort(key=lambda x: (x[0], x[1]))
         self.timings["compute_viewgraph"] = time.time() - s_time
 
@@ -272,6 +273,8 @@ class Adjuster(nn.Module):
                     if type == "batched"
                     else ""
                 ),
+                # edges per image
+                f"Using {self.images[list(self.images.keys())[0]]['edges_padded'].numel()//2:,} edges per image",  # // due to x and y
             )
 
         max_steps = max_steps if max_steps > 0 else 1_000
@@ -305,25 +308,7 @@ class Adjuster(nn.Module):
             loss = self._compute_batched_loss(residuals)
 
             # Backpropagate and update using GradScaler if available
-            if hasattr(self, "scaler") and self.scaler is not None:
-                # gradients computation
-                s_time = time.time()
-                self.scaler.scale(loss).backward()
-                self.timings["gradient_computation"] += time.time() - s_time
-                # parameter update
-                s_time = time.time()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.timings["parameter_update"] += time.time() - s_time
-            else:
-                loss.backward()
-                self.optimizer.step()
-
-            if self.scheduler is not None:
-                if self.scheduler.__class__.__name__ == "ReduceLROnPlateau":
-                    self.scheduler.step(loss)
-                else:
-                    self.scheduler.step()
+            self._scaler_and_scheduler_steps(loss)
 
             # Logging
             self.loss_list.append(loss.detach().item())
@@ -337,7 +322,7 @@ class Adjuster(nn.Module):
             # DEBUG: Evaluate AUC if GT available
             if self.gt_path is not None:
                 opt = "/home/mattia/Desktop/Repos/batchsfm/optimized_reconstruction"
-                self.build_reconstruction(opt)
+                self.build_reconstruction(opt, save_points=False, verbose=False)
                 AUC_score_max, num_images, df_optim = eval_colmap_model(
                     opt, self.gt_path, return_df=False, thrs=[1, 3, 5]
                 )
@@ -351,7 +336,7 @@ class Adjuster(nn.Module):
                 if rel_change < gradient_tolerance:
                     print(
                         f"Converged at step {step} with relative loss ",
-                        f"change {rel_change:.6f} < {gradient_tolerance}",
+                        f"change {rel_change:.3e} < {gradient_tolerance}",
                     )
                     self.convergence = True
                     break
@@ -585,18 +570,176 @@ class Adjuster(nn.Module):
 
         return images, intrinsics
 
+    def compute_sequential_step(self, sampled_viewgraph):
+        """Compute one optimization step over the sampled viewgraph sequentially and return the loss."""
+
+        residuals_list = []
+        # Use autocast (not really helping)
+        with torch.amp.autocast(device_type=self.device, dtype=torch.float16):
+            for pair in sampled_viewgraph:
+                i, j = pair
+                image_i = self.images[i]
+                image_j = self.images[j]
+
+                # project edges 1->2
+                edges_12 = reproject_2D_2D(
+                    xy0=image_i["edges"][None],
+                    depthmap0=image_i["depth"][None],
+                    P0=self.P_cache[i][None],
+                    P1=self.P_cache[j][None],
+                    K0=self.K_cache[image_i["cam_id"]][None],
+                    K1=self.K_cache[image_j["cam_id"]][None],
+                    img1_shape=image_j["hw"],
+                )
+
+                # project edges 2->1
+                edges_21 = reproject_2D_2D(
+                    xy0=image_j["edges"][None],
+                    depthmap0=image_j["depth"][None],
+                    P0=self.P_cache[j][None],
+                    P1=self.P_cache[i][None],
+                    K0=self.K_cache[image_j["cam_id"]][None],
+                    K1=self.K_cache[image_i["cam_id"]][None],
+                    img1_shape=image_i["hw"],
+                )
+
+                # Remove batch dimension before sampling
+                edges_12 = edges_12.squeeze(0)  # (N, 2)
+                edges_21 = edges_21.squeeze(0)  # (N, 2)
+
+                # Filter out NaN values
+                if edges_12.numel() > 0:
+                    valid_12 = ~torch.isnan(edges_12).any(dim=1)
+                    edges_12 = edges_12[valid_12]
+
+                if edges_21.numel() > 0:
+                    valid_21 = ~torch.isnan(edges_21).any(dim=1)
+                    edges_21 = edges_21[valid_21]
+
+                # compute loss, clone and detach since they are created without grads
+                dt_field_1 = image_i["dt_field"]
+                dt_field_2 = image_j["dt_field"]
+                edge_loss_12 = sample_distance_field(
+                    dt_field_2, edges_12, device=self.device
+                )
+
+                edge_loss_21 = sample_distance_field(
+                    dt_field_1, edges_21, device=self.device
+                )
+
+                # average over points per image
+                residuals_list.append(edge_loss_12.mean())
+                residuals_list.append(edge_loss_21.mean())
+
+        residuals = torch.stack(residuals_list)  # (num_pairs,)
+        return residuals
+
+    @torch.no_grad()
+    def _dbscan_filter(self, reconstruction, eps=0.5, min_samples=20):
+        """
+        Filter 3D points in reconstruction using DBSCAN clustering.
+        Keeps only the largest cluster to remove outliers.
+
+        Args:
+            reconstruction: pycolmap.Reconstruction object
+            eps: Maximum distance between two samples for DBSCAN
+            min_samples: Minimum number of samples in a neighborhood for DBSCAN
+
+        Returns:
+            pycolmap.Reconstruction: Filtered reconstruction
+        """
+        import numpy as np
+        from sklearn.cluster import DBSCAN
+
+        if len(reconstruction.points3D) == 0:
+            return reconstruction
+
+        # Extract 3D point coordinates
+        point_ids = list(reconstruction.point3D_ids())
+        xyz = np.array([reconstruction.point3D(p_id).xyz for p_id in point_ids])
+
+        # Run DBSCAN with fallback for memory errors
+        labels = None
+        n_jobs = 4
+        while n_jobs >= 1 and labels is None:
+            try:
+                clustering = DBSCAN(
+                    eps=eps, min_samples=min_samples, n_jobs=n_jobs
+                ).fit(xyz)
+                labels = clustering.labels_
+            except MemoryError:
+                n_jobs //= 2
+            except Exception as e:
+                print(f"DBSCAN failed: {e}")
+                return reconstruction
+
+        # Find largest cluster
+        unique_labels, counts = np.unique(labels, return_counts=True)
+        non_noise_indices = np.where(unique_labels != -1)
+
+        if len(counts[non_noise_indices]) == 0:
+            print("Warning: DBSCAN found no clusters. Skipping filtering.")
+            return reconstruction
+
+        main_cluster_label = unique_labels[non_noise_indices][
+            np.argmax(counts[non_noise_indices])
+        ]
+
+        # Get indices of points in main cluster
+        cluster_indices = np.where(labels == main_cluster_label)[0]
+        ids_to_keep = set([point_ids[i] for i in cluster_indices])
+
+        print(
+            f"DBSCAN: Keeping largest cluster with {len(ids_to_keep):,} / {len(point_ids):,} points"
+        )
+
+        # Create new reconstruction with only kept points
+        filtered_reconstruction = pycolmap.Reconstruction()
+
+        # Copy cameras
+        for camera_id in reconstruction.cameras.keys():
+            filtered_reconstruction.add_camera(reconstruction.cameras[camera_id])
+
+        # Recreate images with new camera references
+        for image_id in reconstruction.images.keys():
+            old_image = reconstruction.images[image_id]
+            new_image = pycolmap.Image(
+                id=old_image.image_id,
+                name=old_image.name,
+                camera_id=old_image.camera_id,
+                cam_from_world=old_image.cam_from_world,
+            )
+            filtered_reconstruction.add_image(new_image)
+
+        # Copy only kept points with fresh empty tracks
+        for p_id in ids_to_keep:
+            point3d = reconstruction.point3D(p_id)
+            # Create empty track instead of copying old one
+            empty_track = pycolmap.Track()
+            filtered_reconstruction.add_point3D(point3d.xyz, empty_track, point3d.color)
+
+        return filtered_reconstruction
+
     @torch.no_grad()
     def build_reconstruction(
-        self, output_path="optimized_reconstruction", save_points=False, verbose=False
+        self,
+        output_path="optimized_reconstruction",
+        save_points=True,
+        verbose=False,
+        max_points_per_image=100_000,
+        final_dbscan_filtering=False,
+        dbscan_eps=0.05,
+        dbscan_min_samples=5,
     ):
         """
         Create a pycolmap.Reconstruction from images and intrinsics dictionaries.
 
         Args:
-            images: dict with image_name -> {P: Pose, cam_id: int, scale: float, ...}
-            intrinsics: dict with cam_id -> Camera
             output_path: path to save the reconstruction
-            save_points: whether to save 3D points (empty here)
+            save_points: whether to save 3D points from depth unprojection
+            max_points_per_image: maximum number of 3D points per image (default: 100_000)
+            dbscan_eps: epsilon for DBSCAN clustering
+            dbscan_min_samples: min samples for DBSCAN clustering
         """
         # Create empty reconstruction
         reconstruction = pycolmap.Reconstruction()
@@ -686,9 +829,6 @@ class Adjuster(nn.Module):
             # Apply inverse scaling to translation (scale back to original)
             t = t / scale
 
-            # use xyzw -> wxyz
-            # q = np.roll(q, shift=3)
-
             # Create image
             img = pycolmap.Image(
                 id=image_id,
@@ -700,17 +840,108 @@ class Adjuster(nn.Module):
             )
             reconstruction.add_image(img)
 
-        # 3. Points3D - empty for now
+        # 3. Add Points3D from depth unprojection using fresh computation
         if save_points:
-            print("Saving with empty Points3D...")
-            # TODO:similar to VGGT, unproject depth maps to create points3D
-            pass
+            if verbose:
+                print("Unprojecting depth maps to 3D points...")
 
-        # 4. Save reconstruction
+            # Compute fresh 3D world coordinates
+            self._unproject_edges_to_3D()
+
+            total_points = 0
+
+            for image_id, (image_name, image_data) in enumerate(
+                self.images.items(), start=1
+            ):
+                cam_id = image_data["cam_id"]
+                scale = image_data.get("scale", 1.0)
+
+                # Get unprojected 3D points in world coordinates (at scaled resolution)
+                edges_3D = image_data.get("edges_3D", None)  # (N, 3)
+                pad_mask = image_data.get("pad_mask", None)  # (N,)
+
+                if edges_3D is None or pad_mask is None:
+                    if verbose:
+                        print(f"No edges_3D or pad_mask for {image_name}, skipping...")
+                    continue
+
+                # Convert to numpy
+                edges_3D_np = edges_3D.detach().cpu().numpy()  # (N, 3)
+                pad_mask_np = pad_mask.detach().cpu().numpy()  # (N,)
+
+                # Filter by pad mask (only valid edges, ignore padded entries)
+                valid_mask = pad_mask_np > 0
+                valid_3D = edges_3D_np[valid_mask]  # (M, 3)
+                valid_indices = np.where(valid_mask)[0]
+
+                if len(valid_3D) == 0:
+                    if verbose:
+                        print(f"No valid edges for {image_name}")
+                    continue
+
+                # Scale points back to original resolution
+                # points_3D is in downsampled world space, multiply by scale to expand to original
+                valid_3D = valid_3D / scale
+
+                # Sample uniformly up to max_points_per_image
+                num_valid = len(valid_3D)
+                if num_valid > max_points_per_image:
+                    sample_idx = np.random.choice(
+                        num_valid, size=max_points_per_image, replace=False
+                    )
+                    valid_3D = valid_3D[sample_idx]
+                    valid_indices = valid_indices[sample_idx]
+
+                # Get RGB values from original image
+                if "image" in image_data:
+                    image = image_data["image"].detach().cpu().numpy()  # (3, H, W)
+                    edges_padded = (
+                        image_data["edges_padded"].detach().cpu().numpy()
+                    )  # (N, 2)
+
+                    # Get coordinates of valid edges
+                    valid_edges = edges_padded[valid_indices]
+                    y_coords_int = valid_edges[:, 1].astype(np.int32)
+                    x_coords_int = valid_edges[:, 0].astype(np.int32)
+
+                    # Clamp to valid range (at scaled resolution)
+                    y_coords_int = np.clip(y_coords_int, 0, image.shape[1] - 1)
+                    x_coords_int = np.clip(x_coords_int, 0, image.shape[2] - 1)
+
+                    rgb = image[:, y_coords_int, x_coords_int]  # (3, M)
+                    rgb = (rgb * 255).astype(np.uint8).T  # (M, 3)
+                else:
+                    # Default to white
+                    rgb = np.full((len(valid_3D), 3), 200, dtype=np.uint8)
+
+                # Add points to reconstruction
+                for pt_world, rgb_val in zip(valid_3D, rgb):
+                    point3D_id = reconstruction.add_point3D(
+                        pt_world, pycolmap.Track(), rgb_val
+                    )
+                    track = reconstruction.point3D(point3D_id).track
+                    track.add_element(image_id, int(0))  # dummy keypoint index
+
+                total_points += len(valid_3D)
+                if verbose:
+                    print(f"Added {len(valid_3D)} points from {image_name}")
+
+            if verbose:
+                print(f"Total points added: {total_points:,}")
+
+        # 4. DBSCAN filtering
+        if save_points and final_dbscan_filtering:
+            if verbose:
+                print("Running DBSCAN filtering...")
+            reconstruction = self._dbscan_filter(
+                reconstruction, eps=dbscan_eps, min_samples=dbscan_min_samples
+            )
+
+        # 5. Save reconstruction
         if verbose:
             print(f"Cameras: {len(reconstruction.cameras)}")
             print(f"Images: {len(reconstruction.images)}")
-            print(f"Points3D: {len(reconstruction.points3D)}")
+            print(f"Points3D: {len(reconstruction.points3D):,}")
 
         if output_path is not None:
             os.makedirs(output_path, exist_ok=True)
@@ -741,11 +972,12 @@ class Adjuster(nn.Module):
             batch["K1"].append(self.K_cache[self.images[i]["cam_id"]])
             batch["img1_shape"].append(self.images[i]["hw"])
 
-            pad_masks.append(self.images[i]["pad_mask"])
-            pad_masks.append(self.images[j]["pad_mask"])
+            # this can be cached once and indexed
+            pad_masks.append(self.pad_masks_cache[i])
+            pad_masks.append(self.pad_masks_cache[j])
 
-            dt_fields.append(self.images[j]["dt_field"])
-            dt_fields.append(self.images[i]["dt_field"])
+            dt_fields.append(self.dt_fields_cache[j])
+            dt_fields.append(self.dt_fields_cache[i])
 
         for key in batch:
             if key in ["img1_shape"]:
@@ -767,71 +999,7 @@ class Adjuster(nn.Module):
 
         return batch, pad_masks, dt_fields
 
-    def compute_sequential_step(self, sampled_viewgraph):
-        """Compute one optimization step over the sampled viewgraph sequentially and return the loss."""
-
-        residuals_list = []
-        # Use autocast (not really helping)
-        with torch.amp.autocast(device_type=self.device, dtype=torch.float16):
-            for pair in sampled_viewgraph:
-                i, j = pair
-                image_i = self.images[i]
-                image_j = self.images[j]
-
-                # project edges 1->2
-                edges_12 = reproject_2D_2D(
-                    xy0=image_i["edges"][None],
-                    depthmap0=image_i["depth"][None],
-                    P0=self.P_cache[i][None],
-                    P1=self.P_cache[j][None],
-                    K0=self.K_cache[image_i["cam_id"]][None],
-                    K1=self.K_cache[image_j["cam_id"]][None],
-                    img1_shape=image_j["hw"],
-                )
-
-                # project edges 2->1
-                edges_21 = reproject_2D_2D(
-                    xy0=image_j["edges"][None],
-                    depthmap0=image_j["depth"][None],
-                    P0=self.P_cache[j][None],
-                    P1=self.P_cache[i][None],
-                    K0=self.K_cache[image_j["cam_id"]][None],
-                    K1=self.K_cache[image_i["cam_id"]][None],
-                    img1_shape=image_i["hw"],
-                )
-
-                # Remove batch dimension before sampling
-                edges_12 = edges_12.squeeze(0)  # (N, 2)
-                edges_21 = edges_21.squeeze(0)  # (N, 2)
-
-                # Filter out NaN values
-                if edges_12.numel() > 0:
-                    valid_12 = ~torch.isnan(edges_12).any(dim=1)
-                    edges_12 = edges_12[valid_12]
-
-                if edges_21.numel() > 0:
-                    valid_21 = ~torch.isnan(edges_21).any(dim=1)
-                    edges_21 = edges_21[valid_21]
-
-                # compute loss, clone and detach since they are created without grads
-                dt_field_1 = image_i["dt_field"]
-                dt_field_2 = image_j["dt_field"]
-                edge_loss_12 = sample_distance_field(
-                    dt_field_2, edges_12, device=self.device
-                )
-
-                edge_loss_21 = sample_distance_field(
-                    dt_field_1, edges_21, device=self.device
-                )
-
-                # average over points per image
-                residuals_list.append(edge_loss_12.mean())
-                residuals_list.append(edge_loss_21.mean())
-
-        residuals = torch.stack(residuals_list)  # (num_pairs,)
-        return residuals
-
-    def compute_batched_step(self, sampled_viewgraph, batch_size=1024, chunk_size=2048):
+    def compute_batched_step(self, sampled_viewgraph, batch_size=1024, chunk_size=4096):
         """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss."""
 
         # divide self.viewgraph in batches if len(self.viewgraph) > batch size
@@ -923,13 +1091,21 @@ class Adjuster(nn.Module):
     def _cache_projection_matrices(self):
         """Cache all P and K matrices to avoid recomputation"""
         self.P_cache = {}
-        self.K_cache = {}
-
         for image_name, image_data in self.images.items():
             self.P_cache[image_name] = image_data["P"].projection_matrix()
 
+        self.K_cache = {}
         for cam_id, camera in self.intrinsics.items():
             self.K_cache[cam_id] = camera.intrinsic_matrix()
+
+    def _cache_pad_and_dt_fields(self):
+        """Cache all pad masks and distance fields for faster access"""
+        self.pad_masks_cache = {}
+        self.dt_fields_cache = {}
+
+        for image_name, image_data in self.images.items():
+            self.pad_masks_cache[image_name] = image_data["pad_mask"]
+            self.dt_fields_cache[image_name] = image_data["dt_field"]
 
     def _load_and_preprocess_images(self):
         self.images = load_and_preprocess_images(
@@ -1279,6 +1455,29 @@ class Adjuster(nn.Module):
 
         repr_str += f")"
         return repr_str
+
+    def _scaler_and_scheduler_steps(self, loss):
+        # scaler step
+        if hasattr(self, "scaler") and self.scaler is not None:
+            # gradients computation
+            s_time = time.time()
+            self.scaler.scale(loss).backward()
+            self.timings["gradient_computation"] += time.time() - s_time
+            # parameter update
+            s_time = time.time()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.timings["parameter_update"] += time.time() - s_time
+        else:
+            loss.backward()
+            self.optimizer.step()
+
+        # scheduler step
+        if self.scheduler is not None:
+            if self.scheduler.__class__.__name__ == "ReduceLROnPlateau":
+                self.scheduler.step(loss)
+            else:
+                self.scheduler.step()
 
 
 if __name__ == "__main__":
