@@ -111,6 +111,10 @@ class Adjuster(nn.Module):
         grad_t=True,
         grad_k=True,
         grad_z=False,
+        q_lr_scale=0.1,
+        t_lr_scale=1.0,
+        k_lr_scale=0.5,
+        z_lr_scale=0.1,
         viz=False,  # it true del non used stuff during computation
         gt_path=None,
     ):
@@ -148,6 +152,10 @@ class Adjuster(nn.Module):
         self.grad_t = grad_t
         self.grad_k = grad_k
         self.grad_z = grad_z
+        self.q_lr_scale = q_lr_scale
+        self.t_lr_scale = t_lr_scale
+        self.k_lr_scale = k_lr_scale
+        self.z_lr_scale = z_lr_scale
 
         # Loading
         self.timings = {}
@@ -822,7 +830,7 @@ class Adjuster(nn.Module):
         residuals = torch.stack(residuals_list)  # (num_pairs,)
         return residuals
 
-    def compute_batched_step(self, sampled_viewgraph, batch_size=1024):
+    def compute_batched_step(self, sampled_viewgraph, batch_size=1024, chunk_size=2048):
         """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss."""
 
         # divide self.viewgraph in batches if len(self.viewgraph) > batch size
@@ -834,7 +842,9 @@ class Adjuster(nn.Module):
         else:
             sampled_viewgraphs.append(sampled_viewgraph)
 
+        # collect per-batch results in a python list (tensors)
         residuals_list = []
+
         for sampled_viewgraph in sampled_viewgraphs:
             s_time = time.time()
             # prepare batched inputs
@@ -852,23 +862,47 @@ class Adjuster(nn.Module):
                 # residuals sampling
                 residuals = sample_distance_field(
                     dt_fields, edges_reprojected, device=self.device
-                )  # (B, N)
+                ).squeeze(
+                    1
+                )  # (B, 1, N) -> (B, N)
 
-                # average residuals over valid points per image
-                # TODO: try vectorized version
-                for b in range(residuals.shape[0]):
-                    pad_mask = pad_masks[b]
-                    edge_loss = residuals[b]
-                    valid = ~torch.isnan(edge_loss) & (pad_mask > 0)
-                    valid_loss = edge_loss[valid]
-                    mean_loss = (
-                        valid_loss.mean()
-                        if valid_loss.numel() > 0
-                        else torch.tensor(0.0, device=self.device)
-                    )
-                    residuals_list.append(mean_loss)
+                # vectorized version -> chunked to avoid OOM
+                valid_mask = ~torch.isnan(residuals) & (pad_masks > 0)  # (B, N)
+                valid_counts = valid_mask.sum(dim=1)  # (B,)
+                zero = torch.tensor(0.0, device=self.device)
+                valid_sums = torch.where(valid_mask, residuals, zero).sum(dim=1)  # (B,)
+                mean_losses = torch.where(
+                    valid_counts > 0, valid_sums / valid_counts, zero
+                )  # (B,)
 
-        residuals = torch.stack(residuals_list)  # (num_pairs,)
+                # chunked reduction to avoid OOM
+                B, N = residuals.shape
+                dtype = residuals.dtype
+                zero = torch.tensor(0.0, device=self.device, dtype=dtype)
+                valid_sums = torch.zeros(B, device=self.device, dtype=dtype)
+                valid_counts = torch.zeros(B, device=self.device, dtype=torch.long)
+
+                for i in range(0, N, chunk_size):
+                    r_chunk = residuals[:, i : i + chunk_size]  # (B, chunk)
+                    m_chunk = pad_masks[:, i : i + chunk_size]  # (B, chunk)
+                    non_nan = ~torch.isnan(r_chunk)
+                    mask = non_nan & (m_chunk > 0)
+                    valid_sums += torch.where(mask, r_chunk, zero).sum(dim=1)
+                    valid_counts += mask.sum(dim=1).to(torch.long)
+
+                valid_counts_f = valid_counts.to(dtype)
+                mean_losses = torch.where(
+                    valid_counts > 0, valid_sums / valid_counts_f.clamp(min=1.0), zero
+                )
+
+                # collect this batch's results
+                residuals_list.append(mean_losses)
+
+        # concatenate all collected batch results
+        if len(residuals_list) == 0:
+            residuals = torch.tensor([], device=self.device)
+        else:
+            residuals = torch.cat(residuals_list, dim=0)  # (num_pairs,)
 
         return residuals
 
@@ -1031,13 +1065,14 @@ class Adjuster(nn.Module):
             max_view_angle_deg=30.0,
             distance_factor=2,
             verbose=False,
+            images_with_depth=self.images,
         )
         # Filter viewgraph by reprojection | This need to be runned as batch and speeded up
         viewgraph = filter_viewgraph_by_reprojection(
             viewgraph,
             self.images,
             self.intrinsics,
-            th=0.025,
+            th=0.02,  # roughly 20% of overlap
             sampling_factor=10,
             reprojection_error=3.0,
             P_cache=self.P_cache,
@@ -1107,18 +1142,24 @@ class Adjuster(nn.Module):
         print(f"  {'Total':}: {total_params:>12,} parameters\n")
 
     def _load_optimizer(self, params):
-        self.use_pypose = False
-
         # Build parameter groups only for parameters that exist
         param_groups = []
         if "t" in params:
-            param_groups.append({"params": params["t"], "lr": self.lr})
+            param_groups.append(
+                {"params": params["t"], "lr": self.lr * self.t_lr_scale}
+            )
         if "k" in params:
-            param_groups.append({"params": params["k"], "lr": self.lr * 0.5})
+            param_groups.append(
+                {"params": params["k"], "lr": self.lr * self.k_lr_scale}
+            )
         if "z" in params:
-            param_groups.append({"params": params["z"], "lr": self.lr * 0.5})
+            param_groups.append(
+                {"params": params["z"], "lr": self.lr * self.z_lr_scale}
+            )
         if "q" in params:
-            param_groups.append({"params": params["q"], "lr": self.lr * 0.1})
+            param_groups.append(
+                {"params": params["q"], "lr": self.lr * self.q_lr_scale}
+            )
 
         self.optimizer = torch.optim.AdamW(param_groups, lr=self.lr)
 
@@ -1264,7 +1305,7 @@ if __name__ == "__main__":
         reconstruction_path=reconstruction_path,
         images_path=images_path,
         depths_path=depths_path,
-        viewgraph_path=None,  # if None, it uses the one in the reconstruction_path
+        # viewgraph_path=viewgraph_path,  # if None, it uses the one in the reconstruction_path
         single_camera_per_folder=True,
         load_with_pad=False,
         lr=5e-3,
@@ -1273,8 +1314,8 @@ if __name__ == "__main__":
         grad_k=True,
         grad_z=True,
         scheduler_name="ReduceLROnPlateau",
-        scheduler_params={"factor": 0.5, "patience": 3, "min_lr": 1e-6},
-        gt_path=gt_path,  # slows down a bit the optimization
+        scheduler_params={"factor": 0.5, "patience": 2, "min_lr": 1e-6},
+        # gt_path=gt_path, # slows down a bit the optimization but useful for eval
         # viz=True,
         detector_params={
             "low_threshold": 0.20,
