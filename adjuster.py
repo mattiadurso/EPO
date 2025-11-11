@@ -197,10 +197,10 @@ class Adjuster(nn.Module):
         self.P_cache, self.K_cache = None, None
         self._cache_projection_matrices()
 
-        if self.viewgraph_path is None:
-            self._compute_viewgraph()
-        else:
-            self._read_viewgraph()
+        # if self.viewgraph_path is None:
+        self._compute_viewgraph()
+        # else:
+        # self._read_viewgraph()
         # vg is a lsit of names of image pairs, sort by the the first name
         self.viewgraph.sort(key=lambda x: (x[0], x[1]))
         self.timings["compute_viewgraph"] = time.time() - s_time
@@ -357,12 +357,13 @@ class Adjuster(nn.Module):
                     break
 
             bar.set_postfix(
-                loss=f"{self.loss_list[-1]:.6f}",
+                loss=f"{self.loss_list[-1]:.4f}",
                 auc5=(
                     f"{self.auc_list[-1][-1]:.4f}"
                     if self.gt_path is not None
                     else "N/A"
                 ),
+                rel_change=f"{rel_change:.3e}" if step > 0 else "N/A",
             )
 
         self.timings["total_optimization"] += time.time() - time_start
@@ -865,15 +866,6 @@ class Adjuster(nn.Module):
                 ).squeeze(
                     1
                 )  # (B, 1, N) -> (B, N)
-
-                # vectorized version -> chunked to avoid OOM
-                valid_mask = ~torch.isnan(residuals) & (pad_masks > 0)  # (B, N)
-                valid_counts = valid_mask.sum(dim=1)  # (B,)
-                zero = torch.tensor(0.0, device=self.device)
-                valid_sums = torch.where(valid_mask, residuals, zero).sum(dim=1)  # (B,)
-                mean_losses = torch.where(
-                    valid_counts > 0, valid_sums / valid_counts, zero
-                )  # (B,)
 
                 # chunked reduction to avoid OOM
                 B, N = residuals.shape
