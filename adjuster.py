@@ -18,7 +18,9 @@ import torch.nn.functional as F
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-
+os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
+os.environ["MKL_THREADING_LAYER"] = "GNU"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
 
 # Ignore the cuDNN warning
 warnings.filterwarnings(
@@ -32,7 +34,8 @@ warnings.filterwarnings(
     message=".*IProgress not found.*",
 )
 
-
+import glob
+from PIL import Image
 from tqdm import tqdm
 from helpers.load import (
     find_images,
@@ -72,6 +75,9 @@ class Adjuster(nn.Module):
         images_path (str): Path to the folder containing input images.
         depths_path (str): Path to the folder containing depth maps.
         viewgraph_path (str, optional): Path to a precomputed viewgraph file. If None, it will be computed from frustums.
+        sky_mask_path (str, optional): Path to the folder containing sky masks. Default is None.
+            This excludes edges from sky regions. Might lead to less constraints in optimization and slightly worse results.
+            Use when sky changes a lot between images. PRovide massk as png images with 1 for sky and 0 for non-sky.
         lr (float, optional): Learning rate for the optimizer. Default is 1e-3.
         single_camera_per_folder (bool, optional): Whether to assume a single camera per folder. Default is True.
         load_with_pad (bool, optional): Whether to load images with padding to make them square. Default is True.
@@ -97,6 +103,7 @@ class Adjuster(nn.Module):
         images_path,
         depths_path,
         viewgraph_path=None,  # for testing with GT viewgraph
+        sky_mask_path=None,
         lr=1e-3,
         single_camera_per_folder=True,
         load_with_pad=True,
@@ -106,7 +113,8 @@ class Adjuster(nn.Module):
         detector_params={},
         seed=0,
         scheduler_name=None,
-        scheduler_params={},
+        scheduler_params={"factor": 0.75, "patience": 2, "min_lr": 1e-6},
+        matcher_type="exhaustive",  # or "sequential"
         grad_q=True,
         grad_t=True,
         grad_k=True,
@@ -134,6 +142,8 @@ class Adjuster(nn.Module):
         self.convergence = False
         self.gt_path = gt_path
         self.viewgraph_path = viewgraph_path
+        self.matcher_type = matcher_type
+        self.scheduler_params = scheduler_params
         self.auc_list = []
 
         # Edge extractor
@@ -179,18 +189,11 @@ class Adjuster(nn.Module):
         s_time = time.time()
         self._extract_edges()  # into self.images
         self.timings["extract_edges"] = time.time() - s_time
-        print(f"max edges per image: {self.max_edges:,}")
 
         ## Load depth maps
         s_time = time.time()
         self._load_and_preprocess_depths()
         self.timings["load_depth_maps"] = time.time() - s_time
-
-        ## Compute Distance Fields
-        s_time = time.time()
-        self._compute_distance_fields()  # into self.images
-        self._cache_pad_and_dt_fields()
-        self.timings["compute_distance_fields"] = time.time() - s_time
 
         ## Viewgraph from frustums
         s_time = time.time()
@@ -198,13 +201,21 @@ class Adjuster(nn.Module):
         self.P_cache, self.K_cache = None, None
         self._cache_projection_matrices()
 
-        # if self.viewgraph_path is None:
-        self._compute_viewgraph()
-        # else:
-        # self._read_viewgraph()
+        self._compute_viewgraph(type=self.matcher_type)
         # vg is a lsit of names of image pairs, sort by the first name
         self.viewgraph.sort(key=lambda x: (x[0], x[1]))
         self.timings["compute_viewgraph"] = time.time() - s_time
+
+        ## Load sky mask if any
+        s_time = time.time()
+        self._load_and_preprocess_sky_masks(sky_mask_path)
+        self.timings["load_sky_masks"] = time.time() - s_time
+
+        ## Compute Distance Fields
+        s_time = time.time()
+        self._compute_distance_fields()  # into self.images
+        self._cache_pad_and_dt_fields()
+        self.timings["compute_distance_fields"] = time.time() - s_time
 
         # Create optimizer
         params_to_optimize = self._collect_parameters_to_optimize()
@@ -229,6 +240,8 @@ class Adjuster(nn.Module):
                 self.images[image_name].pop("image")
                 self.images[image_name].pop("depth")
                 self.images[image_name].pop("edges_map")
+                if "sky_mask" in self.images[image_name]:
+                    self.images[image_name].pop("sky_mask")
 
         self.loss_list = []
         self.lr_list = []
@@ -245,6 +258,7 @@ class Adjuster(nn.Module):
         gradient_tolerance=1e-6,
         quick_mode=True,  # "quick" (sample & backprop) or "full" (accumulate over all)
         batch_size=128,  # faster than 64 and 256
+        loss_robustifier=True,
     ):
         """
         Main optimization loop.
@@ -305,7 +319,7 @@ class Adjuster(nn.Module):
                     sampled_viewgraph, batch_size=batch_size
                 )  # (num_pairs,)
 
-            loss = self._compute_batched_loss(residuals)
+            loss = self._compute_batched_loss(residuals, robustifier=loss_robustifier)
 
             # Backpropagate and update using GradScaler if available
             self._scaler_and_scheduler_steps(loss)
@@ -320,7 +334,7 @@ class Adjuster(nn.Module):
             self.lr_list.append(current_lr)
 
             # DEBUG: Evaluate AUC if GT available
-            if self.gt_path is not None:
+            if self.gt_path is not None and step % 5 == 0:
                 opt = "/home/mattia/Desktop/Repos/batchsfm/optimized_reconstruction"
                 self.build_reconstruction(opt, save_points=False, verbose=False)
                 AUC_score_max, num_images, df_optim = eval_colmap_model(
@@ -338,8 +352,9 @@ class Adjuster(nn.Module):
                         f"Converged at step {step} with relative loss ",
                         f"change {rel_change:.3e} < {gradient_tolerance}",
                     )
-                    self.convergence = True
-                    break
+                    if step > self.scheduler_params.get("patience", 2):
+                        self.convergence = True
+                        break
 
             bar.set_postfix(
                 loss=f"{self.loss_list[-1]:.4f}",
@@ -911,8 +926,8 @@ class Adjuster(nn.Module):
                     rgb = image[:, y_coords_int, x_coords_int]  # (3, M)
                     rgb = (rgb * 255).astype(np.uint8).T  # (M, 3)
                 else:
-                    # Default to white
-                    rgb = np.full((len(valid_3D), 3), 200, dtype=np.uint8)
+                    # Default to black if no image available
+                    rgb = np.full((len(valid_3D), 3), 0, dtype=np.uint8)
 
                 # Add points to reconstruction
                 for pt_world, rgb_val in zip(valid_3D, rgb):
@@ -1066,7 +1081,7 @@ class Adjuster(nn.Module):
 
         return residuals
 
-    def _compute_batched_loss(self, residuals):
+    def _compute_batched_loss(self, residuals, robustifier=False, delta=1.0):
         """Vectorized batched loss computation."""
         s_time = time.time()
 
@@ -1080,6 +1095,14 @@ class Adjuster(nn.Module):
         residuals_pairs = residuals.view(-1, 2)  # (num_pairs, 2)
 
         # Sum i->j and j->i directions which are now in the same row
+        if robustifier:
+            # Use Huber loss for robust cost
+            pair_losses = F.huber_loss(
+                residuals_pairs,
+                torch.zeros_like(residuals_pairs),
+                reduction="none",
+                delta=delta,
+            )
         pair_losses = residuals_pairs.sum(dim=1)  # (num_pairs,)
 
         # Mean over pairs
@@ -1164,6 +1187,101 @@ class Adjuster(nn.Module):
                 grad=self.grad_z,
             )
 
+    def _load_and_preprocess_sky_masks(self, path):
+        """Load and preprocess sky masks from the given path."""
+        if path is None:
+            return
+
+        masks_path = glob.glob(os.path.join(path, "*.png")) + glob.glob(
+            os.path.join(path, "*", "*.png")
+        )
+
+        # load sky masks
+        sky_masks_dict = {}
+        for mask_path in masks_path:
+            mask = Image.open(mask_path).convert("L")
+            rel_image_name = os.path.relpath(mask_path, path).replace(".png", ".jpg")
+            h, w = self.images[rel_image_name]["hw"]
+
+            mask_tensor = (
+                torch.from_numpy(np.array(mask)).float().to(self.device) / 255.0
+            )
+            mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
+            mask_tensor = F.interpolate(
+                mask_tensor, size=(h, w), mode="bilinear", align_corners=False
+            )
+            mask_tensor = mask_tensor.squeeze().bool()
+
+            mask_tensor[:5, :] = True
+            mask_tensor[-5:, :] = True
+            mask_tensor[:, :5] = True
+            mask_tensor[:, -5:] = True
+
+            sky_masks_dict[rel_image_name] = mask_tensor
+
+        # Update depth with sky masks — set to NaN
+        for image_name in self.images.keys():
+            if image_name in sky_masks_dict:
+                self.images[image_name]["sky_mask"] = sky_masks_dict[image_name]
+                depth = self.images[image_name]["depth"]
+                sky_mask_tensor = sky_masks_dict[image_name]
+                # Set sky regions to NaN so they're properly masked
+                depth = depth.masked_fill(sky_mask_tensor, float("nan"))
+                self.images[image_name]["depth_no_sky"] = depth
+
+        # Remove old padded edges/masks before recalculating
+        for image_name in self.images.keys():
+            if "edges_padded" in self.images[image_name]:
+                del self.images[image_name]["edges_padded"]
+            if "pad_mask" in self.images[image_name]:
+                del self.images[image_name]["pad_mask"]
+            if "edges" in self.images[image_name]:
+                del self.images[image_name]["edges"]
+            if "sampled_depth" in self.images[image_name]:
+                del self.images[image_name]["sampled_depth"]
+
+        # Filter edges in sky regions
+        for image_name in self.images.keys():
+            if "sky_mask" in self.images[image_name]:
+                sky_mask = self.images[image_name]["sky_mask"]
+                edges_map = self.images[image_name]["edges_map"]
+
+                if edges_map.numel() > 0:
+                    # Remove edges that fall in sky regions
+                    edges_map = edges_map.masked_fill(sky_mask, False)
+                    self.images[image_name]["edges_map"] = edges_map
+                    # Extract new edges from filtered map
+                    self.images[image_name]["edges"] = (
+                        edges_map.nonzero().flip(dims=(1, 0)).float()
+                    )
+
+        # Recalculate padding with new edge counts
+        self._pad_edges()
+
+        # Sample depth at new edge locations
+        for image_name in self.images.keys():
+            edges_padded = self.images[image_name]["edges_padded"]
+            depth = self.images[image_name]["depth"]
+            sampled_depth, _ = grid_sample_nan(edges_padded[None], depth[None])
+
+            self.images[image_name]["sampled_depth"] = DepthMap(
+                height=self.images[image_name]["hw"][0],
+                width=self.images[image_name]["hw"][1],
+                depth=sampled_depth.squeeze(),
+                grad=self.grad_z,
+            )
+
+        # # Verify consistency
+        # for image_name in self.images.keys():
+        #     n_valid_edges = torch.sum(
+        #         ~torch.isnan(self.images[image_name]["edges_padded"]).any(dim=1)
+        #     )
+        #     n_pad_mask = torch.sum(self.images[image_name]["pad_mask"])
+
+        #     assert (
+        #         n_valid_edges == n_pad_mask
+        #     ), f"Mismatch for {image_name}: edges={n_valid_edges}, pad_mask={n_pad_mask}"
+
     def _extract_edges(self):
         for image_name in tqdm(self.images.keys(), desc=f"Extracting edges"):
             img_tensor = self.images[image_name]["image"].unsqueeze(0).to(self.device)
@@ -1173,24 +1291,39 @@ class Adjuster(nn.Module):
                 {"edges_map": edges_map.squeeze(), "edges": edges}
             )
 
-        # pad with nans to have same number of edges per image
+        # pad to have same number of edges per image
+        self._pad_edges()
+
+    def _pad_edges(self):
+        """Pad all edges to have same number (max_edges) of edges per image."""
         max_edges = max(
             [self.images[img]["edges"].shape[0] for img in self.images.keys()]
         )
+
         for image_name in self.images.keys():
             edges = self.images[image_name]["edges"]
             n_edges = edges.shape[0]
             if n_edges < max_edges:
                 pad_size = max_edges - n_edges
-                # pad = torch.full((pad_size, 2), float("nan"), device=edges.device)
                 pad = torch.zeros((pad_size, 2), device=edges.device)
                 edges = torch.cat([edges, pad], dim=0)
-                pad_mask = torch.zeros((max_edges,), device=edges.device)
+
+                pad_mask = torch.zeros(
+                    (max_edges,), device=edges.device, dtype=torch.float32
+                )
                 pad_mask[:n_edges] = 1.0
+            else:
+                # n_edges == max_edges: all edges are valid
+                pad_mask = torch.ones(
+                    (max_edges,), device=edges.device, dtype=torch.float32
+                )
+
             self.images[image_name].update(
                 {"edges_padded": edges, "pad_mask": pad_mask}
             )
+
         self.max_edges = max_edges
+        print(f"max edges per image: {self.max_edges:,}")
 
     @torch.no_grad()
     def _compute_distance_fields(self):
@@ -1224,23 +1357,34 @@ class Adjuster(nn.Module):
         torch.cuda.empty_cache()
 
     @torch.no_grad()
-    def _compute_viewgraph(self):
-        # Estimate view graph from frustums
-        viewgraph = build_view_graph_from_frustums(
-            self.recon,
-            z_near_default=0.1,
-            z_far_default=5.0,
-            max_view_angle_deg=30.0,
-            distance_factor=2,
-            verbose=False,
-            images_with_depth=self.images,
-        )
+    def _compute_viewgraph(self, type="exhaustive", window_size=10):
+        """Compute viewgraph and filter by reprojection error."""
+        if type == "exhaustive":
+            # Estimate view graph from frustums
+            viewgraph = build_view_graph_from_frustums(
+                self.recon,
+                z_near_default=0.1,
+                z_far_default=5.0,
+                max_view_angle_deg=30.0,
+                distance_factor=2,
+                verbose=False,
+                images_with_depth=self.images,
+            )
+
+        elif type == "sequential":
+            # Build sequential viewgraph based on sorted image names with window size 10
+            image_names = sorted(list(self.images.keys()))
+            viewgraph = []
+            for i in range(len(image_names) - window_size):
+                for j in range(1, window_size + 1):
+                    viewgraph.append((image_names[i], image_names[i + j]))
+
         # Filter viewgraph by reprojection | This need to be runned as batch and speeded up
         viewgraph = filter_viewgraph_by_reprojection(
             viewgraph,
             self.images,
             self.intrinsics,
-            th=0.02,  # roughly 20% of overlap
+            th=0.025,  # roughly 25% of overlap
             sampling_factor=10,
             reprojection_error=3.0,
             P_cache=self.P_cache,
