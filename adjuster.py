@@ -50,7 +50,9 @@ from helpers.reprojection import (
     filter_viewgraph_by_reprojection,
     reproject_2D_2D,
     grid_sample_nan,
-    unproject_to_world,
+)
+from helpers.reprojection_compiled import (
+    unproject_2D_to_world,
     project_world_to_2D,
 )
 from helpers.frustum import build_view_graph_from_frustums
@@ -255,8 +257,8 @@ class Adjuster(nn.Module):
         self,
         max_steps=1_000,
         type="batched",
-        gradient_tolerance=1e-6,
-        quick_mode=True,  # "quick" (sample & backprop) or "full" (accumulate over all)
+        gradient_tolerance=1e-5,
+        quick_mode=False,  # "quick" (sample & backprop) or "full" (accumulate over all)
         batch_size=128,  # faster than 64 and 256
         loss_robustifier=True,
     ):
@@ -292,6 +294,10 @@ class Adjuster(nn.Module):
             )
 
         max_steps = max_steps if max_steps > 0 else 1_000
+        total_points = self.max_edges * (
+            batch_size if quick_mode else len(self.viewgraph)
+        )
+        print(f"Total points to process per iteration: {total_points:,}")
         bar = tqdm(range(max_steps), desc="Adjusting poses and intrinsics")
 
         for step in bar:
@@ -359,11 +365,9 @@ class Adjuster(nn.Module):
             bar.set_postfix(
                 loss=f"{self.loss_list[-1]:.4f}",
                 auc5=(
-                    f"{self.auc_list[-1][-1]:.4f}"
-                    if self.gt_path is not None
-                    else "N/A"
+                    f"{self.auc_list[-1][-1]:.4f}" if self.gt_path is not None else -1
                 ),
-                rel_change=f"{rel_change:.3e}" if step > 0 else "N/A",
+                rel_change=f"{rel_change:.3e}" if step > 0 else -1,
             )
 
         self.timings["total_optimization"] += time.time() - time_start
@@ -1555,7 +1559,7 @@ class Adjuster(nn.Module):
             depth0 = depth_batch[i : i + batch_size]
             P0 = P_batch[i : i + batch_size]
 
-            pts3d = unproject_to_world(
+            pts3d = unproject_2D_to_world(
                 xy0=xy0, K0=K0, depth0=depth0, P0=P0
             )  # (bs, N, 3)
             points_3D_list.append(pts3d)
