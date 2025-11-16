@@ -1,32 +1,18 @@
 import torch
 from torch import Tensor
 
-#################################
-# Goal is to compile all these functions with torch.compile
-#################################
+### From 2D to 3D world coordinates
 
 
-# @torch.compile(mode="reduce-overhead")
+@torch.compile(mode="reduce-overhead")
 def to_homogeneous(xy: Tensor) -> Tensor:
     """Converts 2D points to homogeneous coordinates."""
-    return torch.cat((xy, torch.ones_like(xy[..., :1])), dim=-1)
+    batch_shape = xy.shape[:-1]
+    ones = torch.ones(*batch_shape, 1, dtype=xy.dtype, device=xy.device)
+    return torch.cat((xy, ones), dim=-1)
 
 
-# @torch.compile(mode="reduce-overhead")
-def from_homogeneous(points: Tensor) -> Tensor:
-    """Converts homogeneous coordinates to 2D points."""
-    eps = 1e-8
-    z_vec = points[..., -1:]
-    # set the results of division by zero/near-zero to 1.0
-    # follow the convention of opencv:
-    # https://github.com/opencv/opencv/pull/14411/files
-    mask = torch.abs(z_vec) > eps
-    scale = torch.where(mask, 1.0 / (z_vec + eps), torch.ones_like(z_vec))
-    output = scale * points[..., :-1]
-    return output
-
-
-# @torch.compile(mode="reduce-overhead")
+@torch.compile(mode="reduce-overhead")
 def unproject_to_virtual_plane(
     xy: Tensor,
     K: Tensor,
@@ -54,7 +40,7 @@ def unproject_to_virtual_plane(
     return xyz
 
 
-# @torch.compile(mode="reduce-overhead")
+@torch.compile(mode="reduce-overhead")
 def unproject_to_3D(xy: Tensor, K: Tensor, depths: Tensor) -> Tensor:
     """unproject points to 3D in the camera ref system
     Args:
@@ -110,6 +96,52 @@ def invert_P(P: Tensor) -> Tensor:
 
 
 @torch.compile(mode="reduce-overhead")
+def unproject_2D_to_world(
+    xy0: Tensor, K0: Tensor, depth0: Tensor, P0: Tensor
+) -> Tensor:
+    """unproject points to world coordinates
+    Args:
+        xy: xy points in img0 (with convention top-left pixel coordinate (0.5, 0.5)
+            B,n,2
+        K: intrinsics of the camera
+            B,3,3
+        depths: the points depth
+            B,n
+        P: camera extrinsics matrix
+            B,4,4
+    Returns:
+        xyz_world: unprojected 3D points in the world reference system
+            B,n,3
+    """
+    # 2D -> 3D camera
+    xyz_camera = unproject_to_3D(xy0, K0, depth0)  # B,n,3
+
+    # 3D camera -> world
+    P_inv = invert_P(P0)  # B,4,4
+    R_inv, t_inv = P_inv[:, :3, :3], P_inv[:, :3, 3:]  # B,3,3 , B,3,1
+    xyz_world = (R_inv @ xyz_camera.permute(0, 2, 1) + t_inv).permute(0, 2, 1)  # B,n,3
+
+    return xyz_world
+
+
+#### From homogeneous coordinates to 2D
+
+
+# @torch.compile(mode="reduce-overhead")
+def from_homogeneous(points: Tensor) -> Tensor:
+    """Converts homogeneous coordinates to 2D points."""
+    eps = 1e-8
+    z_vec = points[..., -1:]
+    # set the results of division by zero/near-zero to 1.0
+    # follow the convention of opencv:
+    # https://github.com/opencv/opencv/pull/14411/files
+    mask = torch.abs(z_vec) > eps
+    scale = torch.where(mask, 1.0 / (z_vec + eps), torch.ones_like(z_vec))
+    output = scale * points[..., :-1]
+    return output
+
+
+# @torch.compile(mode="reduce-overhead")
 def filter_outside(xy: Tensor, shape: Tensor, border: int = 0) -> Tensor:
     """set as nan all the points that are not inside rectangle
     Args:
@@ -132,7 +164,7 @@ def filter_outside(xy: Tensor, shape: Tensor, border: int = 0) -> Tensor:
     return xy_filtered
 
 
-@torch.compile(mode="reduce-overhead")
+# @torch.compile(mode="reduce-overhead")
 def project_to_2D(
     xyz: Tensor,
     K: Tensor,
@@ -174,35 +206,6 @@ def project_to_2D(
     )
     xy_proj = filter_outside(xy_proj, img_shape, border)
     return xy_proj, mask_outside  #  Always return both
-
-
-@torch.compile(mode="reduce-overhead")
-def unproject_2D_to_world(
-    xy0: Tensor, K0: Tensor, depth0: Tensor, P0: Tensor
-) -> Tensor:
-    """unproject points to world coordinates
-    Args:
-        xy: xy points in img0 (with convention top-left pixel coordinate (0.5, 0.5)
-            B,n,2
-        K: intrinsics of the camera
-            B,3,3
-        depths: the points depth
-            B,n
-        P: camera extrinsics matrix
-            B,4,4
-    Returns:
-        xyz_world: unprojected 3D points in the world reference system
-            B,n,3
-    """
-    # 2D -> 3D camera
-    xyz_camera = unproject_to_3D(xy0, K0, depth0)  # B,n,3
-
-    # 3D camera -> world
-    P_inv = invert_P(P0)  # B,4,4
-    R_inv, t_inv = P_inv[:, :3, :3], P_inv[:, :3, 3:]  # B,3,3 , B,3,1
-    xyz_world = (R_inv @ xyz_camera.permute(0, 2, 1) + t_inv).permute(0, 2, 1)  # B,n,3
-
-    return xyz_world
 
 
 # @torch.compile(mode="reduce-overhead")
