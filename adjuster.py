@@ -294,7 +294,7 @@ class Adjuster(nn.Module):
             )
         else:
             num_batches = math.ceil(len(self.viewgraph) / batch_size)
-            (
+            if verbose:
                 print(
                     f"Full accumulation mode ON. Processing {len(self.viewgraph):,}",
                     (
@@ -305,26 +305,22 @@ class Adjuster(nn.Module):
                     # edges per image
                     f"Using {self.images[list(self.images.keys())[0]]['edges_padded'].numel()//2:,} edges per image",  # // due to x and y
                 )
-                if verbose
-                else None
-            )
 
         max_steps = max_steps if max_steps > 0 else 1_000
-        total_points = self.max_edges * (
-            batch_size if quick_mode else len(self.viewgraph)
-        )
-        (
-            print(
-                f"Total points to process per iteration: {total_points:,}. Min learning rate: {self.scheduler_params.get('min_lr',1e-4):.2e}"
+        if verbose:
+            total_points = self.max_edges * (
+                batch_size if quick_mode else len(self.viewgraph)
             )
-            if verbose
-            else None
-        )
-        bar = (
-            tqdm(range(max_steps), desc="Adjusting poses and intrinsics")
-            if verbose
-            else range(max_steps)
-        )
+
+            print(
+                f"Total points to process per iteration: {total_points:,}.\n"
+                + f"Initial learning rate: {self.lr:.2e}.\n"
+                + f"Target learning rate:  {self.scheduler_params.get('min_lr',1e-4):.2e}."
+            )
+
+            bar = tqdm(range(max_steps), desc="Adjusting poses and intrinsics")
+        else:
+            bar = range(max_steps)
 
         for step in bar:
             # Initialize optimizer gradients
@@ -1252,7 +1248,7 @@ class Adjuster(nn.Module):
         print(
             f"{'Stage':<{key_width}}"
             f"{'Time (s)':>{val_width}}"
-            f"{'%':>{perc_width+2}}"
+            f"{'%':>{perc_width+1}}"
             f"{'Per Iter':>{avg_width}}"
         )
         print("-" * w)
