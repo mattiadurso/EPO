@@ -119,10 +119,10 @@ def filter_viewgraph_by_reprojection(
     images,
     intrinsics,
     th=0.025,
-    min_points=100,
+    min_points=100,  # do I want this in my scheme?
     border=0,
     sampling_factor=10,
-    reprojection_error=3.0,
+    reprojection_error=5.0,
     device="cuda",
     P_cache=None,
     K_cache=None,
@@ -166,7 +166,7 @@ def filter_viewgraph_by_reprojection(
 
         # Get cached grid instead of creating new one
         grid_i = get_or_create_grid(ih, iw, sampling_factor, border, device)
-        grid_j = get_or_create_grid(jh, jw, sampling_factor, border, device)
+        # grid_j = get_or_create_grid(jh, jw, sampling_factor, border, device)
 
         # Use cached matrices
         data = {
@@ -206,7 +206,7 @@ def filter_viewgraph_by_reprojection(
             torch.isnan(kpts1).any(dim=-1), torch.isnan(kpts0_back).any(dim=-1)
         )
         kpts0_valid = grid_i[~nan_mask.squeeze()]
-        kpts1_valid = kpts1[~nan_mask]
+        # kpts1_valid = kpts1[~nan_mask]
         kpts0_back_valid = kpts0_back[~nan_mask]
 
         # Check reprojection consistency
@@ -236,7 +236,7 @@ def filter_viewgraph_by_reprojection(
             if perc >= th or len(kpt0) >= min_points:
                 filtered_viewgraph.append((i, j))
 
-    print(f"Filtered viewgraph: {len(filtered_viewgraph)} pairs retained")
+    print(f"Filtered viewgraph: {len(filtered_viewgraph):,} pairs retained")
     return filtered_viewgraph
 
 
@@ -324,11 +324,9 @@ def normalize_pixel_coordinates(
     Returns:
         xy_norm: normalized coordinates between [-1, 1]
     """
-    xy_norm = xy.clone()
-    # ? the shape index are flipped because the coordinates are given as x,y but shape is H,W
-    xy_norm[..., 0] = 2 * xy_norm[..., 0] / shape[1]
-    xy_norm[..., 1] = 2 * xy_norm[..., 1] / shape[0]
-    xy_norm -= 1
+    xy_norm_x = 2 * xy[..., 0] / shape[1] - 1
+    xy_norm_y = 2 * xy[..., 1] / shape[0] - 1
+    xy_norm = th.stack([xy_norm_x, xy_norm_y], dim=-1)
     return xy_norm
 
 
@@ -336,8 +334,9 @@ def to_homogeneous(xy: Tensor) -> Tensor:
     return th.cat((xy, th.ones_like(xy[..., 0:1])), dim=-1)
 
 
-def from_homogeneous(points: Tensor, eps: float = 1e-8) -> Tensor:
-    z_vec: Tensor = points[..., -1:]
+def from_homogeneous(points: Tensor) -> Tensor:
+    eps = 1e-8
+    z_vec = points[..., -1:]
     # set the results of division by zero/near-zero to 1.0
     # follow the convention of opencv:
     # https://github.com/opencv/opencv/pull/14411/files
@@ -348,7 +347,8 @@ def from_homogeneous(points: Tensor, eps: float = 1e-8) -> Tensor:
 
 
 def unproject_to_virtual_plane(
-    xy: Tensor, K: Tensor, cast_to_double: bool = True
+    xy: Tensor,
+    K: Tensor,  # cast_to_double: bool = True
 ) -> Tensor:
     """unproject points to the camera virtual plane at depth 1
     Args:
@@ -362,17 +362,17 @@ def unproject_to_virtual_plane(
             B,n,3
     """
     xy_hom = to_homogeneous(xy)  # B,n,3
-    if cast_to_double:
-        original_type = xy.dtype
-        # Bx3x3 * Bx3xn = Bx3xn  -> B,n,3 after permute
-        xyz = (
-            (th.inverse(K.to(th.double)) @ (xy_hom.permute(0, 2, 1).to(th.double)))
-            .permute(0, 2, 1)
-            .to(original_type)
-        )
-    else:
-        # Bx3x3 * Bx3xn = Bx3xn  -> B,n,3 after permute
-        xyz = (th.inverse(K) @ (xy_hom.permute(0, 2, 1))).permute(0, 2, 1)
+    # if cast_to_double:
+    original_type = xy.dtype
+    # Bx3x3 * Bx3xn = Bx3xn  -> B,n,3 after permute
+    xyz = (
+        (th.linalg.inv(K.to(th.double)) @ (xy_hom.permute(0, 2, 1).to(th.double)))
+        .permute(0, 2, 1)
+        .to(original_type)
+    )
+    # else:
+    # Bx3x3 * Bx3xn = Bx3xn  -> B,n,3 after permute
+    # xyz = (th.inverse(K) @ (xy_hom.permute(0, 2, 1))).permute(0, 2, 1)
 
     return xyz
 
@@ -391,13 +391,16 @@ def unproject_to_3D(xy: Tensor, K: Tensor, depths: Tensor) -> Tensor:
             B,n,3
     """
     assert xy.shape[0] == K.shape[0] and xy.shape[0] == depths.shape[0]
-    assert xy.shape[1] == depths.shape[1]
+    assert (
+        xy.shape[1] == depths.shape[1]
+    ), f"Expected xy and depths to have the same number of points, got {xy.shape[1]} and {depths.shape[1]}"
     assert xy.shape[2] == 2
 
     xyz = unproject_to_virtual_plane(xy, K)  # B,n,3
-    xyz *= depths[:, :, None]  # B,n,3
+    depths = depths.unsqueeze(-1)  # B,n,1
+    xyz_scaled = xyz * depths  # B,n,3
 
-    return xyz
+    return xyz_scaled
 
 
 def invert_P(P: Tensor) -> Tensor:
@@ -422,7 +425,9 @@ def invert_P(P: Tensor) -> Tensor:
 
 
 def change_reference_3D_points(
-    xyz0: Tensor, P0: Tensor, P1: Tensor, cast_to_double: bool = True
+    xyz0: Tensor,
+    P0: Tensor,
+    P1: Tensor,  # cast_to_double: bool = True
 ) -> Tensor:
     """move 3D points from P0 to P1 reference systems
     Args:
@@ -449,17 +454,17 @@ def change_reference_3D_points(
     ), f"Expected P1 to have shape Bx4x4, got {P1.shape}"
 
     xyz0_hom = to_homogeneous(xyz0)  # B,n,4
-    if cast_to_double:
-        original_dtype = xyz0.dtype
-        P0_inv = invert_P(P0.to(th.double))
-        xyz1_hom = (
-            P1.to(th.double) @ P0_inv @ xyz0_hom.permute(0, 2, 1).to(th.double)
-        )  # B,4,n
-        xyz1 = from_homogeneous(xyz1_hom.permute(0, 2, 1)).to(original_dtype)  # B,n,3
-    else:
-        P0_inv = invert_P(P0)
-        xyz1_hom = P1 @ P0_inv @ xyz0_hom.permute(0, 2, 1)  # B,4,n
-        xyz1 = from_homogeneous(xyz1_hom.permute(0, 2, 1))  # B,n,3
+    # if cast_to_double:
+    original_dtype = xyz0.dtype
+    P0_inv = invert_P(P0.to(th.double))
+    xyz1_hom = (
+        P1.to(th.double) @ P0_inv @ xyz0_hom.permute(0, 2, 1).to(th.double)
+    )  # B,4,n
+    xyz1 = from_homogeneous(xyz1_hom.permute(0, 2, 1)).to(original_dtype)  # B,n,3
+    # else:
+    #     P0_inv = invert_P(P0)
+    #     xyz1_hom = P1 @ P0_inv @ xyz0_hom.permute(0, 2, 1)  # B,4,n
+    #     xyz1 = from_homogeneous(xyz1_hom.permute(0, 2, 1))  # B,n,3
 
     return xyz1
 
@@ -478,11 +483,11 @@ def filter_outside(
         Tensor: input keypoints with 'nan' where one of the two coordinates was not contained inside shape
         xy_filtered     (B)xnx2
     """
-    assert xy.shape[-1] == 2, f"xy must have last dimension of size 2, got {xy.shape}"
-    assert len(shape) == 2, f"shape must be a tuple of 2 elements, got {shape}"
-    assert border < max(
-        shape
-    ), f"border must be smaller than the smallest shape dimension, got {border} and {shape}"
+    # assert xy.shape[-1] == 2, f"xy must have last dimension of size 2, got {xy.shape}"
+    # assert len(shape) == 2, f"shape must be a tuple of 2 elements, got {shape}"
+    # assert border < max(
+    #     shape
+    # ), f"border must be smaller than the smallest shape dimension, got {border} and {shape}"
 
     xy = xy.clone()
     outside_mask = (
@@ -490,15 +495,16 @@ def filter_outside(
         + (xy[..., 0] >= shape[1] - border)
         + (xy[..., 1] < border)
         + (xy[..., 1] >= shape[0] - border)
-    )  # (B)xn
-    xy[outside_mask] = float("nan")
-    return xy
+    )
+    # Use torch.where instead of indexing assignment
+    xy_filtered = th.where(outside_mask[..., None], th.full_like(xy, float("nan")), xy)
+    return xy_filtered
 
 
 def project_to_2D(
     xyz: Tensor,
     K: Tensor,
-    img_shape: tuple[int, int] | None = None,
+    img_shape: tuple[int, int],
     border: int = 0,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """project 3D points to 2D using the provided intrinsics matrix K. If img_shape is provided, set to nan the points
@@ -523,20 +529,18 @@ def project_to_2D(
     )
     xy_proj = from_homogeneous(xy_proj_hom).to(original_dtype)  # B,n,2
 
-    if img_shape is not None:
-        # ? filter points that fall outside the second image but have depth valid
-        # ? as the comparison of a 'nan' values with something else is always false, only the points that had valid
-        # ? depth will appear in mask_outside
-        mask_outside = (
-            (xy_proj[..., 0] < border)
-            + (xy_proj[..., 0] >= img_shape[1] - border)
-            + (xy_proj[..., 1] < border)
-            + (xy_proj[..., 1] >= img_shape[0] - border)
-        )
-        xy_proj = filter_outside(xy_proj, img_shape, border)
-        return xy_proj, mask_outside
-    else:
-        return xy_proj
+    # if img_shape is not None:
+    # ? filter points that fall outside the second image but have depth valid
+    # ? as the comparison of a 'nan' values with something else is always false, only the points that had valid
+    # ? depth will appear in mask_outside
+    mask_outside = (
+        (xy_proj[..., 0] < border)
+        + (xy_proj[..., 0] >= img_shape[1] - border)
+        + (xy_proj[..., 1] < border)
+        + (xy_proj[..., 1] >= img_shape[0] - border)
+    )
+    xy_proj = filter_outside(xy_proj, img_shape, border)
+    return xy_proj, mask_outside  #  Always return both
 
 
 def reproject_2D_2D(
@@ -608,68 +612,62 @@ def reproject_2D_2D(
         return xy0_proj
 
 
-# @torch.compile()
-def unproject_to_world(xy0: Tensor, K0: Tensor, depth0: Tensor, P0: Tensor) -> Tensor:
-    """unproject points to world coordinates
-    Args:
-        xy: xy points in img0 (with convention top-left pixel coordinate (0.5, 0.5)
-            B,n,2
-        K: intrinsics of the camera
-            B,3,3
-        depths: the points depth
-            B,n
-        P: camera extrinsics matrix
-            B,4,4
-    Returns:
-        xyz_world: unprojected 3D points in the world reference system
-            B,n,3
-    """
-    # 2D -> 3D camera
-    xyz_camera = unproject_to_3D(xy0, K0, depth0)  # B,n,3
+# @torch.compile(mode="reduce-overhead")
+# def unproject_2D_to_world(
+#     xy0: Tensor, K0: Tensor, depth0: Tensor, P0: Tensor
+# ) -> Tensor:
+#     """unproject points to world coordinates
+#     Args:
+#         xy: xy points in img0 (with convention top-left pixel coordinate (0.5, 0.5)
+#             B,n,2
+#         K: intrinsics of the camera
+#             B,3,3
+#         depths: the points depth
+#             B,n
+#         P: camera extrinsics matrix
+#             B,4,4
+#     Returns:
+#         xyz_world: unprojected 3D points in the world reference system
+#             B,n,3
+#     """
+#     # 2D -> 3D camera
+#     xyz_camera = unproject_to_3D(xy0, K0, depth0)  # B,n,3
 
-    # 3D camera -> world
-    P_inv = invert_P(P0)  # B,4,4
-    R_inv, t_inv = P_inv[:, :3, :3], P_inv[:, :3, 3:]  # B,3,3 , B,3,1
-    xyz_world = (R_inv @ xyz_camera.permute(0, 2, 1) + t_inv).permute(0, 2, 1)  # B,n,3
+#     # 3D camera -> world
+#     P_inv = invert_P(P0)  # B,4,4
+#     R_inv, t_inv = P_inv[:, :3, :3], P_inv[:, :3, 3:]  # B,3,3 , B,3,1
+#     xyz_world = (R_inv @ xyz_camera.permute(0, 2, 1) + t_inv).permute(0, 2, 1)  # B,n,3
 
-    return xyz_world
+#     return xyz_world
 
 
-# @torch.compile()
-def project_world_to_2D(
-    xyz_world: Tensor,  # b,n, 3
-    P1: Tensor,
-    K1: Tensor,
-    img1_shape: tuple[int, int] | None = None,
-    border: int = 0,
-) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
-    """project 3D world points to 2D using the provided extrinsics P and intrinsics K. If img_shape is provided,
-    set to nan the points that project out of the img and additionally return mask_outside boolean tensor
-    Args:
-        xyz_world: the 3D points in world reference system
-            B,n,3
-        P: camera extrinsics matrix
-            B,4,4
-        K: the camera intrinsics matrix
-            B,3,3
-        img_shape: if provided, set to nan the points that map out of the image and additionally return mask_outside
-        border: if img_shape is provided, set to nan the points that map out of the image border
-    Returns
-        xy_proj: the 2D projection of the 3D points
-            B,n,2
-        mask_outside: optional (if img_shape is provided). True where the point map outside img_shape
-            B,n bool
-    """
-    # ? change the ref system of the 3d point to camera
-    R1, t1 = P1[:, :3, :3], P1[:, :3, 3:]  # B,3,3 , B,3,1
-    xyz_camera1 = (R1 @ xyz_world.permute(0, 2, 1) + t1).permute(0, 2, 1)  # B,n,3
-    # ? project the point in the destination image
-    if img1_shape is not None:
-        xy_proj, mask_outside = project_to_2D(
-            xyz_camera1, K1, img1_shape, border
-        )  # B,n,2, B,n,2
-        return xy_proj  # , mask_outside
-    else:
-        assert border == 0, "border must be 0 if img_shape is not provided"
-        xy_proj = project_to_2D(xyz_camera1, K1)  # B,n,2, B,n,2
-        return xy_proj
+# # @torch.compile(mode="reduce-overhead")
+# def project_world_to_2D(
+#     xyz_world: Tensor,  # b,n, 3
+#     P1: Tensor,
+#     K1: Tensor,
+#     img1_shape: tuple[int, int] | None = None,
+#     border: int = 0,
+# ) -> tuple[Tensor, Tensor] | tuple[Tensor, Tensor, Tensor]:
+#     """project 3D world points to 2D using the provided extrinsics P and intrinsics K. If img_shape is provided,
+#     set to nan the points that project out of the img and additionally return mask_outside boolean tensor
+#     Args:
+#         xyz_world: the 3D points in world reference system
+#             B,n,3
+#         P: camera extrinsics matrix
+#             B,4,4
+#         K: the camera intrinsics matrix
+#             B,3,3
+#         img_shape: if provided, set to nan the points that map out of the image and additionally return mask_outside
+#         border: if img_shape is provided, set to nan the points that map out of the image border
+#     Returns
+#         xy_proj: the 2D projection of the 3D points
+#             B,n,2
+#         mask_outside: optional (if img_shape is provided). True where the point map outside img_shape
+#             B,n bool
+#     """
+#     # ? change the ref system of the 3d point to camera
+#     R1, t1 = P1[:, :3, :3], P1[:, :3, 3:]  # B,3,3 , B,3,1
+#     xyz_camera1 = (R1 @ xyz_world.permute(0, 2, 1) + t1).permute(0, 2, 1)  # B,n,3
+#     xy_proj, _ = project_to_2D(xyz_camera1, K1, img1_shape, border)  # B,n,2, B,n,2
+#     return xy_proj

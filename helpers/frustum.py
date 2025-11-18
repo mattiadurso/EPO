@@ -40,6 +40,7 @@ def build_view_graph_from_frustums(
     max_view_angle_deg=75.0,
     distance_factor=2,
     verbose=True,
+    images_with_depth=None,
 ):
     """
     Compute view-graph image pairs by frustum intersection,
@@ -79,8 +80,12 @@ def build_view_graph_from_frustums(
             img.cam_from_world.translation, dtype=torch.float32, device=device
         )
 
-        z_near, z_far = z_near_default, z_far_default
-
+        if images_with_depth is not None and img.name in images_with_depth:
+            depth = images_with_depth[img.name]["depth"]
+            z_near = depth.min().detach().cpu()
+            z_far = depth.max().detach().cpu()
+        else:
+            z_near, z_far = z_near_default, z_far_default
         # shrink far plane slightly (avoid wide skinny cones)
         z_far *= 0.9
 
