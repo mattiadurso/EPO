@@ -39,6 +39,8 @@ from PIL import Image
 from tqdm import tqdm
 from helpers.load import (
     find_images,
+    process_pose,
+    process_camera,
     load_and_preprocess_images,
     load_and_preprocess_depths,
 )
@@ -55,6 +57,7 @@ from helpers.reprojection_compiled import (
     unproject_2D_to_world,
     project_world_to_2D,
 )
+from helpers.reconstruction import build_reconstruction
 from helpers.frustum import build_view_graph_from_frustums
 from extractors.canny import CannyEdgeDetector
 from modules.camera import Camera
@@ -116,7 +119,8 @@ class Adjuster(nn.Module):
         seed=0,
         scheduler_name=None,
         scheduler_params={"factor": 0.75, "patience": 2, "min_lr": 1e-6},
-        matcher_type="exhaustive",  # or "sequential"
+        use_amp=True,
+        matcher_type="frustums",  # or "sequential"
         grad_q=True,
         grad_t=True,
         grad_k=True,
@@ -142,6 +146,7 @@ class Adjuster(nn.Module):
         self.reconstruction_path = reconstruction_path
         self.single_camera_per_folder = single_camera_per_folder
         self.convergence = False
+        self.use_amp = use_amp
         self.gt_path = gt_path
         self.viewgraph_path = viewgraph_path
         self.matcher_type = matcher_type
@@ -203,15 +208,15 @@ class Adjuster(nn.Module):
         self.P_cache, self.K_cache = None, None
         self._cache_projection_matrices()
 
+        # compute viewgraph
         self._compute_viewgraph(type=self.matcher_type)
-        # vg is a lsit of names of image pairs, sort by the first name
-        self.viewgraph.sort(key=lambda x: (x[0], x[1]))
         self.timings["compute_viewgraph"] = time.time() - s_time
 
         ## Load sky mask if any
-        s_time = time.time()
-        self._load_and_preprocess_sky_masks(sky_mask_path)
-        self.timings["load_sky_masks"] = time.time() - s_time
+        if sky_mask_path is not None:
+            s_time = time.time()
+            self._load_and_preprocess_sky_masks(sky_mask_path)
+            self.timings["load_sky_masks"] = time.time() - s_time
 
         ## Compute Distance Fields
         s_time = time.time()
@@ -226,7 +231,8 @@ class Adjuster(nn.Module):
         # Create optimizer with collected parameters
         self._load_optimizer(params_to_optimize)
         self._load_scheduler(scheduler_name, self.optimizer, scheduler_params)
-        self.scaler = torch.cuda.amp.GradScaler()
+        if self.use_amp:
+            self.scaler = torch.cuda.amp.GradScaler()
 
         self.timings["total_loading"] = time.time() - time_start
         self.timings["total_optimization"] = 0
@@ -257,10 +263,12 @@ class Adjuster(nn.Module):
         self,
         max_steps=1_000,
         type="batched",
-        gradient_tolerance=1e-5,
+        gradient_tolerance=5e-5,  # 1e-6 for more precise (probably final)
         quick_mode=False,  # "quick" (sample & backprop) or "full" (accumulate over all)
         batch_size=128,  # faster than 64 and 256
         loss_robustifier=True,
+        warm_up_steps=10,  # e.g., min steps. Initially might return loss=0 but then it works. btw it should not happen.
+        verbose=True,
     ):
         """
         Main optimization loop.
@@ -277,28 +285,46 @@ class Adjuster(nn.Module):
         time_start = time.time()
 
         if quick_mode:
-            print(
-                f"Quick mode ON. Randomly sampling viewgraph from {len(self.viewgraph):,} to {batch_size:,} pairs before every iteration"
+            (
+                print(
+                    f"Quick mode ON. Randomly sampling viewgraph from {len(self.viewgraph):,} to {batch_size:,} pairs before every iteration"
+                )
+                if verbose
+                else None
             )
         else:
             num_batches = math.ceil(len(self.viewgraph) / batch_size)
-            print(
-                f"Full accumulation mode ON. Processing {len(self.viewgraph):,}",
-                (
-                    f"pairs with batch size {batch_size:,} ({num_batches} batches per iteration)"
-                    if type == "batched"
-                    else ""
-                ),
-                # edges per image
-                f"Using {self.images[list(self.images.keys())[0]]['edges_padded'].numel()//2:,} edges per image",  # // due to x and y
+            (
+                print(
+                    f"Full accumulation mode ON. Processing {len(self.viewgraph):,}",
+                    (
+                        f"pairs with batch size {batch_size:,} ({num_batches} batches per iteration)"
+                        if type == "batched"
+                        else ""
+                    ),
+                    # edges per image
+                    f"Using {self.images[list(self.images.keys())[0]]['edges_padded'].numel()//2:,} edges per image",  # // due to x and y
+                )
+                if verbose
+                else None
             )
 
         max_steps = max_steps if max_steps > 0 else 1_000
         total_points = self.max_edges * (
             batch_size if quick_mode else len(self.viewgraph)
         )
-        print(f"Total points to process per iteration: {total_points:,}")
-        bar = tqdm(range(max_steps), desc="Adjusting poses and intrinsics")
+        (
+            print(
+                f"Total points to process per iteration: {total_points:,}. Min learning rate: {self.scheduler_params.get('min_lr',1e-4):.2e}"
+            )
+            if verbose
+            else None
+        )
+        bar = (
+            tqdm(range(max_steps), desc="Adjusting poses and intrinsics")
+            if verbose
+            else range(max_steps)
+        )
 
         for step in bar:
             # Initialize optimizer gradients
@@ -342,180 +368,38 @@ class Adjuster(nn.Module):
             # DEBUG: Evaluate AUC if GT available
             if self.gt_path is not None and step % 5 == 0:
                 opt = "/home/mattia/Desktop/Repos/batchsfm/optimized_reconstruction"
-                self.build_reconstruction(opt, save_points=False, verbose=False)
+                self.to_colmap(opt, save_points=False, verbose=False)
                 AUC_score_max, num_images, df_optim = eval_colmap_model(
                     opt, self.gt_path, return_df=False, thrs=[1, 3, 5]
                 )
                 self.auc_list.append(AUC_score_max)
 
-            # stopping criteria: stop if relative change is below tolerance
-            if step > 0:
-                rel_change = abs(self.loss_list[-2] - self.loss_list[-1]) / abs(
-                    self.loss_list[-2]
-                )
-                if rel_change < gradient_tolerance:
-                    print(
-                        f"Converged at step {step} with relative loss ",
-                        f"change {rel_change:.3e} < {gradient_tolerance}",
-                    )
-                    if step > self.scheduler_params.get("patience", 2):
-                        self.convergence = True
-                        break
+            current_lr = self.optimizer.param_groups[0]["lr"]
 
-            bar.set_postfix(
-                loss=f"{self.loss_list[-1]:.4f}",
-                auc5=(
-                    f"{self.auc_list[-1][-1]:.4f}" if self.gt_path is not None else -1
-                ),
-                rel_change=f"{rel_change:.3e}" if step > 0 else -1,
-            )
+            if verbose:
+                bar.set_postfix(
+                    loss=f"{self.loss_list[-1]:.4f}",
+                    auc5=(
+                        f"{self.auc_list[-1][-1]:.4f}"
+                        if self.gt_path is not None
+                        else 0
+                    ),
+                    lr=f"{current_lr:.2e}",
+                )
+
+            # Stopping criterion: stop when lr stops decreasing
+            if current_lr <= self.scheduler_params.get("min_lr", 1e-4):
+                print(
+                    f"Learning rate reached minimum threshold {current_lr:.2e}"
+                    + f" <= {self.scheduler_params.get('min_lr', 1e-4):.2e}. "
+                    + "Stopping optimization."
+                )
+                break
 
         self.timings["total_optimization"] += time.time() - time_start
-        self.print_summary()
+        self.print_summary() if verbose else None
 
-    def print_summary(self, w=None):
-        # Column widths
-        key_width = 30
-        val_width = 10
-        perc_width = 8
-        avg_width = 12
-
-        # Total line width
-        if w is None:
-            w = key_width + val_width + perc_width + avg_width + 6
-
-        print("\n" + "=" * w)
-        print(f"{'Summary':^{w}}")
-        print("-" * w)
-
-        # Compute total
-        self.timings["total"] = self.timings.get("total_loading", 0) + self.timings.get(
-            "total_optimization", 0
-        )
-
-        # Header row
-        print(
-            f"{'Stage':<{key_width}}"
-            f"{'Time (s)':>{val_width}}"
-            f"{'%':>{perc_width+2}}"
-            f"{'Per Iter':>{avg_width}}"
-        )
-        print("-" * w)
-
-        num_iters = len(getattr(self, "loss_list", []))
-        per_iter_keys = {
-            "prepare_batched_inputs",
-            "batched_reprojection_and_loss",
-            "gradient_computation",
-            "parameter_update",
-            "batched_loss_computation",
-            "batched_reprojection",
-        }
-
-        for key, value in self.timings.items():
-            if (key in ["total", "total_loading"]) or (
-                key == "total_optimization" and value == 0
-            ):
-                continue
-
-            if key in per_iter_keys and num_iters > 0:
-                # Show only per-iteration column
-                value_avg = value / num_iters
-                row_str = (
-                    f"{key:<{key_width}}"
-                    f"{'':>{val_width}}"  # Time blank
-                    f"{'':>{perc_width+3}}"  # % blank
-                    f"{value_avg:>{avg_width}.4f}"
-                )
-            else:
-                # Show total time and percentage
-                perc = (
-                    (value / self.timings["total"]) * 100
-                    if self.timings["total"] > 0
-                    else 0
-                )
-                row_str = (
-                    f"{key:<{key_width}}"
-                    f"{value:>{val_width}.2f}"
-                    f"{perc:>{perc_width}.1f}%"
-                    f"{'':>{avg_width}}"
-                )
-
-            print(row_str)
-
-        print("-" * w)
-        print(
-            f"{'Total':<{key_width}}"
-            f"{self.timings['total']:>{val_width}.2f}"
-            f"{'':>{perc_width + avg_width + 3}}"
-        )
-
-        # Loss summary
-        if len(self.loss_list) > 0:
-            initial_loss = self.loss_list[0]
-            final_loss = self.loss_list[-1]
-            delta = initial_loss - final_loss
-
-            print("-" * w)
-            print(f"{'Initial loss:':<{key_width}}{initial_loss:>{val_width}.6f}")
-            print(f"{'Final loss:':<{key_width}}{final_loss:>{val_width}.6f}")
-            print(f"{'Loss reduction:':<{key_width}}{delta:>{val_width}.6f}")
-            steps = len(self.loss_list)
-            conv = " (converged)" if getattr(self, "convergence", False) else ""
-            print(f"{f'Total steps{conv}:':<{key_width}}{steps:>{val_width}d}")
-
-        print("=" * w)
-
-    def fix_seed(self):
-        torch.manual_seed(self.seed)
-        torch.cuda.manual_seed_all(self.seed)
-        np.random.seed(self.seed)
-
-    def process_camera(self, camera, load_with_pad=False):
-        # Convert a single pycolmap.Camera to torch tensor
-        cam_id = camera.camera_id
-        model = camera.model.name
-        params = camera.params
-        width = camera.width
-        height = camera.height
-
-        if model == "SIMPLE_PINHOLE":  # or model == "SIMPLE_RADIAL":
-            f = params[0]
-            cx, cy = params[1], params[2]
-
-        elif model == "PINHOLE":  # or model == "RADIAL":
-            f = torch.tensor([params[0], params[1]], dtype=torch.float32)
-            cx, cy = params[2], params[3]
-
-        else:
-            raise NotImplementedError(f"Camera model {model} not supported.")
-
-        # Account for padding when making square
-        max_dim = max(width, height)
-        pad_x = (max_dim - width) // 2 if load_with_pad else 0
-        pad_y = (max_dim - height) // 2 if load_with_pad else 0
-
-        # Scale factor after resize
-        scale = self.images_size / max_dim
-
-        # Apply padding shift + scale
-        f = f * scale
-        cx = (cx + pad_x) * scale
-        cy = (cy + pad_y) * scale
-
-        params = torch.cat([f, torch.tensor([cx, cy], dtype=torch.float32)], dim=0)
-        return cam_id, model, params
-
-    def process_pose(self, image):
-        # Convert a single pycolmap.Image to torch tensor
-        # COLMAP's cam_from_world is already R_cw (world-to-camera rotation)
-        R = torch.tensor(image.cam_from_world.rotation.matrix(), dtype=torch.float32)
-        t = torch.tensor(
-            image.cam_from_world.translation, dtype=torch.float32
-        ).unsqueeze(1)
-
-        return R, t, image.camera_id
-
+    ### Forward and backward helpers ###
     def read_cameras_from_reconstruction(
         self,
         reconstruction,
@@ -530,7 +414,9 @@ class Adjuster(nn.Module):
         if single_camera_per_folder:
             # Reading cameras from images (to handle multiple images with same camera)
             for image in reconstruction.images.values():
-                _, model, new_params = self.process_camera(image.camera, load_with_pad)
+                _, model, new_params = process_camera(
+                    image.camera, load_with_pad, images_size=self.images_size
+                )
                 cam_id = image.name.split("/")[
                     0
                 ]  # assuming image names are like "cam_id/image_name"
@@ -577,7 +463,7 @@ class Adjuster(nn.Module):
 
         # Read poses from images
         for image in reconstruction.images.values():
-            R, t, cam_id = self.process_pose(image)
+            R, t, cam_id = process_pose(image)
             pose = Pose(R=R, t=t, grad_q=self.grad_q, device=self.device)
 
             if single_camera_per_folder:
@@ -589,12 +475,64 @@ class Adjuster(nn.Module):
 
         return images, intrinsics
 
+    def _unproject_edges_to_3D(self, batch_size=None):
+        """Unproject 2D edges to 3D points for all images as a batch."""
+        # Collect data
+        image_names = list(self.images.keys())
+        B = len(image_names)
+        edges_list, depth_list, K_list, P_list = [], [], [], []
+
+        for name in image_names:
+            data = self.images[name]
+            edges_2D = data["edges_padded"]  # (N, 2)
+            depth_map = data["sampled_depth"]()  # (1, H, W)
+            K = self.K_cache[data["cam_id"]]  # (3, 3)
+            P = self.P_cache[name]  # (4, 4)
+
+            edges_list.append(edges_2D)
+            depth_list.append(depth_map)
+            K_list.append(K)
+            P_list.append(P)
+
+        # Stack as batch
+        # edges_2D may have varying N — pad or bucket if needed
+        edges_batch = torch.stack(edges_list, dim=0).to(self.device)  # (B, N, 2)
+        depth_batch = torch.stack(depth_list, dim=0).to(self.device)  # (B, 1, H, W)
+        K_batch = torch.stack(K_list, dim=0).to(self.device)  # (B, 3, 3)
+        P_batch = torch.stack(P_list, dim=0).to(self.device)  # (B, 4, 4)
+
+        # Optionally chunk if batch too large for memory
+        if batch_size is None:
+            batch_size = B
+        points_3D_list = []
+
+        for i in range(0, B, batch_size):
+            xy0 = edges_batch[i : i + batch_size]
+            K0 = K_batch[i : i + batch_size]
+            depth0 = depth_batch[i : i + batch_size]
+            P0 = P_batch[i : i + batch_size]
+
+            pts3d = unproject_2D_to_world(
+                xy0=xy0, K0=K0, depth0=depth0, P0=P0
+            )  # (bs, N, 3)
+            points_3D_list.append(pts3d)
+
+        points_3D = torch.cat(points_3D_list, dim=0)  # (B, N, 3)
+
+        # Write back (differentiable tensors)
+        for name, pts3d in zip(image_names, points_3D):
+            self.images[name]["edges_3D"] = pts3d
+
     def compute_sequential_step(self, sampled_viewgraph):
         """Compute one optimization step over the sampled viewgraph sequentially and return the loss."""
 
         residuals_list = []
         # Use autocast (not really helping)
-        with torch.amp.autocast(device_type=self.device, dtype=torch.float16):
+        with torch.amp.autocast(
+            device_type=self.device,
+            dtype=torch.bfloat16,
+            enabled=self.use_amp,
+        ):
             for pair in sampled_viewgraph:
                 i, j = pair
                 image_i = self.images[i]
@@ -652,323 +590,6 @@ class Adjuster(nn.Module):
 
         residuals = torch.stack(residuals_list)  # (num_pairs,)
         return residuals
-
-    @torch.no_grad()
-    def _dbscan_filter(self, reconstruction, eps=0.5, min_samples=20):
-        """
-        Filter 3D points in reconstruction using DBSCAN clustering.
-        Keeps only the largest cluster to remove outliers.
-
-        Args:
-            reconstruction: pycolmap.Reconstruction object
-            eps: Maximum distance between two samples for DBSCAN
-            min_samples: Minimum number of samples in a neighborhood for DBSCAN
-
-        Returns:
-            pycolmap.Reconstruction: Filtered reconstruction
-        """
-        import numpy as np
-        from sklearn.cluster import DBSCAN
-
-        if len(reconstruction.points3D) == 0:
-            return reconstruction
-
-        # Extract 3D point coordinates
-        point_ids = list(reconstruction.point3D_ids())
-        xyz = np.array([reconstruction.point3D(p_id).xyz for p_id in point_ids])
-
-        # Run DBSCAN with fallback for memory errors
-        labels = None
-        n_jobs = 4
-        while n_jobs >= 1 and labels is None:
-            try:
-                clustering = DBSCAN(
-                    eps=eps, min_samples=min_samples, n_jobs=n_jobs
-                ).fit(xyz)
-                labels = clustering.labels_
-            except MemoryError:
-                n_jobs //= 2
-            except Exception as e:
-                print(f"DBSCAN failed: {e}")
-                return reconstruction
-
-        # Find largest cluster
-        unique_labels, counts = np.unique(labels, return_counts=True)
-        non_noise_indices = np.where(unique_labels != -1)
-
-        if len(counts[non_noise_indices]) == 0:
-            print("Warning: DBSCAN found no clusters. Skipping filtering.")
-            return reconstruction
-
-        main_cluster_label = unique_labels[non_noise_indices][
-            np.argmax(counts[non_noise_indices])
-        ]
-
-        # Get indices of points in main cluster
-        cluster_indices = np.where(labels == main_cluster_label)[0]
-        ids_to_keep = set([point_ids[i] for i in cluster_indices])
-
-        print(
-            f"DBSCAN: Keeping largest cluster with {len(ids_to_keep):,} / {len(point_ids):,} points"
-        )
-
-        # Create new reconstruction with only kept points
-        filtered_reconstruction = pycolmap.Reconstruction()
-
-        # Copy cameras
-        for camera_id in reconstruction.cameras.keys():
-            filtered_reconstruction.add_camera(reconstruction.cameras[camera_id])
-
-        # Recreate images with new camera references
-        for image_id in reconstruction.images.keys():
-            old_image = reconstruction.images[image_id]
-            new_image = pycolmap.Image(
-                id=old_image.image_id,
-                name=old_image.name,
-                camera_id=old_image.camera_id,
-                cam_from_world=old_image.cam_from_world,
-            )
-            filtered_reconstruction.add_image(new_image)
-
-        # Copy only kept points with fresh empty tracks
-        for p_id in ids_to_keep:
-            point3d = reconstruction.point3D(p_id)
-            # Create empty track instead of copying old one
-            empty_track = pycolmap.Track()
-            filtered_reconstruction.add_point3D(point3d.xyz, empty_track, point3d.color)
-
-        return filtered_reconstruction
-
-    @torch.no_grad()
-    def build_reconstruction(
-        self,
-        output_path="optimized_reconstruction",
-        save_points=True,
-        verbose=False,
-        max_points_per_image=100_000,
-        final_dbscan_filtering=False,
-        dbscan_eps=0.05,
-        dbscan_min_samples=5,
-    ):
-        """
-        Create a pycolmap.Reconstruction from images and intrinsics dictionaries.
-
-        Args:
-            output_path: path to save the reconstruction
-            save_points: whether to save 3D points from depth unprojection
-            max_points_per_image: maximum number of 3D points per image (default: 100_000)
-            dbscan_eps: epsilon for DBSCAN clustering
-            dbscan_min_samples: min samples for DBSCAN clustering
-        """
-        # Create empty reconstruction
-        reconstruction = pycolmap.Reconstruction()
-
-        # 1. Add cameras - we need to handle different scales per image
-        # Group images by camera to find the appropriate scale
-        camera_scales = {}
-        for image_name, image_data in self.images.items():
-            cam_id = image_data["cam_id"]
-            scale = image_data.get("scale", 1.0)
-
-            if cam_id not in camera_scales:
-                camera_scales[cam_id] = []
-            camera_scales[cam_id].append(scale)
-
-        # Use median scale for each camera
-        for cam_id in camera_scales:
-            camera_scales[cam_id] = np.median(camera_scales[cam_id])
-
-        for cam_id, camera in self.intrinsics.items():
-            # Get camera parameters as numpy array
-            params = camera.params.detach().cpu().numpy()
-
-            # Get scale for this camera
-            scale = camera_scales.get(cam_id, 1.0)
-
-            # Apply inverse scaling to focal lengths (scale back to original)
-            if camera.model == "PINHOLE":
-                params = params.copy()
-                params[0] /= scale  # fx
-                params[1] /= scale  # fy
-                params[2] /= scale  # cx
-                params[3] /= scale  # cy
-                model = pycolmap.CameraModelId.PINHOLE
-            elif camera.model == "SIMPLE_PINHOLE":
-                params = params.copy()
-                params[0] /= scale  # f
-                params[1] /= scale  # cx
-                params[2] /= scale  # cy
-                model = pycolmap.CameraModelId.SIMPLE_PINHOLE
-            else:
-                raise ValueError(f"Unsupported camera model: {camera.model}")
-
-            # Get image dimensions from first image with this cam_id
-            sample_image = next(
-                (img for img in self.images.values() if img["cam_id"] == cam_id), None
-            )
-
-            if sample_image is None:
-                print(f"Warning: No images found for camera {cam_id}, skipping...")
-                continue
-
-            height, width = sample_image["hw"]
-
-            # Scale image dimensions back to original
-            width = int(width / scale)
-            height = int(height / scale)
-
-            # Convert cam_id to int for COLMAP
-            cam_id_int = int(cam_id) if isinstance(cam_id, str) else cam_id
-
-            # Create and register camera
-            cam = pycolmap.Camera(
-                model=model,
-                width=width,
-                height=height,
-                params=params,
-                camera_id=cam_id_int,
-            )
-            reconstruction.add_camera(cam)
-
-        # 2. Add images (poses)
-        for image_id, (image_name, image_data) in enumerate(
-            self.images.items(), start=1
-        ):
-            pose = image_data["P"]
-            cam_id = image_data["cam_id"]
-            scale = image_data.get("scale", 1.0)
-
-            # Convert cam_id to int for COLMAP
-            cam_id_int = int(cam_id) if isinstance(cam_id, str) else cam_id
-
-            # Get rotation matrix and translation
-            q = pose.q.detach().cpu().numpy()
-            t = pose.t.detach().cpu().numpy().squeeze()
-
-            # Apply inverse scaling to translation (scale back to original)
-            t = t / scale
-
-            # Create image
-            img = pycolmap.Image(
-                id=image_id,
-                name=image_name,
-                camera_id=cam_id_int,
-                cam_from_world=pycolmap.Rigid3d(
-                    rotation=pycolmap.Rotation3d(q), translation=t
-                ),
-            )
-            reconstruction.add_image(img)
-
-        # 3. Add Points3D from depth unprojection using fresh computation
-        if save_points:
-            if verbose:
-                print("Unprojecting depth maps to 3D points...")
-
-            # Compute fresh 3D world coordinates
-            self._unproject_edges_to_3D()
-
-            total_points = 0
-
-            for image_id, (image_name, image_data) in enumerate(
-                self.images.items(), start=1
-            ):
-                cam_id = image_data["cam_id"]
-                scale = image_data.get("scale", 1.0)
-
-                # Get unprojected 3D points in world coordinates (at scaled resolution)
-                edges_3D = image_data.get("edges_3D", None)  # (N, 3)
-                pad_mask = image_data.get("pad_mask", None)  # (N,)
-
-                if edges_3D is None or pad_mask is None:
-                    if verbose:
-                        print(f"No edges_3D or pad_mask for {image_name}, skipping...")
-                    continue
-
-                # Convert to numpy
-                edges_3D_np = edges_3D.detach().cpu().numpy()  # (N, 3)
-                pad_mask_np = pad_mask.detach().cpu().numpy()  # (N,)
-
-                # Filter by pad mask (only valid edges, ignore padded entries)
-                valid_mask = pad_mask_np > 0
-                valid_3D = edges_3D_np[valid_mask]  # (M, 3)
-                valid_indices = np.where(valid_mask)[0]
-
-                if len(valid_3D) == 0:
-                    if verbose:
-                        print(f"No valid edges for {image_name}")
-                    continue
-
-                # Scale points back to original resolution
-                # points_3D is in downsampled world space, multiply by scale to expand to original
-                valid_3D = valid_3D / scale
-
-                # Sample uniformly up to max_points_per_image
-                num_valid = len(valid_3D)
-                if num_valid > max_points_per_image:
-                    sample_idx = np.random.choice(
-                        num_valid, size=max_points_per_image, replace=False
-                    )
-                    valid_3D = valid_3D[sample_idx]
-                    valid_indices = valid_indices[sample_idx]
-
-                # Get RGB values from original image
-                if "image" in image_data:
-                    image = image_data["image"].detach().cpu().numpy()  # (3, H, W)
-                    edges_padded = (
-                        image_data["edges_padded"].detach().cpu().numpy()
-                    )  # (N, 2)
-
-                    # Get coordinates of valid edges
-                    valid_edges = edges_padded[valid_indices]
-                    y_coords_int = valid_edges[:, 1].astype(np.int32)
-                    x_coords_int = valid_edges[:, 0].astype(np.int32)
-
-                    # Clamp to valid range (at scaled resolution)
-                    y_coords_int = np.clip(y_coords_int, 0, image.shape[1] - 1)
-                    x_coords_int = np.clip(x_coords_int, 0, image.shape[2] - 1)
-
-                    rgb = image[:, y_coords_int, x_coords_int]  # (3, M)
-                    rgb = (rgb * 255).astype(np.uint8).T  # (M, 3)
-                else:
-                    # Default to black if no image available
-                    rgb = np.full((len(valid_3D), 3), 0, dtype=np.uint8)
-
-                # Add points to reconstruction
-                for pt_world, rgb_val in zip(valid_3D, rgb):
-                    point3D_id = reconstruction.add_point3D(
-                        pt_world, pycolmap.Track(), rgb_val
-                    )
-                    track = reconstruction.point3D(point3D_id).track
-                    track.add_element(image_id, int(0))  # dummy keypoint index
-
-                total_points += len(valid_3D)
-                if verbose:
-                    print(f"Added {len(valid_3D)} points from {image_name}")
-
-            if verbose:
-                print(f"Total points added: {total_points:,}")
-
-        # 4. DBSCAN filtering
-        if save_points and final_dbscan_filtering:
-            if verbose:
-                print("Running DBSCAN filtering...")
-            reconstruction = self._dbscan_filter(
-                reconstruction, eps=dbscan_eps, min_samples=dbscan_min_samples
-            )
-
-        # 5. Save reconstruction
-        if verbose:
-            print(f"Cameras: {len(reconstruction.cameras)}")
-            print(f"Images: {len(reconstruction.images)}")
-            print(f"Points3D: {len(reconstruction.points3D):,}")
-
-        if output_path is not None:
-            os.makedirs(output_path, exist_ok=True)
-            reconstruction.write_text(output_path)
-            if verbose:
-                print(f"Reconstruction saved to: {output_path}")
-
-        return reconstruction
 
     def _create_batched_inputs(self, sampled_viewgraph):
         """Prepare batched inputs for the batched optimization step given a list of pairs from the viewgraph."""
@@ -1042,7 +663,11 @@ class Adjuster(nn.Module):
             # actual inference - keep NaN values
             s_time = time.time()
             # amp not really helping
-            with torch.amp.autocast(device_type=self.device, dtype=torch.float16):
+            with torch.amp.autocast(
+                device_type=self.device,
+                dtype=torch.bfloat16,
+                enabled=self.use_amp,
+            ):
                 s_time = time.time()
                 edges_reprojected = project_world_to_2D(**batch)  # (B, N, 2)
                 self.timings["batched_reprojection"] += time.time() - s_time
@@ -1092,8 +717,8 @@ class Adjuster(nn.Module):
         if residuals.numel() == 0:
             return torch.tensor(0.0, device=self.device)
 
-        # Ensure even number of residuals (forward/backward pairs)
-        assert residuals.shape[0] % 2 == 0, "Residual batch size must be even (pairs)."
+        ## Ensure even number of residuals (forward/backward pairs)
+        # assert residuals.shape[0] % 2 == 0, "Residual batch size must be even (pairs)."
 
         # Group pairs: reshape (num_pairs*2,) -> (num_pairs, 2)
         residuals_pairs = residuals.view(-1, 2)  # (num_pairs, 2)
@@ -1115,6 +740,7 @@ class Adjuster(nn.Module):
         self.timings["batched_loss_computation"] += time.time() - s_time
         return loss
 
+    ### Helper functions for loading and preprocessing data ###
     def _cache_projection_matrices(self):
         """Cache all P and K matrices to avoid recomputation"""
         self.P_cache = {}
@@ -1124,15 +750,6 @@ class Adjuster(nn.Module):
         self.K_cache = {}
         for cam_id, camera in self.intrinsics.items():
             self.K_cache[cam_id] = camera.intrinsic_matrix()
-
-    def _cache_pad_and_dt_fields(self):
-        """Cache all pad masks and distance fields for faster access"""
-        self.pad_masks_cache = {}
-        self.dt_fields_cache = {}
-
-        for image_name, image_data in self.images.items():
-            self.pad_masks_cache[image_name] = image_data["pad_mask"]
-            self.dt_fields_cache[image_name] = image_data["dt_field"]
 
     def _load_and_preprocess_images(self):
         self.images = load_and_preprocess_images(
@@ -1192,7 +809,7 @@ class Adjuster(nn.Module):
             )
 
     def _load_and_preprocess_sky_masks(self, path):
-        """Load and preprocess sky masks from the given path."""
+        """Load and preprocess sky masks from the given path."""  # Not sure if working properly
         if path is None:
             return
 
@@ -1204,7 +821,9 @@ class Adjuster(nn.Module):
         sky_masks_dict = {}
         for mask_path in masks_path:
             mask = Image.open(mask_path).convert("L")
-            rel_image_name = os.path.relpath(mask_path, path).replace(".png", ".jpg")
+            rel_image_name = os.path.relpath(mask_path, path).replace(
+                "_mask.png", ".jpg"
+            )
             h, w = self.images[rel_image_name]["hw"]
 
             mask_tensor = (
@@ -1286,6 +905,68 @@ class Adjuster(nn.Module):
         #         n_valid_edges == n_pad_mask
         #     ), f"Mismatch for {image_name}: edges={n_valid_edges}, pad_mask={n_pad_mask}"
 
+    @torch.no_grad()
+    def _compute_viewgraph(self, type="frustums", window_size=10):
+        """Compute viewgraph and filter by reprojection error."""
+        if type == "frustums":
+            # Estimate view graph from frustums
+            viewgraph = build_view_graph_from_frustums(
+                self.recon,
+                z_near_default=0.1,
+                z_far_default=5.0,
+                max_view_angle_deg=30.0,
+                distance_factor=2,
+                verbose=False,
+                images_with_depth=self.images,
+            )
+
+        elif type == "sequential":
+            # Build sequential viewgraph based on sorted image names with a window size of 10
+            image_names = sorted(list(self.images.keys()))
+            viewgraph = []
+            for i in range(len(image_names) - window_size):
+                for j in range(1, window_size + 1):
+                    viewgraph.append((image_names[i], image_names[i + j]))
+
+        elif type == "exhaustive":
+            # Build exhaustive viewgraph (all pairs)
+            image_names = sorted(list(self.images.keys()))
+            viewgraph = []
+            for i in range(len(image_names)):
+                for j in range(i + 1, len(image_names)):
+                    viewgraph.append((image_names[i], image_names[j]))
+        else:
+            raise ValueError(f"Viewgraph type {type} not supported.")
+
+        # Filter viewgraph by reprojection | This need to be runned as batch and speeded up
+        viewgraph = filter_viewgraph_by_reprojection(
+            viewgraph,
+            self.images,
+            self.intrinsics,
+            th=0.025,  # not used cause min_points is set
+            min_points=100,  # tune this eventually
+            sampling_factor=10,
+            reprojection_error=3.0,
+            P_cache=self.P_cache,
+            K_cache=self.K_cache,
+            use_amp=self.use_amp,
+        )
+        self.viewgraph = viewgraph
+        self.viewgraph.sort(key=lambda x: (x[0], x[1]))
+
+    def _load_viewgraph(self):
+        """Load viewgraph from a text file formamted as [(img_i, img_j), ...]."""
+        with open(self.viewgraph_path, "r") as f:
+            lines = f.readlines()
+        self.viewgraph = []
+        for line in lines:
+            i, j, _ = line.strip().split()
+            self.viewgraph.append((i, j))
+        print(
+            f"Loaded GT viewgraph with {len(self.viewgraph):,} edges from {viewgraph_path}"
+        )
+
+    ### Edges
     def _extract_edges(self):
         for image_name in tqdm(self.images.keys(), desc=f"Extracting edges"):
             img_tensor = self.images[image_name]["image"].unsqueeze(0).to(self.device)
@@ -1327,7 +1008,17 @@ class Adjuster(nn.Module):
             )
 
         self.max_edges = max_edges
-        print(f"max edges per image: {self.max_edges:,}")
+        print(f"Max edges per image: {self.max_edges:,}")
+
+    ## Loss
+    def _cache_pad_and_dt_fields(self):
+        """Cache all pad masks and distance fields for faster access"""
+        self.pad_masks_cache = {}
+        self.dt_fields_cache = {}
+
+        for image_name, image_data in self.images.items():
+            self.pad_masks_cache[image_name] = image_data["pad_mask"]
+            self.dt_fields_cache[image_name] = image_data["dt_field"]
 
     @torch.no_grad()
     def _compute_distance_fields(self):
@@ -1360,54 +1051,7 @@ class Adjuster(nn.Module):
         gc.collect()
         torch.cuda.empty_cache()
 
-    @torch.no_grad()
-    def _compute_viewgraph(self, type="exhaustive", window_size=10):
-        """Compute viewgraph and filter by reprojection error."""
-        if type == "exhaustive":
-            # Estimate view graph from frustums
-            viewgraph = build_view_graph_from_frustums(
-                self.recon,
-                z_near_default=0.1,
-                z_far_default=5.0,
-                max_view_angle_deg=30.0,
-                distance_factor=2,
-                verbose=False,
-                images_with_depth=self.images,
-            )
-
-        elif type == "sequential":
-            # Build sequential viewgraph based on sorted image names with window size 10
-            image_names = sorted(list(self.images.keys()))
-            viewgraph = []
-            for i in range(len(image_names) - window_size):
-                for j in range(1, window_size + 1):
-                    viewgraph.append((image_names[i], image_names[i + j]))
-
-        # Filter viewgraph by reprojection | This need to be runned as batch and speeded up
-        viewgraph = filter_viewgraph_by_reprojection(
-            viewgraph,
-            self.images,
-            self.intrinsics,
-            th=0.025,  # roughly 25% of overlap
-            sampling_factor=10,
-            reprojection_error=3.0,
-            P_cache=self.P_cache,
-            K_cache=self.K_cache,
-        )
-        self.viewgraph = viewgraph
-
-    def _load_viewgraph(self):
-        """Load viewgraph from a text file formamted as [(img_i, img_j), ...]."""
-        with open(self.viewgraph_path, "r") as f:
-            lines = f.readlines()
-        self.viewgraph = []
-        for line in lines:
-            i, j, _ = line.strip().split()
-            self.viewgraph.append((i, j))
-        print(
-            f"Loaded GT viewgraph with {len(self.viewgraph):,} edges from {viewgraph_path}"
-        )
-
+    ## Optimizer and scheduler
     def _collect_parameters_to_optimize(self):
         params_to_optimize = {}
 
@@ -1522,53 +1166,174 @@ class Adjuster(nn.Module):
             else:
                 self.scheduler.step()
 
-    def _unproject_edges_to_3D(self, batch_size=None):
-        """Unproject 2D edges to 3D points for all images as a batch."""
-        # Collect data
-        image_names = list(self.images.keys())
-        B = len(image_names)
-        edges_list, depth_list, K_list, P_list = [], [], [], []
+    def _scaler_and_scheduler_steps(self, loss, clip_gradients=False):
+        # scaler step
+        if hasattr(self, "scaler") and self.scaler is not None:
+            # gradients computation
+            s_time = time.time()
+            self.scaler.scale(loss).backward()
+            self.timings["gradient_computation"] += time.time() - s_time
 
-        for name in image_names:
-            data = self.images[name]
-            edges_2D = data["edges_padded"]  # (N, 2)
-            depth_map = data["sampled_depth"]()  # (1, H, W)
-            K = self.K_cache[data["cam_id"]]  # (3, 3)
-            P = self.P_cache[name]  # (4, 4)
+            if clip_gradients:
+                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
 
-            edges_list.append(edges_2D)
-            depth_list.append(depth_map)
-            K_list.append(K)
-            P_list.append(P)
+            # parameter update
+            s_time = time.time()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.timings["parameter_update"] += time.time() - s_time
+        else:
+            # Gradients computation
+            s_time = time.time()
+            loss.backward()
+            self.timings["gradient_computation"] += time.time() - s_time
 
-        # Stack as batch
-        # edges_2D may have varying N — pad or bucket if needed
-        edges_batch = torch.stack(edges_list, dim=0).to(self.device)  # (B, N, 2)
-        depth_batch = torch.stack(depth_list, dim=0).to(self.device)  # (B, 1, H, W)
-        K_batch = torch.stack(K_list, dim=0).to(self.device)  # (B, 3, 3)
-        P_batch = torch.stack(P_list, dim=0).to(self.device)  # (B, 4, 4)
+            if clip_gradients:
+                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
 
-        # Optionally chunk if batch too large for memory
-        if batch_size is None:
-            batch_size = B
-        points_3D_list = []
+            # Parameter update
+            s_time = time.time()
+            self.optimizer.step()
+            self.timings["parameter_update"] += time.time() - s_time
 
-        for i in range(0, B, batch_size):
-            xy0 = edges_batch[i : i + batch_size]
-            K0 = K_batch[i : i + batch_size]
-            depth0 = depth_batch[i : i + batch_size]
-            P0 = P_batch[i : i + batch_size]
+        # scheduler step
+        if self.scheduler is not None:
+            if self.scheduler.__class__.__name__ == "ReduceLROnPlateau":
+                self.scheduler.step(loss)
+            else:
+                self.scheduler.step()
 
-            pts3d = unproject_2D_to_world(
-                xy0=xy0, K0=K0, depth0=depth0, P0=P0
-            )  # (bs, N, 3)
-            points_3D_list.append(pts3d)
+    ### Reconstruction
+    def to_colmap(
+        self,
+        output_path="optimized_reconstruction_GD",
+        save_points=True,
+        verbose=False,
+        max_points_per_image=100_000,
+        final_dbscan_filtering=False,
+        dbscan_eps=0.05,
+        dbscan_min_samples=5,
+    ):
+        recon = build_reconstruction(
+            self,
+            output_path=output_path,
+            save_points=save_points,
+            verbose=verbose,
+            max_points_per_image=max_points_per_image,
+            final_dbscan_filtering=final_dbscan_filtering,
+            dbscan_eps=dbscan_eps,
+            dbscan_min_samples=dbscan_min_samples,
+        )
 
-        points_3D = torch.cat(points_3D_list, dim=0)  # (B, N, 3)
+        return recon
 
-        # Write back (differentiable tensors)
-        for name, pts3d in zip(image_names, points_3D):
-            self.images[name]["edges_3D"] = pts3d
+    ### Misc
+    def print_summary(self, w=None):
+        # Column widths
+        key_width = 30
+        val_width = 10
+        perc_width = 8
+        avg_width = 12
+
+        # Total line width
+        if w is None:
+            w = key_width + val_width + perc_width + avg_width + 6
+
+        print("\n" + "=" * w)
+        print(f"{'Summary':^{w}}")
+        print("-" * w)
+
+        # Compute total
+        self.timings["total"] = self.timings.get("total_loading", 0) + self.timings.get(
+            "total_optimization", 0
+        )
+
+        # Header row
+        print(
+            f"{'Stage':<{key_width}}"
+            f"{'Time (s)':>{val_width}}"
+            f"{'%':>{perc_width+2}}"
+            f"{'Per Iter':>{avg_width}}"
+        )
+        print("-" * w)
+
+        num_iters = len(getattr(self, "loss_list", []))
+        per_iter_keys = {
+            "prepare_batched_inputs",
+            "batched_reprojection_and_loss",
+            "gradient_computation",
+            "parameter_update",
+            "batched_loss_computation",
+            "batched_reprojection",
+        }
+
+        for key, value in self.timings.items():
+            if (key in ["total", "total_loading"]) or (
+                key == "total_optimization" and value == 0
+            ):
+                continue
+
+            if key in per_iter_keys and num_iters > 0:
+                # Show only per-iteration column
+                value_avg = value / num_iters
+                row_str = (
+                    f"{key:<{key_width}}"
+                    f"{'':>{val_width}}"  # Time blank
+                    f"{'':>{perc_width+3}}"  # % blank
+                    f"{value_avg:>{avg_width}.4f}"
+                )
+            else:
+                # Show total time and percentage
+                perc = (
+                    (value / self.timings["total"]) * 100
+                    if self.timings["total"] > 0
+                    else 0
+                )
+                row_str = (
+                    f"{key:<{key_width}}"
+                    f"{value:>{val_width}.2f}"
+                    f"{perc:>{perc_width}.1f}%"
+                    f"{'':>{avg_width}}"
+                )
+
+            print(row_str)
+
+        print("-" * w)
+        print(
+            f"{'Total':<{key_width}}"
+            f"{self.timings['total']:>{val_width}.2f}"
+            f"{'':>{perc_width + avg_width + 3}}"
+        )
+
+        # Loss summary
+        if len(self.loss_list) > 0:
+            initial_loss = self.loss_list[0]
+            final_loss = self.loss_list[-1]
+            delta = initial_loss - final_loss
+
+            print("-" * w)
+            print(f"{'Initial loss:':<{key_width}}{initial_loss:>{val_width}.6f}")
+            print(f"{'Final loss:':<{key_width}}{final_loss:>{val_width}.6f}")
+            # loss and percentage with sign under % column on same row
+            perc_improvement = (
+                (delta / initial_loss) * 100 if initial_loss != 0 else 0.0
+            )
+            sign = "-" if perc_improvement > 0 else "+"
+            perc_improvement = sign + f"{abs(perc_improvement):.1f}"
+            print(
+                f"{'Loss reduction:':<{key_width}}{delta:>{val_width}.6f}"
+                f"{perc_improvement:>{perc_width}}%"
+            )
+            steps = len(self.loss_list)
+            conv = " (converged)" if getattr(self, "convergence", False) else ""
+            print(f"{f'Total steps{conv}:':<{key_width}}{steps:>{val_width}d}")
+
+        print("=" * w)
+
+    def fix_seed(self):
+        torch.manual_seed(self.seed)
+        torch.cuda.manual_seed_all(self.seed)
+        np.random.seed(self.seed)
 
     def __repr__(self):
         repr_str = f"Adjuster(\n"
@@ -1604,30 +1369,241 @@ class Adjuster(nn.Module):
         repr_str += f")"
         return repr_str
 
-    def _scaler_and_scheduler_steps(self, loss):
-        # scaler step
-        if hasattr(self, "scaler") and self.scaler is not None:
-            # gradients computation
-            s_time = time.time()
-            self.scaler.scale(loss).backward()
-            self.timings["gradient_computation"] += time.time() - s_time
-            # parameter update
-            s_time = time.time()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.timings["parameter_update"] += time.time() - s_time
+    @torch.no_grad()
+    def visualize_residuals(
+        self, output_dir="residual_maps", percentile=99, max_images=100
+    ):
+        """
+        Visualize reprojection residuals for all image pairs in the viewgraph.
+        Creates error maps showing where edges align well or poorly between image pairs.
+
+        Args:
+            output_dir (str): Directory to save residual visualization maps
+            percentile (float): Percentile for colormap scaling (default 95 to avoid outliers)
+        """
+        import os
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import Normalize
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Process all viewgraph pairs
+        viewgraph = (
+            self.viewgraph
+            if max_images < 0
+            else random.choices(self.viewgraph, k=max_images)
+        )
+        num_pairs = len(viewgraph)
+        print(f"Visualizing residuals for {num_pairs:,} image pairs...")
+
+        residual_stats = {"min": float("inf"), "max": 0, "mean": 0}
+        all_residuals = []
+
+        for pair_idx, (img_i, img_j) in enumerate(
+            tqdm(viewgraph, desc="Computing residuals")
+        ):
+            sampled_vg = [(img_i, img_j)]
+
+            # Create batched inputs for this single pair
+            batch, pad_masks, dt_fields = self._create_batched_inputs(sampled_vg)
+
+            # Project edges and compute residuals
+            edges_reprojected = project_world_to_2D(
+                **batch
+            )  # (2, N, 2) - both directions
+            residuals = sample_distance_field(
+                dt_fields, edges_reprojected, device=self.device
+            ).squeeze(
+                1
+            )  # (2, N)
+
+            # Process forward direction (i->j)
+            res_ij = residuals[0]  # (N,)
+            edges_ij = edges_reprojected[0]  # (N, 2)
+            hw_j = self.images[img_j]["hw"]
+
+            residual_map_ij = self._create_residual_map(
+                res_ij, edges_ij, hw_j, self.images[img_j]["pad_mask"]
+            )
+
+            # Process backward direction (j->i)
+            res_ji = residuals[1]  # (N,)
+            edges_ji = edges_reprojected[1]  # (N, 2)
+            hw_i = self.images[img_i]["hw"]
+
+            residual_map_ji = self._create_residual_map(
+                res_ji, edges_ji, hw_i, self.images[img_i]["pad_mask"]
+            )
+
+            # Save visualization
+            self._save_residual_visualization(
+                residual_map_ij,
+                residual_map_ji,
+                img_i,
+                img_j,
+                output_dir,
+                pair_idx,
+                percentile,
+            )
+
+            # Collect stats
+            valid_ij = res_ij[~torch.isnan(res_ij)]
+            valid_ji = res_ji[~torch.isnan(res_ji)]
+            valid_residuals = torch.cat([valid_ij, valid_ji])
+
+            if valid_residuals.numel() > 0:
+                all_residuals.append(valid_residuals)
+                residual_stats["min"] = min(
+                    residual_stats["min"], valid_residuals.min().item()
+                )
+                residual_stats["max"] = max(
+                    residual_stats["max"], valid_residuals.max().item()
+                )
+
+        # Compute global statistics
+        if all_residuals:
+            all_residuals_tensor = torch.cat(all_residuals)
+            residual_stats["mean"] = all_residuals_tensor.mean().item()
+            residual_stats["std"] = all_residuals_tensor.std().item()
+            residual_stats["median"] = all_residuals_tensor.median().item()
+            p95 = torch.quantile(all_residuals_tensor, 0.95).item()
+
+            print(f"\nResidual Statistics:")
+            print(f"  Min: {residual_stats['min']:.6f}")
+            print(f"  Max: {residual_stats['max']:.6f}")
+            print(f"  Mean: {residual_stats['mean']:.6f}")
+            print(f"  Median: {residual_stats['median']:.6f}")
+            print(f"  Std: {residual_stats['std']:.6f}")
+            print(f"  95th percentile: {p95:.6f}")
+            print(f"\nResidual maps saved to: {output_dir}")
+
+    @torch.no_grad()
+    def _save_residual_visualization(
+        self, res_map_ij, res_map_ji, img_i, img_j, output_dir, pair_idx, percentile
+    ):
+        """Save residual maps as images with original images and edge maps."""
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import Normalize
+
+        # Sanitize image names for filenames
+        safe_img_i = img_i.replace("/", "_").replace("\\", "_")
+        safe_img_j = img_j.replace("/", "_").replace("\\", "_")
+
+        filename = f"{pair_idx:04d}_{safe_img_i}_to_{safe_img_j}.png"
+        filepath = os.path.join(output_dir, filename)
+
+        # Compute colormap limits using percentile
+        valid_ij = res_map_ij[res_map_ij > 0]
+        valid_ji = res_map_ji[res_map_ji > 0]
+        all_valid = (
+            torch.cat([valid_ij, valid_ji])
+            if (valid_ij.numel() > 0 and valid_ji.numel() > 0)
+            else (valid_ij if valid_ij.numel() > 0 else valid_ji)
+        )
+
+        if all_valid.numel() > 0:
+            vmax = torch.quantile(all_valid, percentile / 100.0).item()
         else:
-            loss.backward()
-            self.optimizer.step()
+            vmax = 1.0
 
-        # scheduler step
-        if self.scheduler is not None:
-            if self.scheduler.__class__.__name__ == "ReduceLROnPlateau":
-                self.scheduler.step(loss)
-            else:
-                self.scheduler.step()
+        # Create figure with 2 rows, 3 columns
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+
+        # Get original images
+        if "image" in self.images[img_i]:
+            img_i_tensor = self.images[img_i]["image"]
+        else:
+            img_i_tensor = torch.zeros(3, *self.images[img_i]["hw"])
+
+        if "image" in self.images[img_j]:
+            img_j_tensor = self.images[img_j]["image"]
+        else:
+            img_j_tensor = torch.zeros(3, *self.images[img_j]["hw"])
+
+        # Normalize images to [0, 1] if they're not already
+        if img_i_tensor.max() > 1.0:
+            img_i_tensor = img_i_tensor / 255.0
+        if img_j_tensor.max() > 1.0:
+            img_j_tensor = img_j_tensor / 255.0
+
+        # Convert to numpy and move channels to last dimension
+        img_i_np = img_i_tensor.cpu().numpy().transpose(1, 2, 0)
+        img_j_np = img_j_tensor.cpu().numpy().transpose(1, 2, 0)
+
+        # Clamp to valid range
+        img_i_np = np.clip(img_i_np, 0, 1)
+        img_j_np = np.clip(img_j_np, 0, 1)
+
+        # Get edge maps
+        edges_map_i = self.images[img_i]["edges_map"].cpu().numpy()
+        edges_map_j = self.images[img_j]["edges_map"].cpu().numpy()
+
+        # First row (img_i -> img_j)
+        axes[0, 0].imshow(img_i_np)
+        axes[0, 0].set_title(f"Image: {img_i}")
+        axes[0, 0].axis("off")
+
+        axes[0, 1].imshow(edges_map_i, cmap="gray")
+        axes[0, 1].set_title(f"Edges: {img_i}")
+        axes[0, 1].axis("off")
+
+        im1 = axes[0, 2].imshow(res_map_ij.cpu().numpy(), cmap="hot", vmin=0, vmax=vmax)
+        axes[0, 2].set_title(f"Residuals: {img_i} → {img_j}")
+        axes[0, 2].axis("off")
+        plt.colorbar(im1, ax=axes[0, 2], label="Error")
+
+        # Second row (img_j -> img_i)
+        axes[1, 0].imshow(img_j_np)
+        axes[1, 0].set_title(f"Image: {img_j}")
+        axes[1, 0].axis("off")
+
+        axes[1, 1].imshow(edges_map_j, cmap="gray")
+        axes[1, 1].set_title(f"Edges: {img_j}")
+        axes[1, 1].axis("off")
+
+        im2 = axes[1, 2].imshow(res_map_ji.cpu().numpy(), cmap="hot", vmin=0, vmax=vmax)
+        axes[1, 2].set_title(f"Residuals: {img_j} → {img_i}")
+        axes[1, 2].axis("off")
+        plt.colorbar(im2, ax=axes[1, 2], label="Error")
+
+        plt.tight_layout()
+        plt.savefig(filepath, dpi=100, bbox_inches="tight")
+        plt.close()
+
+    @torch.no_grad()
+    def _create_residual_map(self, residuals, edges, hw, pad_mask):
+        """Create a 2D residual map from residuals at edge locations.
+
+        Args:
+            residuals: (N,) tensor of residual values
+            edges: (N, 2) tensor of edge coordinates (x, y)
+            hw: tuple of (height, width)
+            pad_mask: (N,) tensor indicating valid edges
+
+        Returns:
+            residual_map: (H, W) tensor with residuals at edge locations, 0 elsewhere
+        """
+        h, w = hw
+        residual_map = torch.zeros(
+            (h, w), device=residuals.device, dtype=residuals.dtype
+        )
+
+        # Filter valid edges based on pad_mask
+        valid_mask = pad_mask > 0.5
+        valid_edges = edges[valid_mask].long()
+        valid_residuals = residuals[valid_mask]
+
+        # Clamp coordinates to image bounds
+        valid_edges[:, 0] = torch.clamp(valid_edges[:, 0], 0, w - 1)
+        valid_edges[:, 1] = torch.clamp(valid_edges[:, 1], 0, h - 1)
+
+        # Place residuals at edge locations
+        residual_map[valid_edges[:, 1], valid_edges[:, 0]] = valid_residuals
+
+        return residual_map
 
 
+# Main
 if __name__ == "__main__":
 
     scene = "vienna_state_opera"
@@ -1653,8 +1629,8 @@ if __name__ == "__main__":
         grad_k=True,
         grad_z=True,
         scheduler_name="ReduceLROnPlateau",
-        scheduler_params={"factor": 0.5, "patience": 2, "min_lr": 1e-6},
-        # gt_path=gt_path, # slows down a bit the optimization but useful for eval
+        scheduler_params={"factor": 0.75, "patience": 2, "min_lr": 1e-6},
+        gt_path=gt_path,  # slows down a bit the optimization but useful for eval
         # viz=True,
         detector_params={
             "low_threshold": 0.20,

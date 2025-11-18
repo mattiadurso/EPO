@@ -322,3 +322,48 @@ def load_reconstruction(recon_path):
     imgs = recon.images
     id_to_name = {img.image_id: img.name for img in imgs.values()}
     return recon, cams, imgs, id_to_name, path
+
+
+def process_camera(camera, load_with_pad=False, images_size=518):
+    # Convert a single pycolmap.Camera to torch tensor
+    cam_id = camera.camera_id
+    model = camera.model.name
+    params = camera.params
+    width = camera.width
+    height = camera.height
+
+    if model == "SIMPLE_PINHOLE":  # or model == "SIMPLE_RADIAL":
+        f = params[0]
+        cx, cy = params[1], params[2]
+
+    elif model == "PINHOLE":  # or model == "RADIAL":
+        f = torch.tensor([params[0], params[1]], dtype=torch.float32)
+        cx, cy = params[2], params[3]
+
+    else:
+        raise NotImplementedError(f"Camera model {model} not supported.")
+
+    # Account for padding when making square
+    max_dim = max(width, height)
+    pad_x = (max_dim - width) // 2 if load_with_pad else 0
+    pad_y = (max_dim - height) // 2 if load_with_pad else 0
+
+    # Scale factor after resize
+    scale = images_size / max_dim
+
+    # Apply padding shift + scale
+    f = f * scale
+    cx = (cx + pad_x) * scale
+    cy = (cy + pad_y) * scale
+
+    params = torch.cat([f, torch.tensor([cx, cy], dtype=torch.float32)], dim=0)
+    return cam_id, model, params
+
+
+def process_pose(image):
+    # Convert a single pycolmap.Image to torch tensor
+    # COLMAP's cam_from_world is already R_cw (world-to-camera rotation)
+    R = torch.tensor(image.cam_from_world.rotation.matrix(), dtype=torch.float32)
+    t = torch.tensor(image.cam_from_world.translation, dtype=torch.float32).unsqueeze(1)
+
+    return R, t, image.camera_id
