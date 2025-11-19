@@ -117,7 +117,7 @@ class Adjuster(nn.Module):
         max_workers=-1,
         detector_params={},
         seed=0,
-        scheduler_name=None,
+        scheduler_name="ReduceLROnPlateau",
         scheduler_params={"factor": 0.75, "patience": 2, "min_lr": 1e-6},
         use_amp=True,
         matcher_type="frustums",  # or "sequential"
