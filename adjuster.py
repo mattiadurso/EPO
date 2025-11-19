@@ -156,11 +156,11 @@ class Adjuster(nn.Module):
         # Edge extractor
         if detector == "canny":
             self.edge_extractor = CannyEdgeDetector(
-                low_threshold=detector_params.get("low_threshold", 0.15),
+                low_threshold=detector_params.get("low_threshold", 0.20),
                 high_threshold=detector_params.get("high_threshold", 0.25),
                 hysteresis=detector_params.get("hysteresis", True),
-                kernel_size=detector_params.get("kernel_size", 5),
-                sigma=detector_params.get("sigma", 3.0),
+                kernel_size=detector_params.get("kernel_size", 7),
+                sigma=detector_params.get("sigma", 1.0),
                 device=device,
             )
 

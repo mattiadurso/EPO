@@ -47,7 +47,7 @@ class CannyEdgeDetector(nn.Module):
         print(
             f"CannyEdgeDetector initialized with low_threshold={low_threshold}, "
             + f"high_threshold={high_threshold}, hysteresis={hysteresis}, "
-            + f"kernel_size={kernel_size}, sigma={sigma}, device={device}"
+            + f"kernel_size={kernel_size}, sigma={sigma}, device={device}\n"
         )
 
         self.device = torch.device(device)
