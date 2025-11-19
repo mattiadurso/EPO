@@ -80,7 +80,7 @@ class Pose(nn.Module):
         return self.__repr__()
 
 
-class PoseModel(nn.Module):
+class PoseModule(nn.Module):
     def __init__(
         self,
         image_id_map: dict[str, int],
@@ -130,6 +130,8 @@ class PoseModel(nn.Module):
         # --- Translation Prep ---
         t_init = t.reshape(num_cams, 3).float().to(self.device)
         self.t_param = nn.Parameter(t_init.clone().detach(), requires_grad=grad_t)
+
+        self.update_all_matrices()  # Precompute all extrinsic matrices
 
     def map_names_to_indices(self, image_names) -> torch.LongTensor:
         """Robustly maps string names to tensor indices."""
@@ -235,10 +237,20 @@ class PoseModel(nn.Module):
         return s
 
     def parameters(self, t=True, q=True, recurse: bool = True):
-        """Return iterator of trainable parameters - only leaf tensors"""
+        """Return list of trainable parameters - only leaf tensors"""
         params = []
-        if q:
+        if q and self.q_param.requires_grad:
             params.append(self.q_param)
-        if t:
+        if t and self.t_param.requires_grad:
             params.append(self.t_param)
-        return iter(params)  # Changed: return iterator instead of list
+        return params  # Changed: return list instead of iterator
+
+    def get_image_qt(self, image_names):
+        """Get quaternion and translation for given image names."""
+        indices = self.map_names_to_indices(image_names)
+        return self.q_param[indices].squeeze(), self.t_param[indices].squeeze()
+
+    def update_all_matrices(self):
+        """Init/Update all extrinsic matrices for all images and store them internally."""
+        all_names = list(self.image_to_tensor_idx.keys())
+        self.poses = self.get_projection_matrix(all_names)

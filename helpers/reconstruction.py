@@ -129,29 +129,31 @@ def build_reconstruction(
     for cam_id in camera_scales:
         camera_scales[cam_id] = np.median(camera_scales[cam_id])
 
-    for cam_id, camera in self.intrinsics.items():
+    for cam_id in self.intrinsics.keys:
         # Get camera parameters as numpy array
-        params = camera.params.detach().cpu().numpy()
+        model, params = self.intrinsics.get_camera_parameters(cam_id)
+        params = params.detach().cpu().numpy()
 
         # Get scale for this camera
         scale = camera_scales.get(cam_id, 1.0)
 
         # Apply inverse scaling to focal lengths (scale back to original)
-        if camera.model == "PINHOLE":
+        if model == "PINHOLE":
             params = params.copy()
             params[0] /= scale  # fx
             params[1] /= scale  # fy
             params[2] /= scale  # cx
             params[3] /= scale  # cy
             model = pycolmap.CameraModelId.PINHOLE
-        elif camera.model == "SIMPLE_PINHOLE":
+
+        elif model == "SIMPLE_PINHOLE":
             params = params.copy()
             params[0] /= scale  # f
             params[1] /= scale  # cx
             params[2] /= scale  # cy
             model = pycolmap.CameraModelId.SIMPLE_PINHOLE
         else:
-            raise ValueError(f"Unsupported camera model: {camera.model}")
+            raise ValueError(f"Unsupported camera model: {model}")
 
         # Get image dimensions from first image with this cam_id
         sample_image = next(
@@ -183,7 +185,7 @@ def build_reconstruction(
 
     # 2. Add images (poses)
     for image_id, (image_name, image_data) in enumerate(self.images.items(), start=1):
-        pose = image_data["P"]
+        # pose = self.poses.get_projection_matrix([image_name])
         cam_id = image_data["cam_id"]
         scale = image_data.get("scale", 1.0)
 
@@ -191,8 +193,9 @@ def build_reconstruction(
         cam_id_int = int(cam_id) if isinstance(cam_id, str) else cam_id
 
         # Get rotation matrix and translation
-        q = pose.q.detach().cpu().numpy()
-        t = pose.t.detach().cpu().numpy().squeeze()
+        q, t = self.poses.get_image_qt([image_name])
+        q = q.detach().cpu().numpy()
+        t = t.detach().cpu().numpy()
 
         # Apply inverse scaling to translation (scale back to original)
         t = t / scale
