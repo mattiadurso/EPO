@@ -126,6 +126,7 @@ def filter_viewgraph_by_reprojection(
     device="cuda",
     P_cache=None,
     K_cache=None,
+    use_amp=False,
 ):
     """Filters viewgraph with batched reprojection."""
 
@@ -178,7 +179,9 @@ def filter_viewgraph_by_reprojection(
             "depth1": Z2,
         }
 
-        with torch.amp.autocast(device_type=device, dtype=torch.float16):
+        with torch.amp.autocast(
+            device_type=device, dtype=torch.bfloat16, enabled=use_amp
+        ):
             # project the points to img1
             kpts1 = reproject_2D_2D(
                 xy0=grid_i[None],  # ✓ Use cached grid
