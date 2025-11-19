@@ -71,9 +71,7 @@ class Camera(nn.Module):  # Changed: inherit from nn.Module
 
     def parameters(self, recurse=True):  # Changed: match nn.Module signature
         """Return list of trainable parameters - only self.params is a leaf tensor"""
-        return iter([self.params])  # Changed: return iterator like nn.Module
-
-    # Removed custom to() method - nn.Module handles this automatically
+        return [self.params]  # Changed: return iterator like nn.Module
 
     def __repr__(self):
         return f"Camera(id={self.id}, model={self.model}, parameters={self.params.data.detach().tolist()})"
@@ -82,10 +80,10 @@ class Camera(nn.Module):  # Changed: inherit from nn.Module
         return self.__repr__()
 
 
-class CameraModel(nn.Module):
+class CameraModule(nn.Module):
     def __init__(
         self,
-        cam_id: dict[int, int],
+        cam_id: dict,
         k_models: list[str],
         k_params: torch.Tensor,
         k_grad: bool = True,
@@ -110,6 +108,7 @@ class CameraModel(nn.Module):
         # --- ID Mappings ---
         self.recon_to_tensor_cam_id = cam_id
         self.tensor_to_recon_cam_id = {v: k for k, v in cam_id.items()}
+        self.keys = list(self.recon_to_tensor_cam_id.keys())
 
         # --- Model Types ---
         self.k_models = k_models
@@ -125,6 +124,8 @@ class CameraModel(nn.Module):
         self.k_params = nn.Parameter(
             k_params.float().clone().detach().to(self.device), requires_grad=self.k_grad
         )
+
+        self.update_all_matrices()  # Precompute all intrinsic matrices
 
     def map_camera_ids_to_indices(self, camera_ids) -> torch.LongTensor:
         """
@@ -150,7 +151,10 @@ class CameraModel(nn.Module):
         # Return as LongTensor on the correct device for indexing
         return torch.tensor(indices, dtype=torch.long, device=self.device)
 
-    def intrinsic_matrix(self, camera_ids) -> torch.Tensor:
+    def get_all_intrinsic_matrix(self):
+        return self.keys, self.get_intrinsic_matrix(self.keys)
+
+    def get_intrinsic_matrix(self, camera_ids) -> torch.Tensor:
         """Construct K matrix from parameters on-the-fly. Handles mixed models."""
 
         # 1. Get the internal row indices for the requested cameras
@@ -268,3 +272,17 @@ class CameraModel(nn.Module):
             s += f"  Camera {self.tensor_to_recon_cam_id[i]}: Model={model}, Params={params.detach().cpu().tolist()}\n"
             count += 1
         return s
+
+    def parameters(self, recurse=True):  # Changed: match nn.Module signature
+        """Return list of trainable parameters - only self.params is a leaf tensor"""
+        return [self.k_params]  # Changed: return iterator like nn.Module
+
+    def get_camera_parameters(self, camera_ids) -> torch.Tensor:
+        """Get camera parameters for given camera IDs."""
+        indices = self.map_camera_ids_to_indices(camera_ids)
+        return self.k_models[indices], self.k_params[indices].squeeze()
+
+    def update_all_matrices(self):
+        """Init/Update all intrinsic matrices for all cameras and store them internally."""
+        all_ids = self.keys
+        self.cameras = self.get_intrinsic_matrix(all_ids)

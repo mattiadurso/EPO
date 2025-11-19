@@ -115,17 +115,15 @@ def compute_121_reprojection(
 
 @torch.no_grad()
 def filter_viewgraph_by_reprojection(
+    self,
     viewgraph,
     images,
-    intrinsics,
     th=0.025,
     min_points=100,  # do I want this in my scheme?
     border=0,
     sampling_factor=10,
     reprojection_error=5.0,
     device="cuda",
-    P_cache=None,
-    K_cache=None,
     use_amp=False,
 ):
     """Filters viewgraph with batched reprojection."""
@@ -144,17 +142,6 @@ def filter_viewgraph_by_reprojection(
             grid_cache[key] = torch.stack((grid_x, grid_y), dim=-1).view(-1, 2).float()
         return grid_cache[key]
 
-    # Use cached matrices if provided, otherwise compute
-    if P_cache is None:
-        P_cache = {
-            name: img_data["P"].projection_matrix().float()
-            for name, img_data in images.items()
-        }
-    if K_cache is None:
-        K_cache = {
-            cam_id: cam.intrinsic_matrix().float() for cam_id, cam in intrinsics.items()
-        }
-
     filtered_viewgraph = []
 
     for i, j in tqdm(viewgraph, desc="Computing viewgraph"):
@@ -170,10 +157,10 @@ def filter_viewgraph_by_reprojection(
 
         # Use cached matrices
         data = {
-            "P0": P_cache[i][None],
-            "P1": P_cache[j][None],
-            "K0": K_cache[images[i]["cam_id"]][None],
-            "K1": K_cache[images[j]["cam_id"]][None],
+            "P0": self.poses.get_projection_matrix(i),
+            "P1": self.poses.get_projection_matrix(j),
+            "K0": self.intrinsics.get_intrinsic_matrix(images[i]["cam_id"]),
+            "K1": self.intrinsics.get_intrinsic_matrix(images[j]["cam_id"]),
             "depth0": Z1,
             "depth1": Z2,
         }
@@ -203,7 +190,7 @@ def filter_viewgraph_by_reprojection(
                 img1_shape=(ih, iw),
             )
 
-        # Remove NaNs
+        # Remove NaNs (points fallen outside the image or with invalid depth)
         nan_mask = torch.logical_or(
             torch.isnan(kpts1).any(dim=-1), torch.isnan(kpts0_back).any(dim=-1)
         )
@@ -217,25 +204,27 @@ def filter_viewgraph_by_reprojection(
         )
         consistent_mask = reprojection_dist < reprojection_error
 
-        kpts0_consistent = kpts0_valid[consistent_mask]
+        kpts0_consistent = kpts0_valid[
+            consistent_mask
+        ]  # back and forth consistent points
 
         # Check border constraints
         if kpts0_consistent.numel() > 0:
             mask_x = torch.logical_and(
-                kpts1_valid[:, 0] > border, kpts1_valid[:, 0] < jw - border
+                kpts0_consistent[:, 0] > border, kpts0_consistent[:, 0] < jw - border
             )
             mask_y = torch.logical_and(
-                kpts1_valid[:, 1] > border, kpts1_valid[:, 1] < jh - border
+                kpts0_consistent[:, 1] > border, kpts0_consistent[:, 1] < jh - border
             )
             mask = torch.logical_and(mask_x, mask_y)
-            kpt0 = kpts0_valid[mask]
+            kpt0 = kpts0_consistent[mask]
         else:
             kpt0 = kpts0_consistent
 
-        tot_kpts = grid_i.shape[0]
+        tot_kpts = grid.shape[0]
         if tot_kpts > 0:
             perc = len(kpt0) / tot_kpts
-            if perc >= th or len(kpt0) >= min_points:
+            if perc >= th or len(kpt0) >= min_points:  # mmm to fix/tune later
                 filtered_viewgraph.append((i, j))
 
     print(f"Filtered viewgraph: {len(filtered_viewgraph):,} pairs retained")

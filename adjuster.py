@@ -1,8 +1,3 @@
-# This script should contain the pose, intrinsics and depth optimizer.
-# It should work with PyTorch and be compatible with CUDA if available.
-# It should works usign edges and photometric losses.
-
-# I might want to use pypose, kornia and/or pytorch3d for this.
 import os
 import gc
 import math
@@ -14,6 +9,9 @@ import pycolmap
 import warnings
 import random
 import torch.nn.functional as F
+import glob
+from PIL import Image
+from tqdm import tqdm
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -34,9 +32,6 @@ warnings.filterwarnings(
     message=".*IProgress not found.*",
 )
 
-import glob
-from PIL import Image
-from tqdm import tqdm
 from helpers.load import (
     find_images,
     process_pose,
@@ -60,15 +55,16 @@ from helpers.reprojection_compiled import (
 from helpers.reconstruction import build_reconstruction
 from helpers.frustum import build_view_graph_from_frustums
 from extractors.canny import CannyEdgeDetector
-from modules.camera import Camera
-from modules.pose import Pose
-from modules.depth import DepthMap
+from modules.camera import CameraModule
+from modules.pose import PoseModule
+from modules.parameters_module import ParameterModule
+from modules.depth import DepthModule
+from modules.edges3d import Edges3DModule
 
 
 import sys
 
 sys.path.append("/home/mattia/Desktop/Repos/wrapper_factory/benchmarks_3D")
-# from utils_benchmark_pose import eval_colmap_model
 from benchmark_pose import eval_colmap_model
 
 
@@ -160,7 +156,7 @@ class Adjuster(nn.Module):
                 high_threshold=detector_params.get("high_threshold", 0.25),
                 hysteresis=detector_params.get("hysteresis", True),
                 kernel_size=detector_params.get("kernel_size", 7),
-                sigma=detector_params.get("sigma", 1.0),
+                sigma=detector_params.get("sigma", 2.0),
                 device=device,
             )
 
@@ -183,12 +179,18 @@ class Adjuster(nn.Module):
 
         ## Load Images as dict {image_name: image_tensor}
         s_time = time.time()
-        self.image_path_list = find_images(self.images_path)
-        self._load_and_preprocess_images()  # into self.images
+        self.image_path_list = find_images(
+            self.images_path
+        )  # image name includes subfolder if any
+        # loads image, coords, scale, hw into self.images[image_name]
+        self._load_and_preprocess_images()
         self.timings["load_images"] = time.time() - s_time
 
         ## Load poses and intrinsics
         s_time = time.time()
+        # creating poses such self.poses[image_name] = PoseModel(...)
+        # creating intrinsics such self.intrinsics[cam_id] = CameraModel(...)
+        # using image name and camera id/foler str
         self._read_cameras_from_reconstruction()  # into self.images and self.intrinsics
         self.timings["load_poses_and_intrinsics"] = time.time() - s_time
 
@@ -204,15 +206,11 @@ class Adjuster(nn.Module):
 
         ## Viewgraph from frustums
         s_time = time.time()
-        # compute and cache P and K matrices once
-        self.P_cache, self.K_cache = None, None
-        self._cache_projection_matrices()
-
         # compute viewgraph
         self._compute_viewgraph(type=self.matcher_type)
         self.timings["compute_viewgraph"] = time.time() - s_time
 
-        ## Load sky mask if any
+        ## Load sky mask if any | Probably not working correctly after refactor
         if sky_mask_path is not None:
             s_time = time.time()
             self._load_and_preprocess_sky_masks(sky_mask_path)
@@ -221,9 +219,43 @@ class Adjuster(nn.Module):
         ## Compute Distance Fields
         s_time = time.time()
         self._compute_distance_fields()  # into self.images
-        self._cache_pad_and_dt_fields()
         self.timings["compute_distance_fields"] = time.time() - s_time
 
+        ## Prepare batched parameters modules that do not need to be optimized
+        image_id_map = {}
+        edges_padded, pad_masks = [], []
+        dt_fields, images_shapes = [], []
+        sampled_depth = []
+        for idx, image_name in enumerate(sorted(self.images.keys())):
+            # mapping image name to tensor index
+            image_id_map[image_name] = idx
+            # collecting data into big tensors
+            edges_padded.append(self.images[image_name]["edges_padded"])
+            pad_masks.append(self.images[image_name]["pad_mask"])
+            dt_fields.append(self.images[image_name]["dt_field"])
+            images_shapes.append(torch.tensor(self.images[image_name]["hw"]))
+            sampled_depth.append(self.images[image_name]["sampled_depth"])
+
+        # stacking
+        edges_padded = torch.stack(edges_padded, dim=0).to(self.device)
+        pad_masks = torch.stack(pad_masks, dim=0).to(self.device)
+        dt_fields = torch.stack(dt_fields, dim=0).to(self.device)
+        images_shapes = torch.stack(images_shapes, dim=0).to(self.device)
+        sampled_depth = torch.stack(sampled_depth, dim=0).to(self.device)
+
+        # storing
+        self.edges_padded = ParameterModule(image_id_map, edges_padded, self.device)
+        self.pad_masks = ParameterModule(image_id_map, pad_masks, self.device)
+        self.dt_fields = ParameterModule(image_id_map, dt_fields, self.device)
+        self.images_hw = ParameterModule(image_id_map, images_shapes, self.device)
+
+        self.sampled_depth = DepthModule(
+            image_id_map,
+            sampled_depth,
+            self.device,
+            grad=self.grad_z,
+        )
+        # ==========================================================================
         # Create optimizer
         params_to_optimize = self._collect_parameters_to_optimize()
         self._print_params_summary(params_to_optimize)
@@ -261,13 +293,10 @@ class Adjuster(nn.Module):
 
     def forward(
         self,
-        max_steps=1_000,
+        max_steps=100,
         type="batched",
-        gradient_tolerance=5e-5,  # 1e-6 for more precise (probably final)
-        quick_mode=False,  # "quick" (sample & backprop) or "full" (accumulate over all)
         batch_size=128,  # faster than 64 and 256
         loss_robustifier=True,
-        warm_up_steps=10,  # e.g., min steps. Initially might return loss=0 but then it works. btw it should not happen.
         verbose=True,
     ):
         """
@@ -279,38 +308,25 @@ class Adjuster(nn.Module):
                             In "full" mode: batch size for accumulation over full viewgraph.
             type (str): Type of optimization to perform. Options are "sequential" or "batched".
             gradient_tolerance (float): Tolerance for gradient-based convergence.
-            quick_mode (bool): Whether to use quick mode (sample & backprop) or full accumulation.
         """
         assert type in ["sequential", "batched"], f"Type {type} not supported."
         time_start = time.time()
 
-        if quick_mode:
-            (
-                print(
-                    f"Quick mode ON. Randomly sampling viewgraph from {len(self.viewgraph):,} to {batch_size:,} pairs before every iteration"
-                )
-                if verbose
-                else None
-            )
-        else:
-            num_batches = math.ceil(len(self.viewgraph) / batch_size)
-            if verbose:
-                print(
-                    f"Full accumulation mode ON. Processing {len(self.viewgraph):,}",
-                    (
-                        f"pairs with batch size {batch_size:,} ({num_batches} batches per iteration)"
-                        if type == "batched"
-                        else ""
-                    ),
-                    # edges per image
-                    f"Using {self.images[list(self.images.keys())[0]]['edges_padded'].numel()//2:,} edges per image",  # // due to x and y
-                )
-
+        num_batches = math.ceil(len(self.viewgraph) / batch_size)
         max_steps = max_steps if max_steps > 0 else 1_000
         if verbose:
-            total_points = self.max_edges * (
-                batch_size if quick_mode else len(self.viewgraph)
+            print(
+                f"Processing {len(self.viewgraph):,}",
+                (
+                    f"pairs with batch size {batch_size:,} ({num_batches} batches per iteration)"
+                    if type == "batched"
+                    else ""
+                ),
+                # edges per image
+                f"Using {self.images[list(self.images.keys())[0]]['edges_padded'].numel()//2:,} edges per image",  # // due to x and y
             )
+
+            total_points = self.max_edges * len(self.viewgraph)
 
             print(
                 f"Total points to process per iteration: {total_points:,}.\n"
@@ -326,28 +342,24 @@ class Adjuster(nn.Module):
             # Initialize optimizer gradients
             self.optimizer.zero_grad()
 
-            # Update cache at START of each step (after parameters changed)
-            self._cache_projection_matrices()
+            # Update at beginning of each step (after parameters changed)
+            self.poses.update_all_matrices()
+            self.intrinsics.update_all_matrices()
 
             # Unproject point to world coordinates
             self._unproject_edges_to_3D()
 
-            if quick_mode:  # reduce pairs randomly each step
-                if len(self.viewgraph) > batch_size:
-                    sampled_indices = torch.randperm(len(self.viewgraph))[:batch_size]
-                    sampled_viewgraph = [self.viewgraph[i] for i in sampled_indices]
-            else:
-                sampled_viewgraph = self.viewgraph
-
+            # Compute residuals
             if type == "sequential":
-                residuals = self.compute_sequential_step(sampled_viewgraph)
+                residuals = self.compute_sequential_step(self.viewgraph)
 
             elif type == "batched":
                 residuals = self.compute_batched_step(
-                    sampled_viewgraph, batch_size=batch_size
-                )  # (num_pairs,)
+                    self.viewgraph, batch_size=batch_size
+                )
 
-            loss = self._compute_batched_loss(residuals, robustifier=loss_robustifier)
+            # Compute loss
+            loss = self._compute_batched_loss(residuals, loss_robustifier)
 
             # Backpropagate and update using GradScaler if available
             self._scaler_and_scheduler_steps(loss)
@@ -362,8 +374,8 @@ class Adjuster(nn.Module):
             self.lr_list.append(current_lr)
 
             # DEBUG: Evaluate AUC if GT available
-            if self.gt_path is not None and step % 5 == 0:
-                opt = "/home/mattia/Desktop/Repos/batchsfm/optimized_reconstruction"
+            if self.gt_path is not None and step % 1 == 0:
+                opt = "/home/mattia/Desktop/Repos/batchsfm/optimized_reconstruction_GD"
                 self.to_colmap(opt, save_points=False, verbose=False)
                 AUC_score_max, num_images, df_optim = eval_colmap_model(
                     opt, self.gt_path, return_df=False, thrs=[1, 3, 5]
@@ -396,26 +408,20 @@ class Adjuster(nn.Module):
         self.print_summary() if verbose else None
 
     ### Forward and backward helpers ###
-    def read_cameras_from_reconstruction(
+    def _read_cameras_from_reconstruction(
         self,
-        reconstruction,
-        images,
-        single_camera_per_folder=False,
-        load_with_pad=False,
     ):
-
         intrinsics = {}
 
         # Read cameras intrinsics
-        if single_camera_per_folder:
+        if self.single_camera_per_folder:
             # Reading cameras from images (to handle multiple images with same camera)
-            for image in reconstruction.images.values():
+            for image in self.recon.images.values():
                 _, model, new_params = process_camera(
-                    image.camera, load_with_pad, images_size=self.images_size
+                    image.camera, self.load_with_pad, images_size=self.images_size
                 )
-                cam_id = image.name.split("/")[
-                    0
-                ]  # assuming image names are like "cam_id/image_name"
+                # assuming image names are like "cam_id/image_name"
+                cam_id = image.name.split("/")[0]
 
                 # I want to stack params of same cam_id to then averaged them
                 if cam_id not in intrinsics:
@@ -441,7 +447,7 @@ class Adjuster(nn.Module):
                     )
         else:  # one camera per image
             # Reading cameras from images
-            for cam in reconstruction.cameras.values():
+            for cam in self.recon.cameras.values():
                 cam_id, model, new_params = self.process_camera(cam)
                 intrinsics[cam.camera_id] = {
                     "cam_id": cam_id,
@@ -452,50 +458,70 @@ class Adjuster(nn.Module):
         intrinsics = dict(sorted(intrinsics.items()))
 
         # Convert to Camera objects
-        for cam_id in intrinsics.keys():
-            intrinsics[cam_id] = Camera(
-                **intrinsics[cam_id], grad=self.grad_k, device=self.device
-            )
+        cam_id_to_tensor_id = {}
+        k_models, k_params = [], []
+        for idx, cam_id in enumerate(intrinsics.keys()):
+            # intrinsics[cam_id] = Camera(
+            #     **intrinsics[cam_id], grad=self.grad_k, device=self.device
+            # )
+            cam_id_to_tensor_id[cam_id] = idx
+            k_models.append(intrinsics[cam_id]["model"])
+            k_params.append(intrinsics[cam_id]["parameters"])
+
+        intrinsics = CameraModule(
+            cam_id=cam_id_to_tensor_id,
+            k_models=k_models,
+            k_params=torch.stack(k_params),
+            k_grad=self.grad_k,
+            device=self.device,
+        )
 
         # Read poses from images
-        for image in reconstruction.images.values():
+        poses_temp = {}
+        for image in self.recon.images.values():
             R, t, cam_id = process_pose(image)
-            pose = Pose(R=R, t=t, grad_q=self.grad_q, device=self.device)
 
-            if single_camera_per_folder:
+            # trusting the folders structure, VGGT returns one camera per image a priori
+            if self.single_camera_per_folder:
                 cam_id = image.name.split("/")[0]
             else:
                 cam_id = image.camera_id
 
-            images[image.name].update({"P": pose, "cam_id": cam_id})
+            poses_temp[image.name] = {"R": R, "t": t, "cam_id": cam_id}
 
-        return images, intrinsics
+        images_id_map = {}
+        R_tensor = []
+        t_tensor = []
+        for idx, image_name in enumerate(poses_temp.keys()):
+            images_id_map[image_name] = idx
+            self.images[image_name]["cam_id"] = poses_temp[image_name]["cam_id"]
+            R_tensor.append(poses_temp[image_name]["R"])
+            t_tensor.append(poses_temp[image_name]["t"])
+
+        poses = PoseModule(
+            images_id_map,
+            R=torch.stack(R_tensor),
+            t=torch.stack(t_tensor),
+            grad_q=self.grad_q,
+            grad_t=self.grad_t,
+            device=self.device,
+        )
+
+        self.poses = poses
+        self.intrinsics = intrinsics
 
     def _unproject_edges_to_3D(self, batch_size=None):
         """Unproject 2D edges to 3D points for all images as a batch."""
-        # Collect data
-        image_names = list(self.images.keys())
+
+        image_names = sorted(list(self.images.keys()))
         B = len(image_names)
-        edges_list, depth_list, K_list, P_list = [], [], [], []
+        cam_ids = [self.images[name]["cam_id"] for name in image_names]
 
-        for name in image_names:
-            data = self.images[name]
-            edges_2D = data["edges_padded"]  # (N, 2)
-            depth_map = data["sampled_depth"]()  # (1, H, W)
-            K = self.K_cache[data["cam_id"]]  # (3, 3)
-            P = self.P_cache[name]  # (4, 4)
-
-            edges_list.append(edges_2D)
-            depth_list.append(depth_map)
-            K_list.append(K)
-            P_list.append(P)
-
-        # Stack as batch
-        # edges_2D may have varying N — pad or bucket if needed
-        edges_batch = torch.stack(edges_list, dim=0).to(self.device)  # (B, N, 2)
-        depth_batch = torch.stack(depth_list, dim=0).to(self.device)  # (B, 1, H, W)
-        K_batch = torch.stack(K_list, dim=0).to(self.device)  # (B, 3, 3)
-        P_batch = torch.stack(P_list, dim=0).to(self.device)  # (B, 4, 4)
+        # indexing data
+        K_batch = self.intrinsics.get_intrinsic_matrix(cam_ids)  # (B, 3, 3)
+        P_batch = self.poses.get_projection_matrix(image_names)  # (B, 4, 4)
+        edges_batch = self.edges_padded.get_parameters(image_names)  # (B, N, 2)
+        depth_batch = self.sampled_depth.get_parameters(image_names)  # (B, 1, H, W)
 
         # Optionally chunk if batch too large for memory
         if batch_size is None:
@@ -515,9 +541,13 @@ class Adjuster(nn.Module):
 
         points_3D = torch.cat(points_3D_list, dim=0)  # (B, N, 3)
 
-        # Write back (differentiable tensors)
-        for name, pts3d in zip(image_names, points_3D):
-            self.images[name]["edges_3D"] = pts3d
+        # # Write back (differentiable tensors)
+        # for name, pts3d in zip(image_names, points_3D):
+        #     self.images[name]["edges_3D"] = pts3d
+
+        self.edges_3D = Edges3DModule(
+            self.edges_padded.image_to_tensor_idx, points_3D, self.device
+        )
 
     def compute_sequential_step(self, sampled_viewgraph):
         """Compute one optimization step over the sampled viewgraph sequentially and return the loss."""
@@ -589,49 +619,32 @@ class Adjuster(nn.Module):
 
     def _create_batched_inputs(self, sampled_viewgraph):
         """Prepare batched inputs for the batched optimization step given a list of pairs from the viewgraph."""
-        batch = {
-            "xyz_world": [],
-            "P1": [],
-            "K1": [],
-            "img1_shape": [],
-        }
-        pad_masks, dt_fields = [], []
-
+        cam_ids = []
+        images_names_ij = []
+        images_names_ji = []
         for i, j in sampled_viewgraph:
-            batch["xyz_world"].append(self.images[i]["edges_3D"])
-            batch["P1"].append(self.P_cache[j])
-            batch["K1"].append(self.K_cache[self.images[j]["cam_id"]])
-            batch["img1_shape"].append(self.images[j]["hw"])
+            # be careful about the order
+            images_names_ij.append(i)
+            images_names_ij.append(j)
+            cam_ids.append(self.images[j]["cam_id"])
+            cam_ids.append(self.images[i]["cam_id"])
+            images_names_ji.append(j)
+            images_names_ji.append(i)
 
-            batch["xyz_world"].append(self.images[j]["edges_3D"])
-            batch["P1"].append(self.P_cache[i])
-            batch["K1"].append(self.K_cache[self.images[i]["cam_id"]])
-            batch["img1_shape"].append(self.images[i]["hw"])
+        batch = {}
+        batch["K1"] = self.intrinsics.get_intrinsic_matrix(cam_ids)
+        batch["P1"] = self.poses.get_projection_matrix(images_names_ji)
+        batch["xyz_world"] = self.edges_3D.get_parameters(images_names_ij)
 
-            # this can be cached once and indexed
-            pad_masks.append(self.pad_masks_cache[i])
-            pad_masks.append(self.pad_masks_cache[j])
+        # check if all img1_shape are the same to avoid redundant data
+        shapes = self.images_hw.get_parameters(images_names_ji)
+        unique_rows = torch.unique(shapes, dim=0)
+        has_repetitions = unique_rows.shape[0] < shapes.shape[0]
+        batch["img1_shape"] = shapes[0] if has_repetitions else shapes
 
-            dt_fields.append(self.dt_fields_cache[j])
-            dt_fields.append(self.dt_fields_cache[i])
-
-        for key in batch:
-            if key in ["img1_shape"]:
-                continue
-            batch[key] = torch.stack(batch[key], dim=0)
-
-        # if img_shape us a list of tuple all equal, use a tuple to run faster
-        batch["img1_shape"] = (
-            batch["img1_shape"][0]
-            if all(
-                batch["img1_shape"][k] == batch["img1_shape"][0]
-                for k in range(len(batch["img1_shape"]))
-            )
-            else batch["img1_shape"]
-        )
-
-        pad_masks = torch.stack(pad_masks, dim=0)  # (B,)
-        dt_fields = torch.stack(dt_fields, dim=0)
+        # non learnable parameters but needed for loss computation
+        pad_masks = self.pad_masks.get_parameters(images_names_ij)
+        dt_fields = self.dt_fields.get_parameters(images_names_ji)
 
         return batch, pad_masks, dt_fields
 
@@ -652,7 +665,6 @@ class Adjuster(nn.Module):
 
         for sampled_viewgraph in sampled_viewgraphs:
             s_time = time.time()
-            # prepare batched inputs
             batch, pad_masks, dt_fields = self._create_batched_inputs(sampled_viewgraph)
             self.timings["prepare_batched_inputs"] += time.time() - s_time
 
@@ -668,12 +680,10 @@ class Adjuster(nn.Module):
                 edges_reprojected = project_world_to_2D(**batch)  # (B, N, 2)
                 self.timings["batched_reprojection"] += time.time() - s_time
 
-                # residuals sampling
+                # residuals sampling # (B, 1, N) -> (B, N)
                 residuals = sample_distance_field(
                     dt_fields, edges_reprojected, device=self.device
-                ).squeeze(
-                    1
-                )  # (B, 1, N) -> (B, N)
+                ).squeeze(1)
 
                 # chunked reduction to avoid OOM
                 B, N = residuals.shape
@@ -737,16 +747,6 @@ class Adjuster(nn.Module):
         return loss
 
     ### Helper functions for loading and preprocessing data ###
-    def _cache_projection_matrices(self):
-        """Cache all P and K matrices to avoid recomputation"""
-        self.P_cache = {}
-        for image_name, image_data in self.images.items():
-            self.P_cache[image_name] = image_data["P"].projection_matrix()
-
-        self.K_cache = {}
-        for cam_id, camera in self.intrinsics.items():
-            self.K_cache[cam_id] = camera.intrinsic_matrix()
-
     def _load_and_preprocess_images(self):
         self.images = load_and_preprocess_images(
             self.image_path_list,
@@ -755,14 +755,6 @@ class Adjuster(nn.Module):
             max_workers=self.max_workers,
             load_with_pad=self.load_with_pad,
             device=self.device,
-        )
-
-    def _read_cameras_from_reconstruction(self):
-        self.images, self.intrinsics = self.read_cameras_from_reconstruction(
-            self.recon,
-            self.images,
-            single_camera_per_folder=self.single_camera_per_folder,
-            load_with_pad=self.load_with_pad,
         )
 
     def _load_and_preprocess_depths(self):
@@ -797,12 +789,7 @@ class Adjuster(nn.Module):
             edges_padded = self.images[image_name]["edges_padded"]  # (N, 2)
             depth = self.images[image_name]["depth"]  # (H, W)
             sampled_depth, _ = grid_sample_nan(edges_padded[None], depth[None])
-            self.images[image_name]["sampled_depth"] = DepthMap(
-                height=self.images[image_name]["hw"][0],
-                width=self.images[image_name]["hw"][1],
-                depth=sampled_depth.squeeze(),  # (N,)
-                grad=self.grad_z,
-            )
+            self.images[image_name]["sampled_depth"] = sampled_depth.squeeze()
 
     def _load_and_preprocess_sky_masks(self, path):
         """Load and preprocess sky masks from the given path."""  # Not sure if working properly
@@ -936,15 +923,13 @@ class Adjuster(nn.Module):
 
         # Filter viewgraph by reprojection | This need to be runned as batch and speeded up
         viewgraph = filter_viewgraph_by_reprojection(
+            self,
             viewgraph,
             self.images,
-            self.intrinsics,
             th=0.025,  # not used cause min_points is set
             min_points=100,  # tune this eventually
             sampling_factor=10,
             reprojection_error=3.0,
-            P_cache=self.P_cache,
-            K_cache=self.K_cache,
             use_amp=self.use_amp,
         )
         self.viewgraph = viewgraph
@@ -1006,16 +991,6 @@ class Adjuster(nn.Module):
         self.max_edges = max_edges
         print(f"Max edges per image: {self.max_edges:,}")
 
-    ## Loss
-    def _cache_pad_and_dt_fields(self):
-        """Cache all pad masks and distance fields for faster access"""
-        self.pad_masks_cache = {}
-        self.dt_fields_cache = {}
-
-        for image_name, image_data in self.images.items():
-            self.pad_masks_cache[image_name] = image_data["pad_mask"]
-            self.dt_fields_cache[image_name] = image_data["dt_field"]
-
     @torch.no_grad()
     def _compute_distance_fields(self):
         dt_fields_shapes = []
@@ -1053,34 +1028,16 @@ class Adjuster(nn.Module):
 
         # Collect parameters to optimize
         if self.grad_k:
-            k_params = []
-            for camera in self.intrinsics.values():
-                k_params.extend(camera.parameters())
-            params_to_optimize["k"] = k_params
+            params_to_optimize["k"] = self.intrinsics.parameters()
 
         if self.grad_q:
-            q_params = []
-            for image_name, image_data in self.images.items():
-                q_params.extend(
-                    image_data["P"].parameters(q=True, t=False) if self.grad_q else []
-                )
-            params_to_optimize["q"] = q_params
+            params_to_optimize["q"] = self.poses.parameters(q=True, t=False)
 
         if self.grad_t:
-            t_params = []
-            for image_name, image_data in self.images.items():
-                t_params.extend(
-                    image_data["P"].parameters(q=False, t=True) if self.grad_t else []
-                )
-            params_to_optimize["t"] = t_params
+            params_to_optimize["t"] = self.poses.parameters(q=False, t=True)
 
         if self.grad_z:
-            z_params = []
-            for image_name, image_data in self.images.items():
-                z_params.extend(
-                    image_data["sampled_depth"].parameters() if self.grad_z else []
-                )
-            params_to_optimize["z"] = z_params
+            params_to_optimize["z"] = self.sampled_depth.parameters()
 
         return params_to_optimize
 
@@ -1203,7 +1160,7 @@ class Adjuster(nn.Module):
     def to_colmap(
         self,
         output_path="optimized_reconstruction_GD",
-        save_points=True,
+        save_points=False,
         verbose=False,
         max_points_per_image=100_000,
         final_dbscan_filtering=False,
@@ -1639,9 +1596,6 @@ if __name__ == "__main__":
     adjuster.print_summary()
 
     adjuster(
-        batch_size=128,  # saturate this value to fully utilize the GPU
-        type="batched",  # "sequential" or "batched"
+        batch_size=128,
         max_steps=-1,
-        quick_mode=False,  # if True, randomly samples of batch_size at each step
-        gradient_tolerance=1e-6,  # stop if relative change in loss is below this value
     )
