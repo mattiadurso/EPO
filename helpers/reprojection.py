@@ -166,8 +166,7 @@ def filter_viewgraph_by_reprojection(
         Z2 = images[j]["depth"][jy1:jy2, jx1:jx2][None].float()
 
         # Get cached grid instead of creating new one
-        grid_i = get_or_create_grid(ih, iw, sampling_factor, border, device)
-        # grid_j = get_or_create_grid(jh, jw, sampling_factor, border, device)
+        grid = get_or_create_grid(ih, iw, sampling_factor, border, device)
 
         # Use cached matrices
         data = {
@@ -184,7 +183,7 @@ def filter_viewgraph_by_reprojection(
         ):
             # project the points to img1
             kpts1 = reproject_2D_2D(
-                xy0=grid_i[None],  # ✓ Use cached grid
+                xy0=grid[None],
                 depthmap0=data["depth0"],
                 P0=data["P0"],
                 P1=data["P1"],
@@ -208,7 +207,7 @@ def filter_viewgraph_by_reprojection(
         nan_mask = torch.logical_or(
             torch.isnan(kpts1).any(dim=-1), torch.isnan(kpts0_back).any(dim=-1)
         )
-        kpts0_valid = grid_i[~nan_mask.squeeze()]
+        kpts0_valid = grid[~nan_mask.squeeze()]
         # kpts1_valid = kpts1[~nan_mask]
         kpts0_back_valid = kpts0_back[~nan_mask]
 
