@@ -147,7 +147,6 @@ class Adjuster(nn.Module):
         self.viewgraph_path = viewgraph_path
         self.matcher_type = matcher_type
         self.scheduler_params = scheduler_params
-        self.auc_list = []
 
         # Edge extractor
         if detector == "canny":
@@ -284,7 +283,8 @@ class Adjuster(nn.Module):
                     self.images[image_name].pop("sky_mask")
 
         self.loss_list = []
-        self.lr_list = []
+        self.lr_list = {}
+        self.auc_list = {}
         self.seed = seed
         self.fix_seed()
 
@@ -371,7 +371,12 @@ class Adjuster(nn.Module):
                 if self.scheduler is not None
                 else self.lr
             )
-            self.lr_list.append(current_lr)
+            # self.lr_list.append(current_lr)
+            # store lr for each group
+            for i, param_group in enumerate(self.optimizer.param_groups):
+                if i not in self.lr_list:
+                    self.lr_list[i] = []
+                self.lr_list[i].append(param_group["lr"])
 
             # DEBUG: Evaluate AUC if GT available
             if self.gt_path is not None and step % 1 == 0:
@@ -380,7 +385,10 @@ class Adjuster(nn.Module):
                 AUC_score_max, num_images, df_optim = eval_colmap_model(
                     opt, self.gt_path, return_df=False, thrs=[1, 3, 5]
                 )
-                self.auc_list.append(AUC_score_max)
+                # store AUC
+                if step not in self.auc_list:
+                    self.auc_list[step] = []
+                self.auc_list[step].append(AUC_score_max)
 
             current_lr = self.optimizer.param_groups[0]["lr"]
 

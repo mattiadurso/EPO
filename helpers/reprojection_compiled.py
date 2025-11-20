@@ -4,7 +4,7 @@ from torch import Tensor
 ### From 2D to 3D world coordinates
 
 
-@torch.compile(mode="reduce-overhead")
+# @torch.compile(mode="reduce-overhead")
 def to_homogeneous(xy: Tensor) -> Tensor:
     """Converts 2D points to homogeneous coordinates."""
     batch_shape = xy.shape[:-1]
@@ -12,7 +12,7 @@ def to_homogeneous(xy: Tensor) -> Tensor:
     return torch.cat((xy, ones), dim=-1)
 
 
-@torch.compile(mode="reduce-overhead")
+# @torch.compile(mode="reduce-overhead")
 def unproject_to_virtual_plane(
     xy: Tensor,
     K: Tensor,
@@ -40,7 +40,7 @@ def unproject_to_virtual_plane(
     return xyz
 
 
-@torch.compile(mode="reduce-overhead")
+# @torch.compile(mode="reduce-overhead")
 def unproject_to_3D(xy: Tensor, K: Tensor, depths: Tensor) -> Tensor:
     """unproject points to 3D in the camera ref system
     Args:
@@ -67,7 +67,7 @@ def unproject_to_3D(xy: Tensor, K: Tensor, depths: Tensor) -> Tensor:
     return xyz_scaled
 
 
-@torch.compile(mode="reduce-overhead")
+# @torch.compile(mode="reduce-overhead")
 def invert_P(P: Tensor) -> Tensor:
     """invert the extrinsics P matrix in a more stable way
     Args:
@@ -95,7 +95,7 @@ def invert_P(P: Tensor) -> Tensor:
     return P_inv
 
 
-@torch.compile(mode="reduce-overhead")
+# @torch.compile(mode="reduce-overhead")
 def unproject_2D_to_world(
     xy0: Tensor, K0: Tensor, depth0: Tensor, P0: Tensor
 ) -> Tensor:

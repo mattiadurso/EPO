@@ -152,20 +152,18 @@ class PoseModule(nn.Module):
         """
         Returns (B, 3, 3) Rotation Matrix for the requested images.
         """
+        # First normalize all quaternions (important for stability)
+        self.q_batch = self.q_param / torch.norm(self.q_param, dim=1, keepdim=True)
+
+        # Map names to indices
         indices = self.map_names_to_indices(image_names)
 
         # 1. Get raw quaternions for batch
         q_batch = self.q_param[indices]
 
-        # 2. Normalize (Crucial for optimization manifold)
-        # Uses Kornia or PyPose logic. PyPose SO3 automatically normalizes on creation usually,
-        # but explicit normalization is safer for raw nn.Parameter optimization.
-        # q_norm = F.normalize(q_batch, p=2, dim=1)
-        q_norm = q_batch / torch.norm(q_batch, dim=1, keepdim=True)
-
         # 3. Convert to Matrix via PyPose
         # PyPose SO3 wraps (x,y,z,w)
-        return pp.SO3(q_norm).matrix()
+        return pp.SO3(q_batch).matrix()
 
     def get_translation(self, image_names) -> torch.Tensor:
         """Returns (B, 3) Translation vectors"""

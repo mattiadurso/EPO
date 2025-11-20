@@ -190,12 +190,15 @@ def filter_viewgraph_by_reprojection(
                 img1_shape=(ih, iw),
             )
 
-        # Remove NaNs (points fallen outside the image or with invalid depth)
+        # ================================================================
+        # AOT it's not clear to me why this works...
+        # kpt1 shouldn't be checked, only the reprojected points k0 should count
+        #
         nan_mask = torch.logical_or(
             torch.isnan(kpts1).any(dim=-1), torch.isnan(kpts0_back).any(dim=-1)
         )
         kpts0_valid = grid[~nan_mask.squeeze()]
-        # kpts1_valid = kpts1[~nan_mask]
+        kpts1_valid = kpts1[~nan_mask]
         kpts0_back_valid = kpts0_back[~nan_mask]
 
         # Check reprojection consistency
@@ -204,27 +207,25 @@ def filter_viewgraph_by_reprojection(
         )
         consistent_mask = reprojection_dist < reprojection_error
 
-        kpts0_consistent = kpts0_valid[
-            consistent_mask
-        ]  # back and forth consistent points
+        kpts0_consistent = kpts0_valid[consistent_mask]
 
         # Check border constraints
         if kpts0_consistent.numel() > 0:
             mask_x = torch.logical_and(
-                kpts0_consistent[:, 0] > border, kpts0_consistent[:, 0] < jw - border
+                kpts1_valid[:, 0] > border, kpts1_valid[:, 0] < jw - border
             )
             mask_y = torch.logical_and(
-                kpts0_consistent[:, 1] > border, kpts0_consistent[:, 1] < jh - border
+                kpts1_valid[:, 1] > border, kpts1_valid[:, 1] < jh - border
             )
             mask = torch.logical_and(mask_x, mask_y)
-            kpt0 = kpts0_consistent[mask]
+            kpt0 = kpts0_valid[mask]
         else:
             kpt0 = kpts0_consistent
 
         tot_kpts = grid.shape[0]
         if tot_kpts > 0:
             perc = len(kpt0) / tot_kpts
-            if perc >= th or len(kpt0) >= min_points:  # mmm to fix/tune later
+            if perc >= th or len(kpt0) >= min_points:
                 filtered_viewgraph.append((i, j))
 
     print(f"Filtered viewgraph: {len(filtered_viewgraph):,} pairs retained")
