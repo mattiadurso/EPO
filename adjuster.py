@@ -639,10 +639,7 @@ class Adjuster(nn.Module):
                 residuals_list.append(mean_losses)
 
         # concatenate all collected batch results
-        if len(residuals_list) == 0:
-            residuals = torch.tensor([], device=self.device)
-        else:
-            residuals = torch.cat(residuals_list, dim=0)  # (num_pairs,)
+        residuals = torch.cat(residuals_list, dim=0)  # (num_pairs,)
 
         return residuals
 
