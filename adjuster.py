@@ -346,7 +346,7 @@ class Adjuster(nn.Module):
             self._unproject_edges_to_3D()
 
             # Compute residuals
-            residuals = self.compute_batched_step(self.viewgraph, batch_size=batch_size)
+            residuals = self.compute_forward_step(self.viewgraph, batch_size=batch_size)
 
             # Compute loss
             loss = self._compute_batched_loss(residuals, loss_robustifier)
@@ -579,7 +579,7 @@ class Adjuster(nn.Module):
 
         return batch, pad_masks, dt_fields
 
-    def compute_batched_step(self, sampled_viewgraph, batch_size=1024, chunk_size=4096):
+    def compute_forward_step(self, sampled_viewgraph, batch_size=1024, chunk_size=4096):
         """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss."""
 
         # divide self.viewgraph in batches if len(self.viewgraph) > batch size
@@ -593,7 +593,6 @@ class Adjuster(nn.Module):
 
         # collect per-batch results in a python list (tensors)
         residuals_list = []
-
         for sampled_viewgraph in sampled_viewgraphs:
             s_time = time.time()
             batch, pad_masks, dt_fields = self._create_batched_inputs(sampled_viewgraph)
