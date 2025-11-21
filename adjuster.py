@@ -380,15 +380,18 @@ class Adjuster(nn.Module):
 
             # DEBUG: Evaluate AUC if GT available
             if self.gt_path is not None and step % 1 == 0:
+                auc_th = [1, 3, 5]
                 opt = "/home/mattia/Desktop/Repos/batchsfm/optimized_reconstruction_GD"
                 self.to_colmap(opt, save_points=False, verbose=False)
                 AUC_score_max, num_images, df_optim = eval_colmap_model(
-                    opt, self.gt_path, return_df=False, thrs=[1, 3, 5]
+                    opt, self.gt_path, return_df=False, thrs=auc_th
                 )
                 # store AUC
                 if step not in self.auc_list:
-                    self.auc_list[step] = []
-                self.auc_list[step].append(AUC_score_max)
+                    for th in auc_th:
+                        self.auc_list[th] = []
+                for i, th in enumerate(auc_th):
+                    self.auc_list[th].append(AUC_score_max[i])
 
             current_lr = self.optimizer.param_groups[0]["lr"]
 
@@ -396,9 +399,7 @@ class Adjuster(nn.Module):
                 bar.set_postfix(
                     loss=f"{self.loss_list[-1]:.4f}",
                     auc5=(
-                        f"{self.auc_list[-1][-1]:.4f}"
-                        if self.gt_path is not None
-                        else 0
+                        f"{self.auc_list[3][-1]:.4f}" if self.gt_path is not None else 0
                     ),
                     lr=f"{current_lr:.2e}",
                 )
