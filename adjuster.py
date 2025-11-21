@@ -293,7 +293,6 @@ class Adjuster(nn.Module):
     def forward(
         self,
         max_steps=100,
-        type="batched",
         batch_size=128,  # faster than 64 and 256
         loss_robustifier=True,
         verbose=True,
@@ -305,10 +304,8 @@ class Adjuster(nn.Module):
             batch_size (int): Maximum number of image pairs per batch.
                             In "quick" mode: samples this many pairs and backprops immediately.
                             In "full" mode: batch size for accumulation over full viewgraph.
-            type (str): Type of optimization to perform. Options are "sequential" or "batched".
             gradient_tolerance (float): Tolerance for gradient-based convergence.
         """
-        assert type in ["sequential", "batched"], f"Type {type} not supported."
         time_start = time.time()
 
         num_batches = math.ceil(len(self.viewgraph) / batch_size)
@@ -349,13 +346,7 @@ class Adjuster(nn.Module):
             self._unproject_edges_to_3D()
 
             # Compute residuals
-            if type == "sequential":
-                residuals = self.compute_sequential_step(self.viewgraph)
-
-            elif type == "batched":
-                residuals = self.compute_batched_step(
-                    self.viewgraph, batch_size=batch_size
-                )
+            residuals = self.compute_batched_step(self.viewgraph, batch_size=batch_size)
 
             # Compute loss
             loss = self._compute_batched_loss(residuals, loss_robustifier)
@@ -556,74 +547,6 @@ class Adjuster(nn.Module):
         self.edges_3D = Edges3DModule(
             self.edges_padded.image_to_tensor_idx, points_3D, self.device
         )
-
-    def compute_sequential_step(self, sampled_viewgraph):
-        """Compute one optimization step over the sampled viewgraph sequentially and return the loss."""
-
-        residuals_list = []
-        # Use autocast (not really helping)
-        with torch.amp.autocast(
-            device_type=self.device,
-            dtype=torch.bfloat16,
-            enabled=self.use_amp,
-        ):
-            for pair in sampled_viewgraph:
-                i, j = pair
-                image_i = self.images[i]
-                image_j = self.images[j]
-
-                # project edges 1->2
-                edges_12 = reproject_2D_2D(
-                    xy0=image_i["edges"][None],
-                    depthmap0=image_i["depth"][None],
-                    P0=self.P_cache[i][None],
-                    P1=self.P_cache[j][None],
-                    K0=self.K_cache[image_i["cam_id"]][None],
-                    K1=self.K_cache[image_j["cam_id"]][None],
-                    img1_shape=image_j["hw"],
-                )
-
-                # project edges 2->1
-                edges_21 = reproject_2D_2D(
-                    xy0=image_j["edges"][None],
-                    depthmap0=image_j["depth"][None],
-                    P0=self.P_cache[j][None],
-                    P1=self.P_cache[i][None],
-                    K0=self.K_cache[image_j["cam_id"]][None],
-                    K1=self.K_cache[image_i["cam_id"]][None],
-                    img1_shape=image_i["hw"],
-                )
-
-                # Remove batch dimension before sampling
-                edges_12 = edges_12.squeeze(0)  # (N, 2)
-                edges_21 = edges_21.squeeze(0)  # (N, 2)
-
-                # Filter out NaN values
-                if edges_12.numel() > 0:
-                    valid_12 = ~torch.isnan(edges_12).any(dim=1)
-                    edges_12 = edges_12[valid_12]
-
-                if edges_21.numel() > 0:
-                    valid_21 = ~torch.isnan(edges_21).any(dim=1)
-                    edges_21 = edges_21[valid_21]
-
-                # compute loss, clone and detach since they are created without grads
-                dt_field_1 = image_i["dt_field"]
-                dt_field_2 = image_j["dt_field"]
-                edge_loss_12 = sample_distance_field(
-                    dt_field_2, edges_12, device=self.device
-                )
-
-                edge_loss_21 = sample_distance_field(
-                    dt_field_1, edges_21, device=self.device
-                )
-
-                # average over points per image
-                residuals_list.append(edge_loss_12.mean())
-                residuals_list.append(edge_loss_21.mean())
-
-        residuals = torch.stack(residuals_list)  # (num_pairs,)
-        return residuals
 
     def _create_batched_inputs(self, sampled_viewgraph):
         """Prepare batched inputs for the batched optimization step given a list of pairs from the viewgraph."""
