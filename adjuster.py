@@ -39,8 +39,8 @@ from helpers.load import (
     load_and_preprocess_images,
     load_and_preprocess_depths,
 )
-from losses.loss import (
-    compute_distance_field,
+from losses.dt_loss import (
+    compute_distance_field_cv2,
     sample_distance_field,
 )
 from helpers.reprojection import (
@@ -60,7 +60,6 @@ from modules.pose import PoseModule
 from modules.parameters_module import ParameterModule
 from modules.depth import DepthModule
 from modules.edges3d import Edges3DModule
-
 
 import sys
 
@@ -941,6 +940,7 @@ class Adjuster(nn.Module):
             reprojection_error=3.0,
             use_amp=self.use_amp,
         )
+
         self.viewgraph = viewgraph
         self.viewgraph.sort(key=lambda x: (x[0], x[1]))
 
@@ -1005,7 +1005,7 @@ class Adjuster(nn.Module):
         dt_fields_shapes = []
         for image_name in tqdm(self.images.keys(), desc="Computing distance fields"):
             edges_map = self.images[image_name]["edges_map"]
-            dt_field = compute_distance_field(
+            dt_field = compute_distance_field_cv2(
                 edges_map,
                 device=self.device,
             )
