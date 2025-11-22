@@ -294,6 +294,7 @@ class Adjuster(nn.Module):
         self,
         max_steps=100,
         batch_size=128,  # faster than 64 and 256
+        early_stopping=True,
         loss_robustifier=True,
         verbose=True,
     ):
@@ -304,7 +305,9 @@ class Adjuster(nn.Module):
             batch_size (int): Maximum number of image pairs per batch.
                             In "quick" mode: samples this many pairs and backprops immediately.
                             In "full" mode: batch size for accumulation over full viewgraph.
-            gradient_tolerance (float): Tolerance for gradient-based convergence.
+            early_stopping (bool): Whether to stop early if learning rate reaches minimum.
+            loss_robustifier (bool): Whether to use a robust loss function.
+            verbose (bool): Whether to print progress.
         """
         time_start = time.time()
 
@@ -395,7 +398,9 @@ class Adjuster(nn.Module):
                 )
 
             # Stopping criterion: stop when lr stops decreasing
-            if current_lr <= self.scheduler_params.get("min_lr", 1e-4):
+            if early_stopping and current_lr <= self.scheduler_params.get(
+                "min_lr", 1e-4
+            ):
                 print(
                     f"Learning rate reached minimum threshold {current_lr:.2e}"
                     + f" <= {self.scheduler_params.get('min_lr', 1e-4):.2e}. "
@@ -593,6 +598,7 @@ class Adjuster(nn.Module):
 
         # collect per-batch results in a python list (tensors)
         residuals_list = []
+        # i might want to process batches of same size and drop last batch
         for sampled_viewgraph in sampled_viewgraphs:
             s_time = time.time()
             batch, pad_masks, dt_fields = self._create_batched_inputs(sampled_viewgraph)
