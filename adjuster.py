@@ -108,7 +108,7 @@ class Adjuster(nn.Module):
         sky_mask_path=None,
         lr=1e-3,
         single_camera_per_folder=True,
-        load_with_pad=True,
+        load_with_pad=False,
         detector="canny",
         device="cuda",
         max_workers=-1,
@@ -119,10 +119,12 @@ class Adjuster(nn.Module):
         use_amp=True,
         amp_dtype=torch.bfloat16,  # torch.float16
         matcher_type="frustums",  # or "sequential"
+        sequential_matcher_window=5,  # only for sequential matcher
+        scene_type="outdoor",  # or "indoor", "object_centric" (not used yet)
         grad_q=True,
         grad_t=True,
         grad_k=True,
-        grad_z=False,
+        grad_z=True,
         q_lr_scale=0.1,
         t_lr_scale=1.0,
         k_lr_scale=0.5,
@@ -143,6 +145,7 @@ class Adjuster(nn.Module):
         self.depths_path = depths_path
         self.reconstruction_path = reconstruction_path
         self.single_camera_per_folder = single_camera_per_folder
+        self.sequential_matcher_window = sequential_matcher_window
         self.convergence = False
         self.use_amp = use_amp
         self.amp_dtype = amp_dtype
@@ -151,6 +154,7 @@ class Adjuster(nn.Module):
         self.viewgraph_path = viewgraph_path
         self.matcher_type = matcher_type
         self.scheduler_params = scheduler_params
+        self.scene_type = scene_type
 
         # Edge extractor
         if detector == "canny":
@@ -197,15 +201,15 @@ class Adjuster(nn.Module):
         self._read_cameras_from_reconstruction()  # into self.images and self.intrinsics
         self.timings["load_poses_and_intrinsics"] = time.time() - s_time
 
-        ## Extract edges
-        s_time = time.time()
-        self._extract_edges()  # into self.images
-        self.timings["extract_edges"] = time.time() - s_time
-
         ## Load depth maps
         s_time = time.time()
         self._load_and_preprocess_depths()
         self.timings["load_depth_maps"] = time.time() - s_time
+
+        ## Extract edges
+        s_time = time.time()
+        self._extract_edges()  # into self.images
+        self.timings["extract_edges"] = time.time() - s_time
 
         ## Viewgraph from frustums
         s_time = time.time()
@@ -303,6 +307,8 @@ class Adjuster(nn.Module):
         self.loss_list = []
         self.lr_list = {}
         self.auc_list = {}
+        self.blacklist = set()  # Add this line
+
         self.seed = seed
         self.fix_seed()
 
@@ -315,6 +321,7 @@ class Adjuster(nn.Module):
         batch_size=128,
         early_stopping=True,
         verbose=True,
+        drop_last=True,
     ):
         """
         Main optimization loop.
@@ -324,12 +331,13 @@ class Adjuster(nn.Module):
                             In "quick" mode: samples this many pairs and backprops immediately.
                             In "full" mode: batch size for accumulation over full viewgraph.
             early_stopping (bool): Whether to stop early if learning rate reaches minimum.
-            loss_robustifier (bool): Whether to use a robust loss function.
             verbose (bool): Whether to print progress.
+            drop_last (bool): Whether to drop the last batch if smaller than batch_size.
         """
         time_start = time.time()
 
-        num_batches = math.ceil(len(self.viewgraph) / batch_size)
+        num_batches = len(self.viewgraph) // batch_size
+        num_batches = num_batches if drop_last else num_batches + 1
         max_steps = max_steps if max_steps > 0 else 1_000
         if verbose:
             print(
@@ -365,7 +373,9 @@ class Adjuster(nn.Module):
             self.timings["step_pre_computation"] += time.time() - t_pre
 
             # Compute residuals
-            residuals = self.compute_forward_step(self.viewgraph, batch_size=batch_size)
+            residuals = self.compute_forward_step(
+                self.viewgraph, batch_size=batch_size, drop_last=drop_last
+            )
 
             # Compute loss
             loss = self._compute_batched_loss(residuals)
@@ -503,7 +513,9 @@ class Adjuster(nn.Module):
 
         return batch, pad_masks, dt_fields
 
-    def compute_forward_step(self, sampled_viewgraph, batch_size=1024, chunk_size=4096):
+    def compute_forward_step(
+        self, sampled_viewgraph, batch_size=1024, chunk_size=4096, drop_last=False
+    ):
         """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss."""
 
         # s_time = time.time()
@@ -521,6 +533,8 @@ class Adjuster(nn.Module):
         residuals_list = []
         # i might want to process batches of same size and drop last batch
         for sampled_viewgraph in sampled_viewgraphs:
+            if drop_last and len(sampled_viewgraph) < batch_size:
+                continue
             # prepare batched inputs
             s_time = time.time()
             batch, pad_masks, dt_fields = self._create_batched_inputs(sampled_viewgraph)
@@ -744,13 +758,6 @@ class Adjuster(nn.Module):
                         self.device, dtype=self.dtype
                     )
 
-        # add sampled depth at edges_padded locations
-        for image_name in self.images.keys():
-            edges_padded = self.images[image_name]["edges_padded"]  # (N, 2)
-            depth = self.images[image_name]["depth"]  # (H, W)
-            sampled_depth, _ = grid_sample_nan(edges_padded[None], depth[None])
-            self.images[image_name]["sampled_depth"] = sampled_depth.squeeze()
-
     def _load_and_preprocess_sky_masks(self, path):
         """Load and preprocess sky masks from the given path."""  # Not sure if working properly
         if path is None:
@@ -841,7 +848,7 @@ class Adjuster(nn.Module):
             )
 
     @torch.no_grad()
-    def _compute_viewgraph(self, type="frustums", window_size=10):
+    def _compute_viewgraph(self, type="frustums"):
         """Compute viewgraph and filter by reprojection error and returns the sorted viewgraph."""
         if type == "frustums":
             # Estimate view graph from frustums
@@ -860,8 +867,8 @@ class Adjuster(nn.Module):
             # Build sequential viewgraph based on sorted image names with a window size of 10
             image_names = sorted(list(self.images.keys()))
             viewgraph = []
-            for i in range(len(image_names) - window_size):
-                for j in range(1, window_size + 1):
+            for i in range(len(image_names) - self.sequential_matcher_window):
+                for j in range(1, self.sequential_matcher_window + 1):
                     viewgraph.append((image_names[i], image_names[i + j]))
 
         elif type == "exhaustive":
@@ -871,6 +878,7 @@ class Adjuster(nn.Module):
             for i in range(len(image_names)):
                 for j in range(i + 1, len(image_names)):
                     viewgraph.append((image_names[i], image_names[j]))
+
         else:
             raise ValueError(f"Viewgraph type {type} not supported.")
 
@@ -879,32 +887,89 @@ class Adjuster(nn.Module):
             self,
             viewgraph,
             self.images,
-            min_points=100,  # tune this
+            min_points=1000,  # tune this
             sampling_factor=10,
             reprojection_error=3.0,
+            border=10,
             use_amp=self.use_amp,
         )
 
         self.viewgraph = viewgraph
         self.viewgraph.sort(key=lambda x: (x[0], x[1]))
 
-    def _load_viewgraph(self):
-        """Load viewgraph from a text file formamted as [(img_i, img_j), ...]."""
-        with open(self.viewgraph_path, "r") as f:
-            lines = f.readlines()
-        self.viewgraph = []
-        for line in lines:
-            i, j, _ = line.strip().split()
-            self.viewgraph.append((i, j))
-        print(
-            f"Loaded GT viewgraph with {len(self.viewgraph):,} edges from {viewgraph_path}"
-        )
+    def filter_images_by_registration_time(self, threshold=1 / 3):
+        """
+        Blacklist images with poor registration times.
+        These images will be skipped during optimization and reconstruction.
+
+        Args:
+            threshold (float): Threshold for filtering (default 0.3)
+
+        Returns:
+            list: Names of blacklisted images
+        """
+        blacklisted = [
+            img_name
+            for img_name, reg_time in self.times_image_was_registered.items()
+            if reg_time < threshold
+        ]
+
+        if blacklisted:
+            self.blacklist = set(blacklisted)
+            # Filter viewgraph
+            original_pairs = len(self.viewgraph)
+            new_viewgraph = [
+                (i, j)
+                for i, j in self.viewgraph
+                if i not in self.blacklist and j not in self.blacklist
+            ]
+            self.viewgraph = new_viewgraph
+            removed_pairs = original_pairs - len(self.viewgraph)
+            print(
+                f"Blacklisted {len(blacklisted)} images with registration time < {threshold:.3f}"
+            )
+            print(f"Removed {removed_pairs:,} viewgraph pairs")
+        else:
+            print(f"No images found with registration time < {threshold:.3f}")
 
     ### Edges
-    def _extract_edges(self):
+    def _extract_edges(self, min_percentile=5, max_percentile=75):
         for image_name in tqdm(self.images.keys(), desc=f"Extracting edges"):
             img_tensor = self.images[image_name]["image"].unsqueeze(0)
             edges_map = self.edge_extractor(img_tensor)
+
+            # --- NEW: Filter edges at depth discontinuities for object-centric scenes ---
+            if (
+                self.scene_type == "object_centric"
+                and "depth" in self.images[image_name]
+            ):
+                depth = self.images[image_name]["depth"].squeeze()  # (H, W)
+
+                valid_depth_mask = (depth > 0) & (~torch.isnan(depth))
+                depth_jump_mask = torch.zeros_like(depth, dtype=torch.bool)
+
+                # 2. Filter point too close or too far depth wise
+                background_mask = torch.zeros_like(depth, dtype=torch.bool)
+                if valid_depth_mask.any():
+                    # Compute 75th percentile of valid depth values
+                    valid_depths = depth[valid_depth_mask]
+                    depth_p75 = torch.quantile(valid_depths, max_percentile / 100.0)
+                    background_mask = (depth > depth_p75) & valid_depth_mask
+
+                    # exclude also very close depths (e.g., depth < 5th percentile)
+                    depth_p5 = torch.quantile(valid_depths, min_percentile / 100.0)
+                    background_mask = background_mask | (depth < depth_p5)
+
+                # Combine masks: remove jumps AND background
+                mask_to_remove = depth_jump_mask | background_mask
+
+                # Apply mask
+                edges_map = edges_map.squeeze()  # (H, W)
+                # Use multiplication for masking float tensor
+                edges_map = edges_map * (~mask_to_remove).float()
+                edges_map = edges_map.unsqueeze(0)  # Restore (1, H, W)
+            # ----------------------------------------------------------------------------
+
             edges = edges_map.squeeze().nonzero().flip(dims=(1, 0))  # (N, 2)
             self.images[image_name].update(
                 {
@@ -915,6 +980,13 @@ class Adjuster(nn.Module):
 
         # pad to have same number of edges per image
         self._pad_edges()
+
+        # add sampled depth at edges_padded locations
+        for image_name in self.images.keys():
+            edges_padded = self.images[image_name]["edges_padded"]  # (N, 2)
+            depth = self.images[image_name]["depth"]  # (H, W)
+            sampled_depth, _ = grid_sample_nan(edges_padded[None], depth[None])
+            self.images[image_name]["sampled_depth"] = sampled_depth.squeeze()
 
     def _pad_edges(self):
         """Pad all edges to have same number (max_edges) of edges per image."""
@@ -1340,14 +1412,8 @@ class Adjuster(nn.Module):
             batch, pad_masks, dt_fields = self._create_batched_inputs(sampled_vg)
 
             # Project edges and compute residuals
-            edges_reprojected = project_world_to_2D(
-                **batch
-            )  # (2, N, 2) - both directions
-            residuals = sample_distance_field(
-                dt_fields, edges_reprojected, device=self.device
-            ).squeeze(
-                1
-            )  # (2, N)
+            edges_reprojected, _ = project_world_to_2D(**batch)  # unpack tuple
+            residuals = sample_distance_field(dt_fields, edges_reprojected).squeeze(1)
 
             # Process forward direction (i->j)
             res_ij = residuals[0]  # (N,)

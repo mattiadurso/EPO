@@ -92,7 +92,7 @@ def dbscan_filter(reconstruction, eps=0.5, min_samples=20):
 
 @torch.no_grad()
 def build_reconstruction(
-    self,
+    adjuster,
     output_path="optimized_reconstruction",
     save_points=True,
     verbose=False,
@@ -105,6 +105,7 @@ def build_reconstruction(
     Create a pycolmap.Reconstruction from images and intrinsics dictionaries.
 
     Args:
+        adjuster: Adjuster instance with images, poses, and intrinsics
         output_path: path to save the reconstruction
         save_points: whether to save 3D points from depth unprojection
         max_points_per_image: maximum number of 3D points per image (default: 100_000)
@@ -117,9 +118,12 @@ def build_reconstruction(
     # 1. Add cameras - we need to handle different scales per image
     # Group images by camera to find the appropriate scale
     camera_scales = {}
-    for image_name, image_data in self.images.items():
+    unique_cam_ids = set()
+
+    for image_name, image_data in adjuster.images.items():
         cam_id = image_data["cam_id"]
         scale = image_data.get("scale", 1.0)
+        unique_cam_ids.add(cam_id)
 
         if cam_id not in camera_scales:
             camera_scales[cam_id] = []
@@ -129,9 +133,11 @@ def build_reconstruction(
     for cam_id in camera_scales:
         camera_scales[cam_id] = np.median(camera_scales[cam_id])
 
-    for cam_id in self.intrinsics.keys:
+    for (
+        cam_id
+    ) in unique_cam_ids:  # Fixed: iterate over unique camera IDs found in images
         # Get camera parameters as numpy array
-        model, params = self.intrinsics.get_camera_parameters(cam_id)
+        model, params = adjuster.intrinsics.get_camera_parameters(cam_id)
         params = params.detach().cpu().numpy()
 
         # Get scale for this camera
@@ -157,7 +163,7 @@ def build_reconstruction(
 
         # Get image dimensions from first image with this cam_id
         sample_image = next(
-            (img for img in self.images.values() if img["cam_id"] == cam_id), None
+            (img for img in adjuster.images.values() if img["cam_id"] == cam_id), None
         )
 
         if sample_image is None:
@@ -184,8 +190,15 @@ def build_reconstruction(
         reconstruction.add_camera(cam)
 
     # 2. Add images (poses)
-    for image_id, (image_name, image_data) in enumerate(self.images.items(), start=1):
-        # pose = self.poses.get_projection_matrix([image_name])
+    for image_id, (image_name, image_data) in enumerate(
+        adjuster.images.items(), start=1
+    ):
+        # skip if image is blacklisted
+        if image_name in adjuster.blacklist:
+            if verbose:
+                print(f"Skipping blacklisted image: {image_name}")
+            continue
+
         cam_id = image_data["cam_id"]
         scale = image_data.get("scale", 1.0)
 
@@ -193,7 +206,7 @@ def build_reconstruction(
         cam_id_int = int(cam_id) if isinstance(cam_id, str) else cam_id
 
         # Get rotation matrix and translation
-        q, t = self.poses.get_image_qt([image_name])
+        q, t = adjuster.poses.get_image_qt([image_name])
         q = q.detach().cpu().numpy()
         t = t.detach().cpu().numpy()
 
@@ -217,32 +230,36 @@ def build_reconstruction(
             print("Unprojecting depth maps to 3D points...")
 
         # Compute fresh 3D world coordinates
-        self._unproject_edges_to_3D()
+        adjuster._unproject_edges_to_3D()
 
         total_points = 0
+        image_names = sorted(list(adjuster.images.keys()))
 
-        for image_id, (image_name, image_data) in enumerate(
-            self.images.items(), start=1
-        ):
+        for image_id, image_name in enumerate(image_names, start=1):
+            # Skip blacklisted images
+            if image_name in adjuster.blacklist:
+                if verbose:
+                    print(f"Skipping blacklisted image: {image_name}")
+                continue
+            image_data = adjuster.images[image_name]
             cam_id = image_data["cam_id"]
             scale = image_data.get("scale", 1.0)
 
-            # Get unprojected 3D points in world coordinates (at scaled resolution)
-            edges_3D = image_data.get("edges_3D", None)  # (N, 3)
-            pad_mask = image_data.get("pad_mask", None)  # (N,)
+            # Get unprojected 3D points from edges_3D module
+            points_3D = adjuster.edges_3D.get_parameters([image_name])  # (1, N, 3)
+            points_3D = points_3D[0]  # (N, 3)
 
-            if edges_3D is None or pad_mask is None:
-                if verbose:
-                    print(f"No edges_3D or pad_mask for {image_name}, skipping...")
-                continue
+            # Get pad mask
+            pad_mask = adjuster.pad_masks.get_parameters([image_name])  # (1, N)
+            pad_mask = pad_mask[0]  # (N,)
 
-            # Convert to numpy
-            edges_3D_np = edges_3D.detach().cpu().numpy()  # (N, 3)
-            pad_mask_np = pad_mask.detach().cpu().numpy()  # (N,)
+            # Convert to numpy if needed
+            if torch.is_tensor(pad_mask):
+                pad_mask = pad_mask.detach().cpu().numpy()
 
             # Filter by pad mask (only valid edges, ignore padded entries)
-            valid_mask = pad_mask_np > 0
-            valid_3D = edges_3D_np[valid_mask]  # (M, 3)
+            valid_mask = pad_mask > 0
+            valid_3D = points_3D[valid_mask]  # (M, 3)
             valid_indices = np.where(valid_mask)[0]
 
             if len(valid_3D) == 0:
@@ -250,15 +267,21 @@ def build_reconstruction(
                     print(f"No valid edges for {image_name}")
                 continue
 
+            # Convert to numpy if needed
+            if torch.is_tensor(valid_3D):
+                valid_3D = valid_3D.detach().cpu().numpy()
+            if torch.is_tensor(valid_indices):
+                valid_indices = valid_indices.detach().cpu().numpy()
+
             # Scale points back to original resolution
-            # points_3D is in downsampled world space, multiply by scale to expand to original
             valid_3D = valid_3D / scale
 
             # Sample uniformly up to max_points_per_image
             num_valid = len(valid_3D)
-            if num_valid > max_points_per_image:
+            max_points_int = int(max_points_per_image)
+            if num_valid > max_points_int:
                 sample_idx = np.random.choice(
-                    num_valid, size=max_points_per_image, replace=False
+                    num_valid, size=max_points_int, replace=False
                 )
                 valid_3D = valid_3D[sample_idx]
                 valid_indices = valid_indices[sample_idx]
@@ -266,9 +289,10 @@ def build_reconstruction(
             # Get RGB values from original image
             if "image" in image_data:
                 image = image_data["image"].detach().cpu().numpy()  # (3, H, W)
-                edges_padded = (
-                    image_data["edges_padded"].detach().cpu().numpy()
-                )  # (N, 2)
+                edges_padded = adjuster.edges_padded.get_parameters(
+                    [image_name]
+                )  # (1, N, 2)
+                edges_padded = edges_padded[0].detach().cpu().numpy()  # (N, 2)
 
                 # Get coordinates of valid edges
                 valid_edges = edges_padded[valid_indices]
