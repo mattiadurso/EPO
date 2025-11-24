@@ -127,7 +127,7 @@ def from_homogeneous(points: Tensor) -> Tensor:
     return output
 
 
-def filter_outside(xy: Tensor, shape: Tensor, border: int = 0) -> Tensor:
+def filter_outside_nans(xy: Tensor, shape: Tensor, border: int = 0) -> Tensor:
     """set as nan all the points that are not inside rectangle
     Args:
         xy: Points to filter (B, n, 2)
@@ -177,7 +177,9 @@ def project_to_2D(
     xy_proj = from_homogeneous(xy_proj_hom).to(original_dtype)  # B,n,2
 
     # filter points outside img_shape
-    xy_proj, outside_mask = filter_outside(xy_proj, img_shape, border)
+    # xy_proj, outside_mask = filter_outside_zeros(xy_proj, img_shape, border)
+    xy_proj, outside_mask = filter_outside_nans(xy_proj, img_shape, border)
+
     return xy_proj, outside_mask
 
 
@@ -200,4 +202,4 @@ def project_world_to_2D(
 
     xy_proj, outside_mask = project_to_2D(xyz_camera1, K1, img1_shape, border)
 
-    return xy_proj
+    return xy_proj, outside_mask
