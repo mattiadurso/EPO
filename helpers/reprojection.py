@@ -1,3 +1,4 @@
+import adjuster
 import torch
 from torch import Tensor
 import torch.nn.functional as F
@@ -328,6 +329,7 @@ def filter_viewgraph_by_reprojection(
 
     # --- Step 1: Pre-compute 3D World Points for all images ---
     image_names = sorted(list(images.keys()))
+    self.times_image_was_registered = {name: 0 for name in image_names}
     name_to_idx = {name: i for i, name in enumerate(image_names)}
 
     # Collect camera parameters for all images
@@ -354,7 +356,6 @@ def filter_viewgraph_by_reprojection(
         sampled_depth = sampled_depth.squeeze(0).squeeze(0)  # (N_points,)
 
         # Unproject to World
-        # unsqueeze batch dim for the compiled function
         pts_world = unproject_2D_to_world(
             grid[None], Ks[i : i + 1], sampled_depth[None], Ps[i : i + 1]
         )  # (1, N_points, 3)
@@ -372,9 +373,9 @@ def filter_viewgraph_by_reprojection(
     vg_tensor = torch.tensor(vg_indices, dtype=torch.long, device=device)
     num_pairs = len(viewgraph)
 
-    print(f"Filtering {num_pairs:,} pairs in batches of {batch_size}...")
+    print(f"Filtering {num_pairs:,} pairs in batches of {batch_size}")
 
-    for k in tqdm(range(0, num_pairs, batch_size), desc="Filtering Viewgraph"):
+    for k in tqdm(range(0, num_pairs, batch_size), desc="Filtering viewgraph"):
         batch_end = min(k + batch_size, num_pairs)
         batch_indices = vg_tensor[k:batch_end]  # (B, 2)
 
@@ -433,21 +434,6 @@ def filter_viewgraph_by_reprojection(
             if d_j_sampled.ndim == 3:
                 d_j_sampled = d_j_sampled.squeeze(1)
 
-            # except:
-            #     # Fallback: depths have different sizes
-            #     d_j_sampled = torch.full(
-            #         (B, max_pts), float("nan"), device=device, dtype=self.dtype
-            #     )
-            #     for b_idx in range(B):
-            #         d_map = images[image_names[idx_j[b_idx]]]["depth"]
-            #         if d_map.ndim == 2:
-            #             d_map = d_map.unsqueeze(0)
-            #         # sample single
-            #         uv = uv_proj[b_idx : b_idx + 1]  # 1, N, 2
-            #         d_val, _ = grid_sample_nan(uv, d_map.unsqueeze(0))
-            #         # d_val is (1, 1, N), squeeze makes it (N,)
-            #         d_j_sampled[b_idx] = d_val.squeeze()
-
             # 2.5 Re-unproject to World using J's depth (Round Trip)
             # pts_j_world_est: (B, N_pts, 3)
             # d_j_sampled MUST be (B, N) here.
@@ -476,6 +462,32 @@ def filter_viewgraph_by_reprojection(
             for local_idx in kept_indices_local:
                 global_idx = k + local_idx.item()
                 filtered_viewgraph.append(viewgraph[global_idx])
+
+                # add +1 if images were a valid pair
+                self.times_image_was_registered[viewgraph[global_idx][0]] += 1
+                self.times_image_was_registered[viewgraph[global_idx][1]] += 1
+
+        # Count how many pairs each image appears in within the filtered viewgraph
+
+    freq = {}
+    for pair in filtered_viewgraph:
+        i, j = pair
+        if i not in freq:
+            freq[i] = 1
+        else:
+            freq[i] += 1
+        if j not in freq:
+            freq[j] = 1
+        else:
+            freq[j] += 1
+
+    # Normalize: divide by how many pairs the image appears in
+    for image_name in self.times_image_was_registered.keys():
+        if image_name in freq:
+            self.times_image_was_registered[image_name] /= freq[image_name]
+        else:
+            # Image doesn't appear in any filtered pair
+            self.times_image_was_registered[image_name] = 0.0
 
     print(f"Filtered viewgraph: {len(filtered_viewgraph):,} pairs retained")
     return filtered_viewgraph
