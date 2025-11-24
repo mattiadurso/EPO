@@ -42,6 +42,7 @@ from helpers.load import (
 from losses.dt_loss import (
     compute_distance_field_cv2,
     sample_distance_field,
+    compute_chunk_loss_logic,
 )
 from helpers.reprojection import (
     filter_viewgraph_by_reprojection,
@@ -51,6 +52,7 @@ from helpers.reprojection import (
 from helpers.reprojection_compiled import (
     unproject_2D_to_world,
     project_world_to_2D,
+    project_and_sample_logic,
 )
 from helpers.reconstruction import build_reconstruction
 from helpers.frustum import build_view_graph_from_frustums
@@ -133,7 +135,7 @@ class Adjuster(nn.Module):
         assert detector in ["canny"], f"Detector {detector} not supported."
 
         self.max_workers = os.cpu_count() if max_workers < 0 else max_workers
-        self.images_size = 518  # square size to which images are resized
+        self.images_size = 518
         self.device = device
         self.lr = lr
         self.load_with_pad = load_with_pad
@@ -308,7 +310,7 @@ class Adjuster(nn.Module):
     def forward(
         self,
         max_steps=100,
-        batch_size=128,  # faster than 64 and 256
+        batch_size=128,
         early_stopping=True,
         loss_robustifier=True,
         verbose=True,
@@ -384,7 +386,7 @@ class Adjuster(nn.Module):
             # DEBUG: Evaluate AUC if GT available
             if self.gt_path is not None and step % 1 == 0:
                 auc_th = [1, 3, 5]
-                opt = "/home/mattia/Desktop/Repos/batchsfm/optimized_reconstruction_GD"
+                opt = "optimized_reconstruction_GD"
                 self.to_colmap(opt, save_points=False, verbose=False)
                 AUC_score_max, num_images, df_optim = eval_colmap_model(
                     opt, self.gt_path, return_df=False, thrs=auc_th
@@ -422,9 +424,7 @@ class Adjuster(nn.Module):
         self.print_summary() if verbose else None
 
     ### Forward and backward helpers ###
-    def _read_cameras_from_reconstruction(
-        self,
-    ):
+    def _read_cameras_from_reconstruction(self):
         intrinsics = {}
 
         # Read cameras intrinsics
@@ -442,7 +442,7 @@ class Adjuster(nn.Module):
                     intrinsics[cam_id] = {
                         "cam_id": cam_id,
                         "model": model,
-                        "parameters": [new_params],  # Changed: store as list initially
+                        "parameters": [new_params],
                     }
                 else:
                     # Append new params to the list
@@ -475,9 +475,6 @@ class Adjuster(nn.Module):
         cam_id_to_tensor_id = {}
         k_models, k_params = [], []
         for idx, cam_id in enumerate(intrinsics.keys()):
-            # intrinsics[cam_id] = Camera(
-            #     **intrinsics[cam_id], grad=self.grad_k, device=self.device
-            # )
             cam_id_to_tensor_id[cam_id] = idx
             k_models.append(intrinsics[cam_id]["model"])
             k_params.append(intrinsics[cam_id]["parameters"])
@@ -555,7 +552,7 @@ class Adjuster(nn.Module):
             )  # (bs, N, 3)
             points_3D_list.append(pts3d)
 
-        points_3D = torch.cat(points_3D_list, dim=0)  # (B, N, 3)
+        points_3D = torch.cat(points_3D_list, dim=0)
 
         # Store points_3D in Edges3DModule
         self.edges_3D = Edges3DModule(
@@ -620,7 +617,7 @@ class Adjuster(nn.Module):
             batch, pad_masks, dt_fields = self._create_batched_inputs(sampled_viewgraph)
             self.timings["prepare_batched_inputs"] += time.time() - s_time
 
-            # actual inference - keep NaN values
+            # actual inference
             s_time = time.time()
             # amp not really helping
             with torch.amp.autocast(
@@ -629,34 +626,46 @@ class Adjuster(nn.Module):
                 enabled=self.use_amp,
             ):
                 s_time = time.time()
-                edges_reprojected, outside_mask = project_world_to_2D(
-                    **batch
-                )  # (B, N, 2)
+
+                # --- FUSED KERNEL 1: PROJECTION & SAMPLING ---
+                # project_and_sample_logic ensures outputs are clean (no NaNs)
+                # outside_mask marks invalid points
+                residuals, outside_mask = project_and_sample_logic(
+                    batch["xyz_world"],
+                    batch["K1"],
+                    batch["P1"],
+                    batch["img1_shape"],
+                    dt_fields,
+                    border=0,
+                )
                 self.timings["batched_reprojection"] += time.time() - s_time
 
-                # residuals sampling # (B, 1, N) -> (B, N)
-                residuals = sample_distance_field(
-                    dt_fields, edges_reprojected, device=self.device
-                ).squeeze(1)
+                # --- FUSED KERNEL 2: CHUNKED REDUCTION ---
+                # Combine the original pad_mask with the new projection validity mask
+                # Only process points that were valid originally AND projected validly
+                valid_mask = (pad_masks > 0) & (~outside_mask)
 
-                # chunked reduction to avoid OOM
                 B, N = residuals.shape
                 dtype = residuals.dtype
-                zero = torch.tensor(0.0, device=self.device, dtype=dtype)
-                valid_sums = torch.zeros(B, device=self.device, dtype=dtype)
-                valid_counts = torch.zeros(B, device=self.device, dtype=torch.long)
+
+                total_sum = torch.zeros(B, device=self.device, dtype=dtype)
+                total_count = torch.zeros(B, device=self.device, dtype=torch.long)
 
                 for i in range(0, N, chunk_size):
-                    r_chunk = residuals[:, i : i + chunk_size]  # (B, chunk)
-                    m_chunk = pad_masks[:, i : i + chunk_size]  # (B, chunk)
-                    non_nan = ~torch.isnan(r_chunk)
-                    mask = non_nan & (m_chunk > 0)
-                    valid_sums += torch.where(mask, r_chunk, zero).sum(dim=1)
-                    valid_counts += mask.sum(dim=1).to(torch.long)
+                    r_chunk = residuals[:, i : i + chunk_size]
+                    m_chunk = valid_mask[:, i : i + chunk_size]
 
-                valid_counts_f = valid_counts.to(dtype)
+                    # Pass the clean residual chunk and the merged validity mask
+                    s_chunk, c_chunk = compute_chunk_loss_logic(r_chunk, m_chunk)
+
+                    total_sum += s_chunk
+                    total_count += c_chunk
+
+                zero = torch.tensor(0.0, device=self.device, dtype=dtype)
                 mean_losses = torch.where(
-                    valid_counts > 0, valid_sums / valid_counts_f.clamp(min=1.0), zero
+                    total_count > 0,
+                    total_sum / total_count.to(dtype).clamp(min=1.0),
+                    zero,
                 )
 
                 # collect this batch's results
@@ -667,28 +676,22 @@ class Adjuster(nn.Module):
 
         return residuals
 
-    def _compute_batched_loss(self, residuals, robustifier=False, delta=1.0):
+    def _compute_batched_loss(self, residuals, delta=1.0):
         """Vectorized batched loss computation."""
         s_time = time.time()
 
         if residuals.numel() == 0:
             return torch.tensor(0.0, device=self.device)
 
-        ## Ensure even number of residuals (forward/backward pairs)
-        # assert residuals.shape[0] % 2 == 0, "Residual batch size must be even (pairs)."
+        residuals_pairs = residuals.view(-1, 2)
 
-        # Group pairs: reshape (num_pairs*2,) -> (num_pairs, 2)
-        residuals_pairs = residuals.view(-1, 2)  # (num_pairs, 2)
-
-        # Sum i->j and j->i directions which are now in the same row
-        if robustifier:
-            # Use Huber loss for robust cost
-            pair_losses = F.huber_loss(
-                residuals_pairs,
-                torch.zeros_like(residuals_pairs),
-                reduction="none",
-                delta=delta,
-            )
+        # Use Huber loss for robust cost
+        pair_losses = F.huber_loss(
+            residuals_pairs,
+            torch.zeros_like(residuals_pairs),
+            reduction="none",
+            delta=delta,
+        )
         pair_losses = residuals_pairs.sum(dim=1)  # (num_pairs,)
 
         # Mean over pairs
@@ -835,17 +838,6 @@ class Adjuster(nn.Module):
                 grad=self.grad_z,
             )
 
-        # # Verify consistency
-        # for image_name in self.images.keys():
-        #     n_valid_edges = torch.sum(
-        #         ~torch.isnan(self.images[image_name]["edges_padded"]).any(dim=1)
-        #     )
-        #     n_pad_mask = torch.sum(self.images[image_name]["pad_mask"])
-
-        #     assert (
-        #         n_valid_edges == n_pad_mask
-        #     ), f"Mismatch for {image_name}: edges={n_valid_edges}, pad_mask={n_pad_mask}"
-
     @torch.no_grad()
     def _compute_viewgraph(self, type="frustums", window_size=10):
         """Compute viewgraph and filter by reprojection error and returns the sorted viewgraph."""
@@ -880,7 +872,7 @@ class Adjuster(nn.Module):
         else:
             raise ValueError(f"Viewgraph type {type} not supported.")
 
-        # Filter viewgraph by reprojection | This need to be runned as batch and speeded up
+        # Filter viewgraph by reprojection
         viewgraph = filter_viewgraph_by_reprojection(
             self,
             viewgraph,
@@ -1019,7 +1011,6 @@ class Adjuster(nn.Module):
         print(f"  {'Total':}: {total_params:>12,} parameters\n")
 
     def _load_optimizer(self, params):
-        # Build parameter groups only for parameters that exist
         param_groups = []
         if "t" in params:
             param_groups.append(
@@ -1398,7 +1389,6 @@ class Adjuster(nn.Module):
     def _save_residual_visualization(
         self, res_map_ij, res_map_ji, img_i, img_j, output_dir, pair_idx, percentile
     ):
-        """Save residual maps as images with original images and edge maps."""
         import matplotlib.pyplot as plt
         from matplotlib.colors import Normalize
 
@@ -1520,7 +1510,6 @@ class Adjuster(nn.Module):
         return residual_map
 
 
-# Main
 if __name__ == "__main__":
 
     scene = "vienna_state_opera"
@@ -1537,7 +1526,6 @@ if __name__ == "__main__":
         reconstruction_path=reconstruction_path,
         images_path=images_path,
         depths_path=depths_path,
-        # viewgraph_path=viewgraph_path,  # if None, it uses the one in the reconstruction_path
         single_camera_per_folder=True,
         load_with_pad=False,
         lr=5e-3,
@@ -1547,8 +1535,8 @@ if __name__ == "__main__":
         grad_z=True,
         scheduler_name="ReduceLROnPlateau",
         scheduler_params={"factor": 0.75, "patience": 2, "min_lr": 1e-6},
-        gt_path=gt_path,  # slows down a bit the optimization but useful for eval
-        # viz=True,
+        gt_path=gt_path,
+        viz=True,
         detector_params={
             "low_threshold": 0.20,
             "high_threshold": 0.25,

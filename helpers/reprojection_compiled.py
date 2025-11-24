@@ -1,7 +1,9 @@
 import torch
 from torch import Tensor
+from losses.dt_loss import sample_distance_field
 
 BOTTOM_ROW_TEMPLATE = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]])
+
 ### From 2D to 3D world coordinates
 
 
@@ -130,12 +132,14 @@ def from_homogeneous(points: Tensor) -> Tensor:
     return output
 
 
-def filter_outside_nans(xy: Tensor, shape: Tensor, border: int = 0) -> Tensor:
-    """set as nan all the points that are not inside rectangle
-    Args:
-        xy: Points to filter (B, n, 2)
-        shape: Tensor of image shape. Can be 1D [H, W] or 2D [B, 2]
-        border: Border margin
+def filter_outside_safe(
+    xy: Tensor, shape: Tensor, border: int = 0
+) -> tuple[Tensor, Tensor]:
+    """
+    Identifies points outside the image.
+    Returns:
+        xy_safe: Points with outside values replaced by 0.0 (safe for graph execution)
+        outside_mask: Boolean mask where True indicates the point was outside.
     """
     # Handle both single shape [H, W] and batched shapes [B, 2]
     if shape.ndim == 1:
@@ -151,43 +155,30 @@ def filter_outside_nans(xy: Tensor, shape: Tensor, border: int = 0) -> Tensor:
         | (xy[..., 1] < border)
         | (xy[..., 1] >= H - border)
     )
-    # Use torch.where instead of indexing assignment
-    xy_filtered = torch.where(
-        outside_mask[..., None], torch.full_like(xy, float("nan")), xy
+
+    # Replace outside points with 0.0 (valid coordinate, but masked later)
+    # This prevents NaNs from propagating through the graph
+    xy_safe = torch.where(
+        outside_mask[..., None], torch.tensor(0.0, device=xy.device, dtype=xy.dtype), xy
     )
-    return xy_filtered, outside_mask # Return the outside mask as well
+
+    return xy_safe, outside_mask
 
 
 def project_to_2D(
     xyz: Tensor,
     K: Tensor,
-    # MODIFICATION: img_shape must be a Tensor or None.
-    # A Python tuple will cause recompilations.
     img_shape: Tensor,
     border: int = 0,
-) -> tuple[Tensor, Tensor]:  # MODIFICATION: Always return a tuple
-    """project 3D points to 2D using the provided intrinsics matrix K.
-    Args:
-        xyz: the 3D points
-            B,n,3
-        K: the camera intrinsics matrix
-            B,3,3
-        img_shape: if provided, set to nan the points that map out of the image and additionally return mask_outside
-        border: if img_shape is provided, set to nan the points that map out of the image border
-    Returns
-        xy_proj: the 2D projection of the 3D points
-            B,n,2
-        mask_outside: optional (if img_shape is provided). True where the point map outside img_shape
-            B,n bool
-    """
+) -> tuple[Tensor, Tensor]:
+    """project 3D points to 2D using the provided intrinsics matrix K."""
     original_dtype = xyz.dtype
     # B,3,3 * B,3,n =  B,3,n  -> B,n,3 after permutation
     xy_proj_hom = (K @ xyz.permute(0, 2, 1)).permute(0, 2, 1)
     xy_proj = from_homogeneous(xy_proj_hom).to(original_dtype)  # B,n,2
 
-    # filter points outside img_shape
-    # xy_proj, outside_mask = filter_outside_zeros(xy_proj, img_shape, border)
-    xy_proj, outside_mask = filter_outside_nans(xy_proj, img_shape, border)
+    # Use safe filtering: sets outside points to 0.0, returns mask
+    xy_proj, outside_mask = filter_outside_safe(xy_proj, img_shape, border)
 
     return xy_proj, outside_mask
 
@@ -212,3 +203,35 @@ def project_world_to_2D(
     xy_proj, outside_mask = project_to_2D(xyz_camera1, K1, img1_shape, border)
 
     return xy_proj, outside_mask
+
+
+### Forward step
+
+
+# @torch.compile(mode="reduce-overhead")
+def project_and_sample_logic(
+    xyz_world: torch.Tensor,
+    K1: torch.Tensor,
+    P1: torch.Tensor,
+    img1_shape: torch.Tensor,
+    dt_fields: torch.Tensor,
+    border: int = 0,
+):
+    """
+    Fused operation: Projection -> 2D -> Sampling.
+    Guarantees no NaNs are produced. Invalid points are zeroed out and tracked via outside_mask.
+    """
+    # 1. Project World Points to 2D
+    # uv_proj contains safe values (0.0) where points are outside
+    uv_proj, outside_mask = project_world_to_2D(xyz_world, P1, K1, img1_shape, border)
+
+    # 2. Prepare Distance Fields
+    # Ensure 4D shape (B, C, H, W) for grid_sample
+    if dt_fields.dim() == 3:
+        dt_fields = dt_fields.unsqueeze(1)
+
+    # 3. Sample Distance Field
+    # uv_proj is guaranteed safe, so we don't need NaN checks inside
+    sampled_vals = sample_distance_field(dt_fields, uv_proj)
+
+    return sampled_vals, outside_mask
