@@ -134,16 +134,22 @@ def filter_outside_nans(xy: Tensor, shape: Tensor, border: int = 0) -> Tensor:
     """set as nan all the points that are not inside rectangle
     Args:
         xy: Points to filter (B, n, 2)
-        shape: 1D Tensor [H, W] of the image shape
+        shape: Tensor of image shape. Can be 1D [H, W] or 2D [B, 2]
         border: Border margin
     """
-    # MODIFICATION: Use | (logical or) instead of + for boolean tensors.
-    # shape[0] is H, shape[1] is W
+    # Handle both single shape [H, W] and batched shapes [B, 2]
+    if shape.ndim == 1:
+        H, W = shape[0], shape[1]
+    else:
+        # shape is (B, 2). We need (B, 1) for broadcasting against (B, n)
+        H = shape[..., 0:1]
+        W = shape[..., 1:2]
+
     outside_mask = (
         (xy[..., 0] < border)
-        | (xy[..., 0] >= shape[1] - border)  # W
+        | (xy[..., 0] >= W - border)
         | (xy[..., 1] < border)
-        | (xy[..., 1] >= shape[0] - border)  # H
+        | (xy[..., 1] >= H - border)
     )
     # Use torch.where instead of indexing assignment
     xy_filtered = torch.where(
