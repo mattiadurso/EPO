@@ -369,7 +369,9 @@ class Adjuster(nn.Module):
             # Backpropagate and update using GradScaler if available
             self._scaler_and_scheduler_steps(loss)
 
+            # ============================================================
             # Logging
+            # ============================================================
             self.loss_list.append(loss.detach().item())
             current_lr = (
                 self.scheduler.get_last_lr()[0]
@@ -587,13 +589,14 @@ class Adjuster(nn.Module):
         # 3D world points to the second image of the pair
         batch["K1"] = self.intrinsics.get_intrinsic_matrix(cam_ids)
         batch["P1"] = self.poses.get_projection_matrix(images_names_ji)
+        batch["img1_shape"] = self.images_hw.get_parameters(images_names_ji[:1])
         dt_fields = self.dt_fields.get_parameters(images_names_ji)
 
         # check if all img1_shape are the same to avoid redundant data
-        shapes = self.images_hw.get_parameters(images_names_ji)
-        unique_rows = torch.unique(shapes, dim=0)
-        has_repetitions = unique_rows.shape[0] < shapes.shape[0]
-        batch["img1_shape"] = shapes[0] if has_repetitions else shapes
+        # shapes = self.images_hw.get_parameters(images_names_ji)
+        # unique_rows = torch.unique(shapes, dim=0)
+        # has_repetitions = unique_rows.shape[0] < shapes.shape[0]
+        # batch["img1_shape"] = shapes[0] if has_repetitions else shapes
 
         return batch, pad_masks, dt_fields
 
