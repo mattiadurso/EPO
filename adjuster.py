@@ -127,7 +127,7 @@ class Adjuster(nn.Module):
         t_lr_scale=1.0,
         k_lr_scale=0.5,
         z_lr_scale=0.1,
-        viz=False,  # it true del non used stuff during computation
+        viz=True,  # it true del non used stuff during computation
         gt_path=None,
     ):
         super().__init__()
@@ -146,7 +146,7 @@ class Adjuster(nn.Module):
         self.convergence = False
         self.use_amp = use_amp
         self.amp_dtype = amp_dtype
-        self.dtype = torch.float32
+        self.dtype = torch.float32  # hardcode to float32 for stability
         self.gt_path = gt_path
         self.viewgraph_path = viewgraph_path
         self.matcher_type = matcher_type
@@ -283,11 +283,13 @@ class Adjuster(nn.Module):
 
         self.timings["total_loading"] = time.time() - time_start
         self.timings["total_optimization"] = 0
+        self.timings["step_pre_computation"] = 0
         self.timings["prepare_batched_inputs"] = 0
-        self.timings["batched_reprojection"] = 0
-        self.timings["batched_loss_computation"] = 0
+        self.timings["forward_pass"] = 0
+        self.timings["loss_computation"] = 0
         self.timings["gradient_computation"] = 0
         self.timings["parameter_update"] = 0
+        self.timings["logging"] = 0
 
         # # At this point I might get rid of rgb images to save memory as not needed for edge loss
         if not viz:
@@ -312,7 +314,6 @@ class Adjuster(nn.Module):
         max_steps=100,
         batch_size=128,
         early_stopping=True,
-        loss_robustifier=True,
         verbose=True,
     ):
         """
@@ -350,34 +351,40 @@ class Adjuster(nn.Module):
             bar = range(max_steps)
 
         for step in bar:
+            t_pre = time.time()
+
             # Initialize optimizer gradients
             self.optimizer.zero_grad()
 
-            # Update at beginning of each step (after parameters changed)
+            # Update geometric modules
             self.poses.update_all_matrices()
             self.intrinsics.update_all_matrices()
 
             # Unproject point to world coordinates
             self._unproject_edges_to_3D()
+            self.timings["step_pre_computation"] += time.time() - t_pre
 
             # Compute residuals
             residuals = self.compute_forward_step(self.viewgraph, batch_size=batch_size)
 
             # Compute loss
-            loss = self._compute_batched_loss(residuals, loss_robustifier)
+            loss = self._compute_batched_loss(residuals)
 
             # Backpropagate and update using GradScaler if available
             self._scaler_and_scheduler_steps(loss)
 
-            # ============================================================
-            # Logging
-            # ============================================================
-            self.loss_list.append(loss.detach().item())
+            # save lr for stopping criterion
             current_lr = (
                 self.scheduler.get_last_lr()[0]
                 if self.scheduler is not None
                 else self.lr
             )
+            # ============================================================
+            # Logging
+            # ============================================================
+            logging_time_start = time.time()
+            self.loss_list.append(loss.detach().item())
+
             # self.lr_list.append(current_lr)
             # store lr for each group
             for i, param_group in enumerate(self.optimizer.param_groups):
@@ -400,8 +407,6 @@ class Adjuster(nn.Module):
                 for i, th in enumerate(auc_th):
                     self.auc_list[th].append(AUC_score_max[i])
 
-            current_lr = self.optimizer.param_groups[0]["lr"]
-
             if verbose:
                 bar.set_postfix(
                     loss=f"{self.loss_list[-1]:.4f}",
@@ -410,6 +415,8 @@ class Adjuster(nn.Module):
                     ),
                     lr=f"{current_lr:.2e}",
                 )
+
+                self.timings["logging"] += time.time() - logging_time_start
 
             # Stopping criterion: stop when lr stops decreasing
             if early_stopping and current_lr <= self.scheduler_params.get(
@@ -426,6 +433,177 @@ class Adjuster(nn.Module):
         self.print_summary() if verbose else None
 
     ### Forward and backward helpers ###
+
+    def _unproject_edges_to_3D(self, batch_size=None):
+        """Unproject 2D edges to 3D points for all images as a batch."""
+
+        image_names = sorted(list(self.images.keys()))
+        B = len(image_names)
+        cam_ids = [self.images[name]["cam_id"] for name in image_names]
+
+        # indexing data
+        K_batch = self.intrinsics.get_intrinsic_matrix(cam_ids)  # (B, 3, 3)
+        P_batch = self.poses.get_projection_matrix(image_names)  # (B, 4, 4)
+        edges_batch = self.edges_padded.get_parameters(image_names)  # (B, N, 2)
+        depth_batch = self.sampled_depth.get_parameters(image_names)  # (B, 1, H, W)
+
+        # Optionally chunk if batch too large for memory
+        if batch_size is None:
+            batch_size = B
+        points_3D_list = []
+
+        for i in range(0, B, batch_size):
+            xy0 = edges_batch[i : i + batch_size]
+            K0 = K_batch[i : i + batch_size]
+            depth0 = depth_batch[i : i + batch_size]
+            P0 = P_batch[i : i + batch_size]
+
+            pts3d = unproject_2D_to_world(
+                xy0=xy0, K0=K0, depth0=depth0, P0=P0
+            )  # (bs, N, 3)
+            points_3D_list.append(pts3d)
+
+        points_3D = torch.cat(points_3D_list, dim=0)
+
+        # Store points_3D in Edges3DModule
+        self.edges_3D = Edges3DModule(
+            self.edges_padded.image_to_tensor_idx, points_3D, self.device
+        )
+
+    def _create_batched_inputs(self, sampled_viewgraph):
+        """Prepare batched inputs for the batched optimization step given a list of pairs from the viewgraph."""
+        cam_ids = []
+        images_names_ij = []
+        images_names_ji = []
+        for i, j in sampled_viewgraph:  # with i,j being left (0) and right (1) images
+            # I already have unprojected points to 3D, so I only have to check that
+            # those points reproject within the image boundaries.
+
+            # these are are the ids for points 3D and their corresponding pad
+            images_names_ij.append(i)
+            images_names_ij.append(j)
+
+            # these are the ids for right images where to reproject
+            cam_ids.append(self.images[j]["cam_id"])
+            cam_ids.append(self.images[i]["cam_id"])
+            images_names_ji.append(j)
+            images_names_ji.append(i)
+
+        batch = {}
+        # 3D points in world coordinates and padd for left images
+        batch["xyz_world"] = self.edges_3D.get_parameters(images_names_ij)
+        pad_masks = self.pad_masks.get_parameters(images_names_ij)
+
+        # these are the intrinsics and poses for right images. Needed to project
+        # 3D world points to the second image of the pair
+        batch["K1"] = self.intrinsics.get_intrinsic_matrix(cam_ids)
+        batch["P1"] = self.poses.get_projection_matrix(images_names_ji)
+        batch["img1_shape"] = self.images_hw.get_parameters(images_names_ji[:1])
+        dt_fields = self.dt_fields.get_parameters(images_names_ji)
+
+        return batch, pad_masks, dt_fields
+
+    def compute_forward_step(self, sampled_viewgraph, batch_size=1024, chunk_size=4096):
+        """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss."""
+
+        # s_time = time.time()
+
+        # divide self.viewgraph in batches if len(self.viewgraph) > batch size
+        sampled_viewgraphs = []
+        if len(sampled_viewgraph) > batch_size:
+            for i in range(0, len(sampled_viewgraph), batch_size):
+                end = min(i + batch_size, len(sampled_viewgraph))
+                sampled_viewgraphs.append(sampled_viewgraph[i:end])
+        else:
+            sampled_viewgraphs.append(sampled_viewgraph)
+
+        # collect per-batch results in a python list (tensors)
+        residuals_list = []
+        # i might want to process batches of same size and drop last batch
+        for sampled_viewgraph in sampled_viewgraphs:
+            # prepare batched inputs
+            s_time = time.time()
+            batch, pad_masks, dt_fields = self._create_batched_inputs(sampled_viewgraph)
+            self.timings["prepare_batched_inputs"] += time.time() - s_time
+
+            # actual inference
+            s_time = time.time()
+            # actual inference
+            with torch.amp.autocast(
+                device_type=self.device,
+                dtype=self.amp_dtype,
+                enabled=self.use_amp,
+            ):
+                # projection and sampling
+                residuals, outside_mask = project_and_sample_logic(
+                    batch["xyz_world"],
+                    batch["K1"],
+                    batch["P1"],
+                    batch["img1_shape"],
+                    dt_fields,
+                    border=0,
+                )
+
+                # chunked computation of loss over residuals
+                valid_mask = (pad_masks > 0) & (~outside_mask)
+
+                B, N = residuals.shape
+
+                total_sum = torch.zeros(B, device=self.device, dtype=self.dtype)
+                total_count = torch.zeros(B, device=self.device, dtype=torch.long)
+
+                for i in range(0, N, chunk_size):
+                    r_chunk = residuals[:, i : i + chunk_size]
+                    m_chunk = valid_mask[:, i : i + chunk_size]
+
+                    # Pass the clean residual chunk and the merged validity mask
+                    s_chunk, c_chunk = compute_chunk_loss_logic(r_chunk, m_chunk)
+
+                    total_sum += s_chunk
+                    total_count += c_chunk
+
+                zero = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+                mean_losses = torch.where(
+                    total_count > 0,
+                    total_sum / total_count.to(self.dtype).clamp(min=1.0),
+                    zero,
+                )
+
+                # collect this batch's results
+                residuals_list.append(mean_losses)
+
+            self.timings["forward_pass"] += time.time() - s_time
+
+        # concatenate all collected batch results
+        residuals = torch.cat(residuals_list, dim=0)  # (num_pairs,)
+
+        return residuals
+
+    def _compute_batched_loss(self, residuals, delta=1.0):
+        """Vectorized batched loss computation."""
+        s_time = time.time()
+
+        if residuals.numel() == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        residuals_pairs = residuals.view(-1, 2)
+
+        # Use Huber loss for robust cost
+        pair_losses = F.huber_loss(
+            residuals_pairs,
+            torch.zeros_like(residuals_pairs),
+            reduction="none",
+            delta=delta,
+        )
+        pair_losses = residuals_pairs.sum(dim=1)  # (num_pairs,)
+
+        # Mean over pairs
+        loss = pair_losses.mean()
+
+        self.timings["loss_computation"] += time.time() - s_time
+        return loss
+
+    ### Helper functions for loading and preprocessing data ###
     def _read_cameras_from_reconstruction(self):
         intrinsics = {}
 
@@ -525,185 +703,6 @@ class Adjuster(nn.Module):
         self.poses = poses
         self.intrinsics = intrinsics
 
-    def _unproject_edges_to_3D(self, batch_size=None):
-        """Unproject 2D edges to 3D points for all images as a batch."""
-
-        image_names = sorted(list(self.images.keys()))
-        B = len(image_names)
-        cam_ids = [self.images[name]["cam_id"] for name in image_names]
-
-        # indexing data
-        K_batch = self.intrinsics.get_intrinsic_matrix(cam_ids)  # (B, 3, 3)
-        P_batch = self.poses.get_projection_matrix(image_names)  # (B, 4, 4)
-        edges_batch = self.edges_padded.get_parameters(image_names)  # (B, N, 2)
-        depth_batch = self.sampled_depth.get_parameters(image_names)  # (B, 1, H, W)
-
-        # Optionally chunk if batch too large for memory
-        if batch_size is None:
-            batch_size = B
-        points_3D_list = []
-
-        for i in range(0, B, batch_size):
-            xy0 = edges_batch[i : i + batch_size]
-            K0 = K_batch[i : i + batch_size]
-            depth0 = depth_batch[i : i + batch_size]
-            P0 = P_batch[i : i + batch_size]
-
-            pts3d = unproject_2D_to_world(
-                xy0=xy0, K0=K0, depth0=depth0, P0=P0
-            )  # (bs, N, 3)
-            points_3D_list.append(pts3d)
-
-        points_3D = torch.cat(points_3D_list, dim=0)
-
-        # Store points_3D in Edges3DModule
-        self.edges_3D = Edges3DModule(
-            self.edges_padded.image_to_tensor_idx, points_3D, self.device
-        )
-
-    def _create_batched_inputs(self, sampled_viewgraph):
-        """Prepare batched inputs for the batched optimization step given a list of pairs from the viewgraph."""
-        cam_ids = []
-        images_names_ij = []
-        images_names_ji = []
-        for i, j in sampled_viewgraph:  # with i,j being left (0) and right (1) images
-            # I already have unprojected points to 3D, so I only have to check that
-            # those points reproject within the image boundaries.
-
-            # these are are the ids for points 3D and their corresponding pad
-            images_names_ij.append(i)
-            images_names_ij.append(j)
-
-            # these are the ids for right images where to reproject
-            cam_ids.append(self.images[j]["cam_id"])
-            cam_ids.append(self.images[i]["cam_id"])
-            images_names_ji.append(j)
-            images_names_ji.append(i)
-
-        batch = {}
-        # 3D points in world coordinates and padd for left images
-        batch["xyz_world"] = self.edges_3D.get_parameters(images_names_ij)
-        pad_masks = self.pad_masks.get_parameters(images_names_ij)
-
-        # these are the intrinsics and poses for right images. Needed to project
-        # 3D world points to the second image of the pair
-        batch["K1"] = self.intrinsics.get_intrinsic_matrix(cam_ids)
-        batch["P1"] = self.poses.get_projection_matrix(images_names_ji)
-        batch["img1_shape"] = self.images_hw.get_parameters(images_names_ji[:1])
-        dt_fields = self.dt_fields.get_parameters(images_names_ji)
-
-        # check if all img1_shape are the same to avoid redundant data
-        # shapes = self.images_hw.get_parameters(images_names_ji)
-        # unique_rows = torch.unique(shapes, dim=0)
-        # has_repetitions = unique_rows.shape[0] < shapes.shape[0]
-        # batch["img1_shape"] = shapes[0] if has_repetitions else shapes
-
-        return batch, pad_masks, dt_fields
-
-    def compute_forward_step(self, sampled_viewgraph, batch_size=1024, chunk_size=4096):
-        """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss."""
-
-        # divide self.viewgraph in batches if len(self.viewgraph) > batch size
-        sampled_viewgraphs = []
-        if len(sampled_viewgraph) > batch_size:
-            for i in range(0, len(sampled_viewgraph), batch_size):
-                end = min(i + batch_size, len(sampled_viewgraph))
-                sampled_viewgraphs.append(sampled_viewgraph[i:end])
-        else:
-            sampled_viewgraphs.append(sampled_viewgraph)
-
-        # collect per-batch results in a python list (tensors)
-        residuals_list = []
-        # i might want to process batches of same size and drop last batch
-        for sampled_viewgraph in sampled_viewgraphs:
-            s_time = time.time()
-            batch, pad_masks, dt_fields = self._create_batched_inputs(sampled_viewgraph)
-            self.timings["prepare_batched_inputs"] += time.time() - s_time
-
-            # actual inference
-            s_time = time.time()
-            # amp not really helping
-            with torch.amp.autocast(
-                device_type=self.device,
-                dtype=self.amp_dtype,
-                enabled=self.use_amp,
-            ):
-                s_time = time.time()
-
-                # --- FUSED KERNEL 1: PROJECTION & SAMPLING ---
-                # project_and_sample_logic ensures outputs are clean (no NaNs)
-                # outside_mask marks invalid points
-                residuals, outside_mask = project_and_sample_logic(
-                    batch["xyz_world"],
-                    batch["K1"],
-                    batch["P1"],
-                    batch["img1_shape"],
-                    dt_fields,
-                    border=0,
-                )
-                self.timings["batched_reprojection"] += time.time() - s_time
-
-                # --- FUSED KERNEL 2: CHUNKED REDUCTION ---
-                # Combine the original pad_mask with the new projection validity mask
-                # Only process points that were valid originally AND projected validly
-                valid_mask = (pad_masks > 0) & (~outside_mask)
-
-                B, N = residuals.shape
-                dtype = residuals.dtype
-
-                total_sum = torch.zeros(B, device=self.device, dtype=dtype)
-                total_count = torch.zeros(B, device=self.device, dtype=torch.long)
-
-                for i in range(0, N, chunk_size):
-                    r_chunk = residuals[:, i : i + chunk_size]
-                    m_chunk = valid_mask[:, i : i + chunk_size]
-
-                    # Pass the clean residual chunk and the merged validity mask
-                    s_chunk, c_chunk = compute_chunk_loss_logic(r_chunk, m_chunk)
-
-                    total_sum += s_chunk
-                    total_count += c_chunk
-
-                zero = torch.tensor(0.0, device=self.device, dtype=dtype)
-                mean_losses = torch.where(
-                    total_count > 0,
-                    total_sum / total_count.to(dtype).clamp(min=1.0),
-                    zero,
-                )
-
-                # collect this batch's results
-                residuals_list.append(mean_losses)
-
-        # concatenate all collected batch results
-        residuals = torch.cat(residuals_list, dim=0)  # (num_pairs,)
-
-        return residuals
-
-    def _compute_batched_loss(self, residuals, delta=1.0):
-        """Vectorized batched loss computation."""
-        s_time = time.time()
-
-        if residuals.numel() == 0:
-            return torch.tensor(0.0, device=self.device)
-
-        residuals_pairs = residuals.view(-1, 2)
-
-        # Use Huber loss for robust cost
-        pair_losses = F.huber_loss(
-            residuals_pairs,
-            torch.zeros_like(residuals_pairs),
-            reduction="none",
-            delta=delta,
-        )
-        pair_losses = residuals_pairs.sum(dim=1)  # (num_pairs,)
-
-        # Mean over pairs
-        loss = pair_losses.mean()
-
-        self.timings["batched_loss_computation"] += time.time() - s_time
-        return loss
-
-    ### Helper functions for loading and preprocessing data ###
     def _load_and_preprocess_images(self):
         self.images = load_and_preprocess_images(
             self.image_path_list,
@@ -1169,28 +1168,50 @@ class Adjuster(nn.Module):
         print("-" * w)
 
         num_iters = len(getattr(self, "loss_list", []))
-        per_iter_keys = {
+
+        ordered_keys = [
+            "total_loading",
+            "step_pre_computation",
             "prepare_batched_inputs",
-            "batched_reprojection_and_loss",
+            "forward_pass",
+            "loss_computation",
             "gradient_computation",
             "parameter_update",
-            "batched_loss_computation",
-            "batched_reprojection",
+            "logging",
+            "total_optimization",
+        ]
+
+        per_iter_keys = {
+            "step_pre_computation",
+            "prepare_batched_inputs",
+            "forward_pass",
+            "loss_computation",
+            "gradient_computation",
+            "parameter_update",
+            "logging",
         }
 
-        for key, value in self.timings.items():
-            if (key in ["total", "total_loading"]) or (
-                key == "total_optimization" and value == 0
-            ):
+        for key in ordered_keys:
+            if key not in self.timings:
+                continue
+
+            value = self.timings[key]
+
+            if value == 0 and key not in per_iter_keys:
                 continue
 
             if key in per_iter_keys and num_iters > 0:
-                # Show only per-iteration column
+                # Show total time, percentage, AND per-iteration average
+                perc = (
+                    (value / self.timings["total"]) * 100
+                    if self.timings["total"] > 0
+                    else 0
+                )
                 value_avg = value / num_iters
                 row_str = (
                     f"{key:<{key_width}}"
-                    f"{'':>{val_width}}"  # Time blank
-                    f"{'':>{perc_width+3}}"  # % blank
+                    f"{value:>{val_width}.2f}"
+                    f"{perc:>{perc_width}.1f}%"
                     f"{value_avg:>{avg_width}.4f}"
                 )
             else:
