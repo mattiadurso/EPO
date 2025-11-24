@@ -26,8 +26,11 @@ def unproject_to_virtual_plane(
         xyz: 3D points laying on the virtual plane
             B,n,3
     """
+    dtype = xy.dtype
     xy_hom = to_homogeneous(xy)  # B,n,3
-    xyz = (torch.linalg.inv(K) @ (xy_hom.permute(0, 2, 1))).permute(0, 2, 1)
+    xyz = (
+        torch.linalg.inv(K.float()).to(dtype=dtype) @ (xy_hom.permute(0, 2, 1))
+    ).permute(0, 2, 1)
     return xyz
 
 

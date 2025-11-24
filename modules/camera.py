@@ -87,7 +87,8 @@ class CameraModule(nn.Module):
         k_models: list[str],
         k_params: torch.Tensor,
         k_grad: bool = True,
-        device: str = "cpu",
+        device: str = "cuda",
+        dtype: torch.dtype = torch.float32,
     ):
         """Class storing camera intrinsics for multiple cameras and poses.
         Args:
@@ -98,6 +99,7 @@ class CameraModule(nn.Module):
         """
         super().__init__()
         self.device = torch.device(device)
+        self.dtype = dtype
 
         # Define model ID mapping
         self.camera_model_name_to_id = {
@@ -122,7 +124,8 @@ class CameraModule(nn.Module):
         self.k_grad = k_grad
         # Use nn.Parameter so nn.Module tracks it automatically
         self.k_params = nn.Parameter(
-            k_params.float().clone().detach().to(self.device), requires_grad=self.k_grad
+            k_params.clone().detach().to(self.device, dtype=self.dtype),
+            requires_grad=self.k_grad,
         )
 
         self.update_all_matrices()  # Precompute all intrinsic matrices

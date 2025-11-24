@@ -121,6 +121,7 @@ def load_and_preprocess_images(
     target_size=1024,
     max_workers=20,
     load_with_pad=True,
+    dtype=torch.float32,
     device="cuda",
 ):
     """
@@ -170,7 +171,7 @@ def load_and_preprocess_images(
         ):
             image_name, img_tensor, coords, scale = future.result()
             images_dict[image_name] = {
-                "image": img_tensor.to(device),
+                "image": img_tensor.to(device, dtype=dtype),
                 "coords": torch.from_numpy(coords).to(device),
                 "scale": scale,
                 "hw": (img_tensor.shape[-2], img_tensor.shape[-1]),
@@ -192,7 +193,7 @@ def _process_single_depth(
     depth = h5py.File(depth_file, "r")["depth"][()]
 
     # Convert to tensor and add batch+channel dimensions
-    depth_tensor = torch.tensor(depth, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    depth_tensor = torch.tensor(depth).unsqueeze(0).unsqueeze(0)
 
     # Get original dimensions
     h, w = depth_tensor.shape[-2:]
@@ -257,6 +258,7 @@ def load_and_preprocess_depths(
     target_size=518,
     max_workers=20,
     load_with_pad=False,
+    dtype=torch.float32,
     device="cuda",
 ):
     """
@@ -302,7 +304,9 @@ def load_and_preprocess_depths(
             image_name, depth_tensor = future.result()
 
             if depth_tensor is not None:
-                images_dict[image_name].update({"depth": depth_tensor.to(device)})
+                images_dict[image_name].update(
+                    {"depth": depth_tensor.to(device, dtype=dtype)}
+                )
             else:
                 print(f"Warning: Depth map not found for {image_name}")
 
@@ -337,7 +341,7 @@ def process_camera(camera, load_with_pad=False, images_size=518):
         cx, cy = params[1], params[2]
 
     elif model == "PINHOLE":  # or model == "RADIAL":
-        f = torch.tensor([params[0], params[1]], dtype=torch.float32)
+        f = torch.tensor([params[0], params[1]])
         cx, cy = params[2], params[3]
 
     else:
@@ -356,14 +360,14 @@ def process_camera(camera, load_with_pad=False, images_size=518):
     cx = (cx + pad_x) * scale
     cy = (cy + pad_y) * scale
 
-    params = torch.cat([f, torch.tensor([cx, cy], dtype=torch.float32)], dim=0)
+    params = torch.cat([f, torch.tensor([cx, cy])], dim=0)
     return cam_id, model, params
 
 
 def process_pose(image):
     # Convert a single pycolmap.Image to torch tensor
     # COLMAP's cam_from_world is already R_cw (world-to-camera rotation)
-    R = torch.tensor(image.cam_from_world.rotation.matrix(), dtype=torch.float32)
-    t = torch.tensor(image.cam_from_world.translation, dtype=torch.float32).unsqueeze(1)
+    R = torch.tensor(image.cam_from_world.rotation.matrix())
+    t = torch.tensor(image.cam_from_world.translation).unsqueeze(1)
 
     return R, t, image.camera_id

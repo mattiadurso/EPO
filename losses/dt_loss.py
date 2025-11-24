@@ -29,7 +29,7 @@ def compute_distance_field_cv2(
     """
     # 1. Move to CPU and convert to Numpy
     # We detach just in case, though @no_grad handles most of it.
-    edges_np = edges_map.detach().cpu().numpy()
+    edges_np = edges_map.detach().cpu().float().numpy()
 
     # 2. Prepare Binary Mask for OpenCV
     # Your logic: 1 (or >0) is an edge.
@@ -115,8 +115,8 @@ def sample_distance_field(
         sampled_dists: Tensor of shape (B, N) or (N,) with sampled distances at edge coordinates.
                        NaN values are preserved but masked for loss computation.
     """
-    dt_field = dt_field.to(device).float()
-    edge_coords = edge_coords.to(device).float()
+    dt_field = dt_field.to(device)
+    edge_coords = edge_coords.to(device)
 
     # Handle both batched and unbatched inputs
     if dt_field.dim() == 2:

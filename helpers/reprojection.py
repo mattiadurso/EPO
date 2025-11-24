@@ -81,10 +81,10 @@ def grid_sample_nan(xy: Tensor, img: Tensor, mode="nearest") -> tuple[Tensor, Te
     mask_img_nan = torch.isnan(sampled.sum(1))  # BxN or BxN0xN1
     # ? set to nan the sampled values for points xy that were nan (grid_sample consider those as (-1, -1))
     xy_invalid = xy_norm.isnan().any(-1)  # BxN or BxN0xN1
-    if xy.ndim == 3:
-        sampled[xy_invalid[:, None, :].repeat(1, C, 1)] = float("nan")
-    else:
-        sampled[xy_invalid[:, None, :, :].repeat(1, C, 1, 1)] = float("nan")
+    # if xy.ndim == 3:
+    sampled[xy_invalid[:, None, :].repeat(1, C, 1)] = float("nan")
+    # else:
+    #     sampled[xy_invalid[:, None, :, :].repeat(1, C, 1, 1)] = float("nan")
 
     if squeeze_result:
         img = img.squeeze(1)
@@ -102,6 +102,7 @@ def create_grid(image, permute=False, sampling_factor=10, border=30):
     Returns:
         grid: grid of the same size as the image HxWx2
     """
+    dtype = image.dtype
     image = image[None] if image.dim() == 3 else image
     H, W = image.shape[-2:]
 
@@ -110,7 +111,7 @@ def create_grid(image, permute=False, sampling_factor=10, border=30):
         torch.arange(border, W - border, sampling_factor),
         indexing="ij",
     )
-    grid = torch.stack((grid_x, grid_y), dim=-1).view(-1, 2).float()
+    grid = torch.stack((grid_x, grid_y), dim=-1).view(-1, 2).to(dtype=dtype)
 
     grid = grid[torch.randperm(grid.shape[0])] if permute else grid
 
@@ -129,7 +130,7 @@ def compute_121_reprojection(
 ):
     # create a grid of points in img 0
     kpts0 = create_grid(img0, sampling_factor=sampling_factor, border=border)[None].to(
-        device
+        device, dtype=img0.dtype
     )
     # starting from depth valid locations, in nan is invalid in any case
     # kpts0 = torch.nonzero(~torch.isnan(data['depth0'][0]))[None].float() # why not working?
@@ -330,7 +331,9 @@ def filter_viewgraph_by_reprojection(
                 torch.arange(border, w - border, sampling_factor, device=device),
                 indexing="ij",
             )
-            grid_cache[key] = torch.stack((grid_x, grid_y), dim=-1).view(-1, 2).float()
+            grid_cache[key] = (
+                torch.stack((grid_x, grid_y), dim=-1).view(-1, 2).to(dtype=self.dtype)
+            )
         return grid_cache[key]
 
     filtered_viewgraph = []
@@ -340,8 +343,8 @@ def filter_viewgraph_by_reprojection(
         jx1, jy1, jx2, jy2, jh, jw = [int(x) for x in images[j]["coords"]]
 
         # Convert depth to float32
-        Z1 = images[i]["depth"][iy1:iy2, ix1:ix2][None].float()
-        Z2 = images[j]["depth"][jy1:jy2, jx1:jx2][None].float()
+        Z1 = images[i]["depth"][iy1:iy2, ix1:ix2][None]
+        Z2 = images[j]["depth"][jy1:jy2, jx1:jx2][None]
 
         # Get cached grid instead of creating new one
         grid = get_or_create_grid(ih, iw, sampling_factor, border, device)
@@ -357,7 +360,7 @@ def filter_viewgraph_by_reprojection(
         }
 
         with torch.amp.autocast(
-            device_type=device, dtype=torch.bfloat16, enabled=use_amp
+            device_type=device, dtype=self.amp_dtype, enabled=use_amp
         ):
             # project the points to img1
             kpts1 = reproject_2D_2D(
