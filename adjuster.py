@@ -115,6 +115,7 @@ class Adjuster(nn.Module):
         scheduler_name="ReduceLROnPlateau",
         scheduler_params={"factor": 0.75, "patience": 2, "min_lr": 1e-6},
         use_amp=True,
+        amp_dtype=torch.bfloat16,  # torch.float16
         matcher_type="frustums",  # or "sequential"
         grad_q=True,
         grad_t=True,
@@ -142,6 +143,8 @@ class Adjuster(nn.Module):
         self.single_camera_per_folder = single_camera_per_folder
         self.convergence = False
         self.use_amp = use_amp
+        self.amp_dtype = amp_dtype
+        self.dtype = torch.float32
         self.gt_path = gt_path
         self.viewgraph_path = viewgraph_path
         self.matcher_type = matcher_type
@@ -220,13 +223,13 @@ class Adjuster(nn.Module):
         self.timings["compute_distance_fields"] = time.time() - s_time
 
         ## Prepare batched parameters modules that do not need to be optimized
-        image_id_map = {}
+        self.image_id_map = {}
         edges_padded, pad_masks = [], []
         dt_fields, images_shapes = [], []
         sampled_depth = []
         for idx, image_name in enumerate(sorted(self.images.keys())):
             # mapping image name to tensor index
-            image_id_map[image_name] = idx
+            self.image_id_map[image_name] = idx
             # collecting data into big tensors
             edges_padded.append(self.images[image_name]["edges_padded"])
             pad_masks.append(self.images[image_name]["pad_mask"])
@@ -235,24 +238,36 @@ class Adjuster(nn.Module):
             sampled_depth.append(self.images[image_name]["sampled_depth"])
 
         # stacking
-        edges_padded = torch.stack(edges_padded, dim=0).to(self.device)
-        pad_masks = torch.stack(pad_masks, dim=0).to(self.device)
-        dt_fields = torch.stack(dt_fields, dim=0).to(self.device)
-        images_shapes = torch.stack(images_shapes, dim=0).to(self.device)
-        sampled_depth = torch.stack(sampled_depth, dim=0).to(self.device)
+        edges_padded = torch.stack(edges_padded, dim=0).to(
+            self.device, dtype=self.dtype
+        )
+        pad_masks = torch.stack(pad_masks, dim=0).to(self.device, dtype=self.dtype)
+        dt_fields = torch.stack(dt_fields, dim=0).to(self.device, dtype=self.dtype)
+        images_shapes = torch.stack(images_shapes, dim=0).to(
+            self.device, dtype=self.dtype
+        )
+        sampled_depth = torch.stack(sampled_depth, dim=0).to(
+            self.device, dtype=self.dtype
+        )
 
         # storing
-        self.edges_padded = ParameterModule(image_id_map, edges_padded, self.device)
-        self.pad_masks = ParameterModule(image_id_map, pad_masks, self.device)
-        self.dt_fields = ParameterModule(image_id_map, dt_fields, self.device)
-        self.images_hw = ParameterModule(image_id_map, images_shapes, self.device)
+        self.edges_padded = ParameterModule(
+            self.image_id_map, edges_padded, self.device
+        )
+        self.pad_masks = ParameterModule(self.image_id_map, pad_masks, self.device)
+        self.dt_fields = ParameterModule(self.image_id_map, dt_fields, self.device)
+        self.images_hw = ParameterModule(self.image_id_map, images_shapes, self.device)
 
         self.sampled_depth = DepthModule(
-            image_id_map,
+            self.image_id_map,
             sampled_depth,
             self.device,
             grad=self.grad_z,
         )
+
+        self.viewgraph_ids = [
+            (self.image_id_map[i], self.image_id_map[j]) for i, j in self.viewgraph
+        ]
         # ==========================================================================
         # Create optimizer
         params_to_optimize = self._collect_parameters_to_optimize()
@@ -473,6 +488,7 @@ class Adjuster(nn.Module):
             k_params=torch.stack(k_params),
             k_grad=self.grad_k,
             device=self.device,
+            dtype=self.dtype,
         )
 
         # Read poses from images
@@ -504,6 +520,7 @@ class Adjuster(nn.Module):
             grad_q=self.grad_q,
             grad_t=self.grad_t,
             device=self.device,
+            dtype=self.dtype,
         )
 
         self.poses = poses
@@ -540,10 +557,7 @@ class Adjuster(nn.Module):
 
         points_3D = torch.cat(points_3D_list, dim=0)  # (B, N, 3)
 
-        # # Write back (differentiable tensors)
-        # for name, pts3d in zip(image_names, points_3D):
-        #     self.images[name]["edges_3D"] = pts3d
-
+        # Store points_3D in Edges3DModule
         self.edges_3D = Edges3DModule(
             self.edges_padded.image_to_tensor_idx, points_3D, self.device
         )
@@ -553,29 +567,36 @@ class Adjuster(nn.Module):
         cam_ids = []
         images_names_ij = []
         images_names_ji = []
-        for i, j in sampled_viewgraph:
-            # be careful about the order
+        for i, j in sampled_viewgraph:  # with i,j being left (0) and right (1) images
+            # I already have unprojected points to 3D, so I only have to check that
+            # those points reproject within the image boundaries.
+
+            # these are are the ids for points 3D and their corresponding pad
             images_names_ij.append(i)
             images_names_ij.append(j)
+
+            # these are the ids for right images where to reproject
             cam_ids.append(self.images[j]["cam_id"])
             cam_ids.append(self.images[i]["cam_id"])
             images_names_ji.append(j)
             images_names_ji.append(i)
 
         batch = {}
+        # 3D points in world coordinates and padd for left images
+        batch["xyz_world"] = self.edges_3D.get_parameters(images_names_ij)
+        pad_masks = self.pad_masks.get_parameters(images_names_ij)
+
+        # these are the intrinsics and poses for right images. Needed to project
+        # 3D world points to the second image of the pair
         batch["K1"] = self.intrinsics.get_intrinsic_matrix(cam_ids)
         batch["P1"] = self.poses.get_projection_matrix(images_names_ji)
-        batch["xyz_world"] = self.edges_3D.get_parameters(images_names_ij)
+        dt_fields = self.dt_fields.get_parameters(images_names_ji)
 
         # check if all img1_shape are the same to avoid redundant data
         shapes = self.images_hw.get_parameters(images_names_ji)
         unique_rows = torch.unique(shapes, dim=0)
         has_repetitions = unique_rows.shape[0] < shapes.shape[0]
         batch["img1_shape"] = shapes[0] if has_repetitions else shapes
-
-        # non learnable parameters but needed for loss computation
-        pad_masks = self.pad_masks.get_parameters(images_names_ij)
-        dt_fields = self.dt_fields.get_parameters(images_names_ji)
 
         return batch, pad_masks, dt_fields
 
@@ -604,7 +625,7 @@ class Adjuster(nn.Module):
             # amp not really helping
             with torch.amp.autocast(
                 device_type=self.device,
-                dtype=torch.bfloat16,
+                dtype=self.amp_dtype,
                 enabled=self.use_amp,
             ):
                 s_time = time.time()
@@ -684,6 +705,7 @@ class Adjuster(nn.Module):
             target_size=self.images_size,
             max_workers=self.max_workers,
             load_with_pad=self.load_with_pad,
+            dtype=self.dtype,
             device=self.device,
         )
 
@@ -694,6 +716,7 @@ class Adjuster(nn.Module):
             target_size=self.images_size,
             max_workers=self.max_workers,
             load_with_pad=self.load_with_pad,
+            dtype=self.dtype,
             device=self.device,
         )
         # check all depths have the same size
@@ -712,7 +735,9 @@ class Adjuster(nn.Module):
                     pad_right = max_w - w
                     pad = (0, pad_right, 0, pad_bottom)  # left, right, top, bottom
                     depth = F.pad(depth, pad, mode="constant", value=depth.max())
-                    self.images[image_name]["depth"] = depth
+                    self.images[image_name]["depth"] = depth.to(
+                        self.device, dtype=self.dtype
+                    )
 
         # add sampled depth at edges_padded locations
         for image_name in self.images.keys():
@@ -740,7 +765,8 @@ class Adjuster(nn.Module):
             h, w = self.images[rel_image_name]["hw"]
 
             mask_tensor = (
-                torch.from_numpy(np.array(mask)).float().to(self.device) / 255.0
+                torch.from_numpy(np.array(mask)).to(self.device, dtype=self.dtype)
+                / 255.0
             )
             mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
             mask_tensor = F.interpolate(
@@ -788,7 +814,9 @@ class Adjuster(nn.Module):
                     self.images[image_name]["edges_map"] = edges_map
                     # Extract new edges from filtered map
                     self.images[image_name]["edges"] = (
-                        edges_map.nonzero().flip(dims=(1, 0)).float()
+                        edges_map.nonzero()
+                        .flip(dims=(1, 0))
+                        .to(self.device, dtype=self.dtype)
                     )
 
         # Recalculate padding with new edge counts
@@ -820,7 +848,7 @@ class Adjuster(nn.Module):
 
     @torch.no_grad()
     def _compute_viewgraph(self, type="frustums", window_size=10):
-        """Compute viewgraph and filter by reprojection error."""
+        """Compute viewgraph and filter by reprojection error and returns the sorted viewgraph."""
         if type == "frustums":
             # Estimate view graph from frustums
             viewgraph = build_view_graph_from_frustums(
@@ -831,6 +859,7 @@ class Adjuster(nn.Module):
                 distance_factor=2,
                 verbose=False,
                 images_with_depth=self.images,
+                dtype=self.dtype,
             )
 
         elif type == "sequential":
@@ -881,11 +910,14 @@ class Adjuster(nn.Module):
     ### Edges
     def _extract_edges(self):
         for image_name in tqdm(self.images.keys(), desc=f"Extracting edges"):
-            img_tensor = self.images[image_name]["image"].unsqueeze(0).to(self.device)
+            img_tensor = self.images[image_name]["image"].unsqueeze(0)
             edges_map = self.edge_extractor(img_tensor)
-            edges = edges_map.squeeze().nonzero().flip(dims=(1, 0)).float()  # (N, 2)
+            edges = edges_map.squeeze().nonzero().flip(dims=(1, 0))  # (N, 2)
             self.images[image_name].update(
-                {"edges_map": edges_map.squeeze(), "edges": edges}
+                {
+                    "edges_map": edges_map.squeeze().to(self.device, dtype=self.dtype),
+                    "edges": edges.to(self.device, dtype=self.dtype),
+                }
             )
 
         # pad to have same number of edges per image
@@ -906,13 +938,13 @@ class Adjuster(nn.Module):
                 edges = torch.cat([edges, pad], dim=0)
 
                 pad_mask = torch.zeros(
-                    (max_edges,), device=edges.device, dtype=torch.float32
+                    (max_edges,), device=edges.device, dtype=self.dtype
                 )
                 pad_mask[:n_edges] = 1.0
             else:
                 # n_edges == max_edges: all edges are valid
                 pad_mask = torch.ones(
-                    (max_edges,), device=edges.device, dtype=torch.float32
+                    (max_edges,), device=edges.device, dtype=self.dtype
                 )
 
             self.images[image_name].update(
@@ -931,7 +963,9 @@ class Adjuster(nn.Module):
                 edges_map,
                 device=self.device,
             )
-            self.images[image_name].update({"dt_field": dt_field})
+            self.images[image_name].update(
+                {"dt_field": dt_field.to(self.device, dtype=self.dtype)}
+            )
             dt_fields_shapes.append(dt_field.shape)
 
         # if dt_fields_shapes is not equal, need to pad right bottom to make them equal

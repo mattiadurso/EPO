@@ -71,10 +71,10 @@ class CannyEdgeDetector(nn.Module):
         )
 
         # Move images to the specified device
-        images = images.to(self.device)
+        images = images.to(self.device).float()
 
         # images: (B, C, H, W) in [0, 1]
         _, edges_binary = self.canny(images)
 
         # return edges as (B, 1, H, W) in (0, 1)
-        return edges_binary.float()
+        return edges_binary

@@ -8,13 +8,14 @@ from .load import load_reconstruction
 
 def compute_frustum_corners(K, width, height, z_near, z_far, R, t, device):
     """Compute 8 frustum corners in world coordinates."""
+    dtype = K.dtype
     corners_px = torch.tensor(
         [[0, 0, 1], [width, 0, 1], [width, height, 1], [0, height, 1]],
-        dtype=torch.float32,
+        dtype=dtype,
         device=device,
     )
 
-    invK = torch.inverse(K)
+    invK = torch.linalg.inv(K.float()).to(dtype=dtype)
     near_pts = (invK @ corners_px.T).T * z_near
     far_pts = (invK @ corners_px.T).T * z_far
     pts_cam = torch.cat([near_pts, far_pts], dim=0)
@@ -41,6 +42,7 @@ def build_view_graph_from_frustums(
     distance_factor=2,
     verbose=True,
     images_with_depth=None,
+    dtype=torch.float32,
 ):
     """
     Compute view-graph image pairs by frustum intersection,
@@ -70,15 +72,15 @@ def build_view_graph_from_frustums(
     else:
         bar = imgs.values()
 
+    v = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
+
     for img in bar:
         cam = cams[img.camera_id]
-        K = torch.tensor(cam.calibration_matrix(), dtype=torch.float32, device=device)
+        K = torch.tensor(cam.calibration_matrix(), device=device, dtype=dtype)
         R = torch.tensor(
-            img.cam_from_world.rotation.matrix(), dtype=torch.float32, device=device
+            img.cam_from_world.rotation.matrix(), device=device, dtype=dtype
         )
-        t = torch.tensor(
-            img.cam_from_world.translation, dtype=torch.float32, device=device
-        )
+        t = torch.tensor(img.cam_from_world.translation, device=device, dtype=dtype)
 
         if images_with_depth is not None and img.name in images_with_depth:
             depth = images_with_depth[img.name]["depth"]
@@ -99,7 +101,7 @@ def build_view_graph_from_frustums(
         c_world = -(R.T @ t)
         centers[img.image_id] = c_world
         # camera forward vector in world
-        d_world = R.T @ torch.tensor([0.0, 0.0, 1.0], device=device)
+        d_world = R.T @ v
         directions[img.image_id] = d_world / torch.norm(d_world)
 
     ids = list(imgs.keys())

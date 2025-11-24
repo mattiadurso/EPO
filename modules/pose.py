@@ -89,6 +89,7 @@ class PoseModule(nn.Module):
         grad_q: bool = True,
         grad_t: bool = True,
         device: str = "cuda",
+        dtype: torch.dtype = torch.float32,
     ):
         """
         Class storing extrinsics (Pose) for multiple cameras.
@@ -104,6 +105,7 @@ class PoseModule(nn.Module):
         """
         super().__init__()
         self.device = torch.device(device)
+        self.dtype = dtype
 
         # --- ID Mappings ---
         # string name -> tensor index (0..N)
@@ -118,18 +120,24 @@ class PoseModule(nn.Module):
 
         # --- Rotation Prep (Matrix -> Quat) ---
         # Kornia returns (w, x, y, z)
-        q_init = kgc.rotation_matrix_to_quaternion(R).float().to(self.device)
+        q_init = kgc.rotation_matrix_to_quaternion(R)
 
         # PyPose expects (x, y, z, w) (scalar last)
         # We roll -1 to move w from index 0 to index 3
         q_init = torch.roll(q_init, shifts=-1, dims=1)
 
         # Store as Raw Parameter (requires normalization on usage)
-        self.q_param = nn.Parameter(q_init.clone().detach(), requires_grad=grad_q)
+        self.q_param = nn.Parameter(
+            q_init.clone().detach().to(self.device, dtype=self.dtype),
+            requires_grad=grad_q,
+        )
 
         # --- Translation Prep ---
-        t_init = t.reshape(num_cams, 3).float().to(self.device)
-        self.t_param = nn.Parameter(t_init.clone().detach(), requires_grad=grad_t)
+        t_init = t.reshape(num_cams, 3)
+        self.t_param = nn.Parameter(
+            t_init.clone().detach().to(self.device, dtype=self.dtype),
+            requires_grad=grad_t,
+        )
 
         self.update_all_matrices()  # Precompute all extrinsic matrices
 
