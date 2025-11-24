@@ -315,13 +315,7 @@ class Adjuster(nn.Module):
         max_steps = max_steps if max_steps > 0 else 1_000
         if verbose:
             print(
-                f"Processing {len(self.viewgraph):,}",
-                (
-                    f"pairs with batch size {batch_size:,} ({num_batches} batches per iteration)"
-                    if type == "batched"
-                    else ""
-                ),
-                # edges per image
+                f"Processing {len(self.viewgraph):,} pairs with batch size {batch_size:,} ({num_batches} batches per iteration).",
                 f"Using {self.images[list(self.images.keys())[0]]['edges_padded'].numel()//2:,} edges per image",  # // due to x and y
             )
 
@@ -330,7 +324,8 @@ class Adjuster(nn.Module):
             print(
                 f"Total points to process per iteration: {total_points:,}.\n"
                 + f"Initial learning rate: {self.lr:.2e}.\n"
-                + f"Target learning rate:  {self.scheduler_params.get('min_lr',1e-4):.2e}."
+                + f"Target learning rate:  {self.scheduler_params.get('min_lr',1e-4):.2e}.",
+                end="\n\n",
             )
 
             bar = tqdm(range(max_steps), desc="Adjusting poses and intrinsics")
@@ -613,7 +608,9 @@ class Adjuster(nn.Module):
                 enabled=self.use_amp,
             ):
                 s_time = time.time()
-                edges_reprojected = project_world_to_2D(**batch)  # (B, N, 2)
+                edges_reprojected, outside_mask = project_world_to_2D(
+                    **batch
+                )  # (B, N, 2)
                 self.timings["batched_reprojection"] += time.time() - s_time
 
                 # residuals sampling # (B, 1, N) -> (B, N)
