@@ -518,8 +518,6 @@ class Adjuster(nn.Module):
     ):
         """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss."""
 
-        # s_time = time.time()
-
         # divide self.viewgraph in batches if len(self.viewgraph) > batch size
         sampled_viewgraphs = []
         if len(sampled_viewgraph) > batch_size:
@@ -601,6 +599,9 @@ class Adjuster(nn.Module):
             return torch.tensor(0.0, device=self.device)
 
         residuals_pairs = residuals.view(-1, 2)
+
+        # clamp residuals. 15 is quite high already
+        residuals_pairs = torch.clamp(residuals_pairs, min=0, max=15.0)
 
         # Use Huber loss for robust cost
         pair_losses = F.huber_loss(
@@ -887,7 +888,7 @@ class Adjuster(nn.Module):
             self,
             viewgraph,
             self.images,
-            min_points=1000,  # tune this
+            min_points=100,  # tune this
             sampling_factor=10,
             reprojection_error=3.0,
             border=10,
@@ -933,7 +934,7 @@ class Adjuster(nn.Module):
             print(f"No images found with registration time < {threshold:.3f}")
 
     ### Edges
-    def _extract_edges(self, min_percentile=5, max_percentile=75):
+    def _extract_edges(self, min_percentile=10, max_percentile=75):
         for image_name in tqdm(self.images.keys(), desc=f"Extracting edges"):
             img_tensor = self.images[image_name]["image"].unsqueeze(0)
             edges_map = self.edge_extractor(img_tensor)
@@ -953,11 +954,11 @@ class Adjuster(nn.Module):
                 if valid_depth_mask.any():
                     # Compute 75th percentile of valid depth values
                     valid_depths = depth[valid_depth_mask]
-                    depth_p75 = torch.quantile(valid_depths, max_percentile / 100.0)
+                    depth_p75 = torch.quantile(valid_depths, max_percentile / 100)
                     background_mask = (depth > depth_p75) & valid_depth_mask
 
                     # exclude also very close depths (e.g., depth < 5th percentile)
-                    depth_p5 = torch.quantile(valid_depths, min_percentile / 100.0)
+                    depth_p5 = torch.quantile(valid_depths, min_percentile / 100)
                     background_mask = background_mask | (depth < depth_p5)
 
                 # Combine masks: remove jumps AND background
@@ -1375,7 +1376,11 @@ class Adjuster(nn.Module):
 
     @torch.no_grad()
     def visualize_residuals(
-        self, output_dir="residual_maps", percentile=99, max_images=100
+        self,
+        output_dir="residual_maps",
+        percentile=99,
+        max_images=100,
+        custom_viewgraph=None,
     ):
         """
         Visualize reprojection residuals for all image pairs in the viewgraph.
@@ -1392,11 +1397,14 @@ class Adjuster(nn.Module):
         os.makedirs(output_dir, exist_ok=True)
 
         # Process all viewgraph pairs
-        viewgraph = (
-            self.viewgraph
-            if max_images < 0
-            else random.choices(self.viewgraph, k=max_images)
-        )
+        if custom_viewgraph:
+            viewgraph = custom_viewgraph
+        else:
+            viewgraph = (
+                self.viewgraph
+                if max_images < 0
+                else random.choices(self.viewgraph, k=max_images)
+            )
         num_pairs = len(viewgraph)
         print(f"Visualizing residuals for {num_pairs:,} image pairs...")
 
