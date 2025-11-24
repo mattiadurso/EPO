@@ -1,14 +1,7 @@
 import torch
+import cv2
+import numpy as np
 import torch.nn.functional as F
-
-import torch
-import cv2
-import numpy as np
-
-
-import torch
-import cv2
-import numpy as np
 
 
 @torch.no_grad()
@@ -28,7 +21,6 @@ def compute_distance_field_cv2(
         field: Distance field of shape (H, W).
     """
     # 1. Move to CPU and convert to Numpy
-    # We detach just in case, though @no_grad handles most of it.
     edges_np = edges_map.detach().cpu().float().numpy()
 
     # 2. Prepare Binary Mask for OpenCV
@@ -57,7 +49,6 @@ def compute_distance_field_torch(
     device="cuda",
     dtype=torch.float32,
 ):
-    # TODO: run all this in fp16. carefully normalize EVERITHING in 0-1 range
     """
     Compute the Euclidean distance field from edges coordinates.
     Args:
@@ -66,9 +57,7 @@ def compute_distance_field_torch(
     Returns:
         field: Distance field of shape (H, W) showing distance from each pixel to nearest edge.
     """
-    # dtype = torch.float16 if normalize else dtype
     h, w = edges_map.shape[-2:]
-
     edges_dtype = edges_map.dtype
     edges_map = edges_map.to(device).to(dtype)
     edges = edges_map.nonzero().flip(dims=(0, 1)).to(dtype)
@@ -84,11 +73,8 @@ def compute_distance_field_torch(
         dtype
     )
 
-    # Compute distances from all pixels to target points
-    pixel_dists = torch.cdist(
-        pixel_coords.unsqueeze(0), edges.unsqueeze(0), p=2
-    )  # (1, h*w, M)
-    min_pixel_dists, _ = torch.min(pixel_dists[0], dim=1)  # (h*w,)
+    pixel_dists = torch.cdist(pixel_coords.unsqueeze(0), edges.unsqueeze(0), p=2)
+    min_pixel_dists, _ = torch.min(pixel_dists[0], dim=1)
 
     # Reshape to image
     full_field = min_pixel_dists.view(h, w).to(edges_dtype)
@@ -99,150 +85,64 @@ def compute_distance_field_torch(
 def sample_distance_field(
     dt_field: torch.Tensor,
     edge_coords: torch.Tensor,
-    device="cuda",
-    sampling_mode="bilinear",
 ):
     """
-    Sample the distance field at given edge coordinates.
-    Preserves gradient flow through grid_sample.
+    Simplified version of sample_distance_field.
+    Assumes input edge_coords are free of NaNs (pre-filtered).
 
     Args:
-        dt_field: Tensor of shape (B, H, W) or (H, W) with the distance field.
-        edge_coords: Tensor of shape (B, N, 2) or (N, 2) with edge coordinates (x, y) to sample.
-        device: Device to use for computation.
-        sampling_mode: Sampling mode for grid_sample ('bilinear' or 'nearest').
-    Returns:
-        sampled_dists: Tensor of shape (B, N) or (N,) with sampled distances at edge coordinates.
-                       NaN values are preserved but masked for loss computation.
+        dt_field: (B, C, H, W) or (B, H, W) distance fields
+        edge_coords: (B, N, 2) projected coordinates, assumed safe.
     """
-    dt_field = dt_field.to(device)
-    edge_coords = edge_coords.to(device)
+    B, H, W = dt_field.shape[-3], dt_field.shape[-2], dt_field.shape[-1]
+    device = dt_field.device
+    dtype = dt_field.dtype
 
-    # Handle both batched and unbatched inputs
-    if dt_field.dim() == 2:
-        dt_field = dt_field.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-        edge_coords = edge_coords.unsqueeze(0)  # (1, N, 2)
-        unbatched = True
-    else:
-        dt_field = dt_field.unsqueeze(1)  # (B, 1, H, W)
-        unbatched = False
+    # Normalize coordinates to [-1, 1]
+    x = edge_coords[..., 0]
+    y = edge_coords[..., 1]
 
-    b, _, h, w = dt_field.shape
+    norm_x = (x / (W - 1)) * 2 - 1
+    norm_y = (y / (H - 1)) * 2 - 1
 
-    # **CRITICAL: Detect NaN coordinates BEFORE normalization**
-    nan_mask_coords = torch.isnan(edge_coords).any(dim=-1)  # (B, N)
+    # Note: We don't check for NaNs here anymore.
+    # Inputs must be filtered before calling this function.
 
-    # Replace NaN coordinates with valid placeholder (e.g., center of image)
-    # This prevents NaN from entering grid_sample
-    edge_coords_safe = edge_coords.clone()
-    edge_coords_safe[nan_mask_coords] = torch.tensor(
-        [w / 2.0, h / 2.0], device=device, dtype=edge_coords.dtype
-    )
+    # Stack: (B, N, 1, 2) required for grid_sample 4D input
+    grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(2)
 
-    # Normalize coordinates to [-1, 1] for grid_sample
-    norm_x = (edge_coords_safe[..., 0] / (w - 1)) * 2 - 1
-    norm_y = (edge_coords_safe[..., 1] / (h - 1)) * 2 - 1
+    # Grid Sample
+    # Input dt_field must be (B, C, H, W)
+    if dt_field.dim() == 3:
+        dt_field = dt_field.unsqueeze(1)
 
-    # Clamp to valid range to prevent out-of-bounds issues
-    norm_x = torch.clamp(norm_x, -1.0, 1.0)
-    norm_y = torch.clamp(norm_y, -1.0, 1.0)
-
-    # Stack as [x, y] for grid_sample: (B, 1, N, 2)
-    grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(1)
-
-    # Sample without NaNs in the computation graph
-    sampled_dists = torch.nn.functional.grid_sample(
+    sampled = F.grid_sample(
         dt_field,
         grid,
-        mode=sampling_mode,
+        mode="bilinear",
+        padding_mode="border",
         align_corners=True,
     )
 
-    sampled_dists = sampled_dists.squeeze(1)  # (B, N)
+    # Output Shaping
+    sampled_dists = sampled.squeeze(-1).squeeze(1)  # (B, N)
 
-    # **CRITICAL: Restore NaN values AFTER sampling (outside computation graph)**
-    # Expand nan_mask_coords to match sampled_dists shape if needed
-    if sampled_dists.dim() > nan_mask_coords.dim():
-        # This shouldn't happen with squeeze(1), but being safe
-        nan_mask_coords = nan_mask_coords.unsqueeze(1).expand_as(sampled_dists)
-
-    sampled_dists = sampled_dists.clone()
-    sampled_dists[nan_mask_coords] = float("nan")
-
-    if unbatched:
-        sampled_dists = sampled_dists.squeeze(0)  # (N,)
-
-    return sampled_dists
+    return sampled_dists.to(device=device, dtype=dtype)
 
 
-# # Not tused for now
-# # This seem to have same results, but masking with zeros instaed of nans which is better for gradients
-# # @torch.compile(mode="reduce-overhead")
-# def sample_distance_field(
-#     dt_field: torch.Tensor,
-#     edge_coords: torch.Tensor,
-#     device="cuda",
-#     sampling_mode="bilinear",
-# ) -> tuple[torch.Tensor, torch.Tensor]:  # <--- RETURN MASK TOO
-#     """
-#     Sample the distance field at given edge coordinates.
-#     Preserves gradient flow through grid_sample.
+# @torch.compile(mode="reduce-overhead")
+def compute_chunk_loss_logic(residuals_chunk: torch.Tensor, mask_chunk: torch.Tensor):
+    """
+    Pure tensor logic for the loss reduction of a single chunk.
+    Assumes mask_chunk correctly identifies valid entries.
+    """
+    # Masked Summation
+    zero = torch.tensor(0.0, device=residuals_chunk.device, dtype=residuals_chunk.dtype)
 
-#     Args:
-#         dt_field: Tensor of shape (B, H, W) or (H, W) with the distance field.
-#         edge_coords: Tensor of shape (B, N, 2) or (N, 2) with edge coordinates (x, y) to sample.
-#         device: Device to use for computation.
-#         sampling_mode: Sampling mode for grid_sample ('bilinear' or 'nearest').
-#     Returns:
-#         sampled_dists: Tensor of shape (B, N) or (N,) with sampled distances at edge coordinates.
-#         valid_mask: Tensor of shape (B, N) or (N,) boolean mask. True = valid point, False = invalid (NaN/out-of-bounds).
-#     """
-#     dt_field = dt_field.to(device).float()
-#     edge_coords = edge_coords.to(device).float()
+    # We trust the mask_chunk. Any residual where mask is False is ignored.
+    valid_values = torch.where(mask_chunk, residuals_chunk, zero)
 
-#     # Handle both batched and unbatched inputs
-#     if dt_field.dim() == 2:
-#         dt_field = dt_field.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-#         edge_coords = edge_coords.unsqueeze(0)  # (1, N, 2)
-#         unbatched = True
-#     else:
-#         dt_field = dt_field.unsqueeze(1)  # (B, 1, H, W)
-#         unbatched = False
+    sum_val = valid_values.sum(dim=1)
+    count_val = mask_chunk.sum(dim=1).to(torch.long)
 
-#     b, _, h, w = dt_field.shape
-
-#     # **CRITICAL: Detect NaN coordinates BEFORE normalization**
-#     nan_mask_coords = torch.isnan(edge_coords).any(dim=-1)  # (B, N)
-#     valid_mask = ~nan_mask_coords  # <--- Store validity ONCE
-
-#     # Replace NaN coordinates with valid placeholder (e.g., center of image)
-#     edge_coords_safe = edge_coords.clone()
-#     edge_coords_safe[nan_mask_coords] = torch.tensor(
-#         [w / 2.0, h / 2.0], device=device, dtype=edge_coords.dtype
-#     )
-
-#     # Normalize coordinates to [-1, 1] for grid_sample
-#     norm_x = (edge_coords_safe[..., 0] / (w - 1)) * 2 - 1
-#     norm_y = (edge_coords_safe[..., 1] / (h - 1)) * 2 - 1
-
-#     # Clamp to valid range
-#     norm_x = torch.clamp(norm_x, -1.0, 1.0)
-#     norm_y = torch.clamp(norm_y, -1.0, 1.0)
-
-#     grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(1)
-
-#     # Sample
-#     sampled_dists = torch.nn.functional.grid_sample(
-#         dt_field,
-#         grid,
-#         mode=sampling_mode,
-#         align_corners=True,
-#     )
-
-#     sampled_dists = sampled_dists.squeeze()  # (B, N)
-
-#     if unbatched:
-#         sampled_dists = sampled_dists.squeeze(0)  # (N,)
-#         valid_mask = valid_mask.squeeze(0)  # (N,)
-
-#     return sampled_dists, valid_mask  # <--- RETURN BOTH
+    return sum_val, count_val
