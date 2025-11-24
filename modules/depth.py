@@ -60,6 +60,9 @@ class DepthModule(nn.Module):
         self.image_to_tensor_idx = image_id_map
         self.tensor_idx_to_image = {v: k for k, v in image_id_map.items()}
 
+        # store loss in log space to avoid negative depths
+        depth = torch.log(depth)
+
         self.params = nn.Parameter(
             depth.clone().detach().to(device), requires_grad=self.grad
         )
@@ -101,7 +104,8 @@ class DepthModule(nn.Module):
     def get_parameters(self, ids):
         """Return depth parameters - ensures gradient flow"""
         indices = self.map_ids_to_indices(ids)
-        return self.params[indices]
+        # Return depth in linear space by exponentiating the stored log-depths
+        return torch.exp(self.params[indices])
 
     def parameters(self, recurse: bool = True):
         return [self.params]

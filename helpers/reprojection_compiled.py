@@ -2,7 +2,6 @@ import torch
 from torch import Tensor
 from losses.dt_loss import sample_distance_field
 
-BOTTOM_ROW_TEMPLATE = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]])
 
 ### From 2D to 3D world coordinates
 
@@ -79,7 +78,7 @@ def invert_P(P: Tensor) -> Tensor:
     P_inv = torch.cat((R.permute(0, 2, 1), -R.permute(0, 2, 1) @ t), dim=2)
 
     # Ensure device matches P
-    template = BOTTOM_ROW_TEMPLATE.to(P.device).type(P.dtype)
+    template = torch.tensor([[[0, 0, 0, 1]]], device=P.device, dtype=P.dtype)
     # Expand
     bottom_row = template.expand(B, 1, 4)
 
