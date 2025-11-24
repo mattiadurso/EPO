@@ -885,8 +885,7 @@ class Adjuster(nn.Module):
             self,
             viewgraph,
             self.images,
-            th=0.025,  # not used cause min_points is set
-            min_points=100,  # tune this eventually
+            min_points=100,  # tune this
             sampling_factor=10,
             reprojection_error=3.0,
             use_amp=self.use_amp,
