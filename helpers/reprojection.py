@@ -2,7 +2,7 @@ import adjuster
 import torch
 from torch import Tensor
 import torch.nn.functional as F
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 from helpers.reprojection_compiled import (
     to_homogeneous,
@@ -330,6 +330,7 @@ def filter_viewgraph_by_reprojection(
     # --- Step 1: Pre-compute 3D World Points for all images ---
     image_names = sorted(list(images.keys()))
     self.times_image_was_registered = {name: 0 for name in image_names}
+    self.valid_points_per_pair = {}
     name_to_idx = {name: i for i, name in enumerate(image_names)}
 
     # Collect camera parameters for all images
@@ -448,6 +449,14 @@ def filter_viewgraph_by_reprojection(
 
             # Also check border (uv_proj inside image)
             valid_points = consistent & (~mask_outside)
+
+            # Store valid points count for each pair
+            for b in range(B):
+                i_name = image_names[idx_i[b]]
+                j_name = image_names[idx_j[b]]
+                self.valid_points_per_pair[(i_name, j_name)] = (
+                    valid_points[b].sum().item()
+                )
 
             # Count valid points per pair
             valid_counts = valid_points.sum(dim=1)
