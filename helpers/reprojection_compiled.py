@@ -15,7 +15,7 @@ def to_homogeneous(xy: Tensor) -> Tensor:
 
 def unproject_to_virtual_plane(
     xy: Tensor,
-    K: Tensor,
+    K_inv: Tensor,
 ) -> Tensor:
     """unproject points to the camera virtual plane at depth 1
     Args:
@@ -27,15 +27,13 @@ def unproject_to_virtual_plane(
         xyz: 3D points laying on the virtual plane
             B,n,3
     """
-    dtype = xy.dtype
     xy_hom = to_homogeneous(xy)  # B,n,3
-    xyz = (
-        torch.linalg.inv(K.float()).to(dtype=dtype) @ (xy_hom.permute(0, 2, 1))
-    ).permute(0, 2, 1)
-    return xyz
+    # K_inv = torch.linalg.inv(K.float()).to(dtype=dtype)
+    xyz = K_inv @ (xy_hom.permute(0, 2, 1))
+    return xyz.permute(0, 2, 1)
 
 
-def unproject_to_3D(xy: Tensor, K: Tensor, depths: Tensor) -> Tensor:
+def unproject_to_3D(xy: Tensor, K_inv: Tensor, depths: Tensor) -> Tensor:
     """unproject points to 3D in the camera ref system
     Args:
         xy: xy points in img0 (with convention top-left pixel coordinate (0.5, 0.5)
@@ -55,7 +53,7 @@ def unproject_to_3D(xy: Tensor, K: Tensor, depths: Tensor) -> Tensor:
     # ), f"Expected xy and depths to have the same number of points, got {xy.shape[1]} and {depths.shape[1]}"
     # assert xy.shape[2] == 2
 
-    xyz = unproject_to_virtual_plane(xy, K)  # B,n,3
+    xyz = unproject_to_virtual_plane(xy, K_inv)  # B,n,3
     depths = depths.unsqueeze(-1)  # B,n,1
     xyz_scaled = xyz * depths  # B,n,3
 
@@ -88,7 +86,7 @@ def invert_P(P: Tensor) -> Tensor:
 
 
 def unproject_2D_to_world(
-    xy0: Tensor, K0: Tensor, depth0: Tensor, P0: Tensor
+    xy0: Tensor, K0: Tensor, depth0: Tensor, P0: Tensor, skip_inversion: bool = False
 ) -> Tensor:
     """unproject points to world coordinates
     Args:
@@ -100,16 +98,23 @@ def unproject_2D_to_world(
             B,n
         P: camera extrinsics matrix
             B,4,4
+        skip_inversion: whether to skip inversion of K and P matrices
     Returns:
         xyz_world: unprojected 3D points in the world reference system
             B,n,3
     """
+    # invert K and P
+    if skip_inversion:
+        K0_inv, P0_inv = K0, P0
+    else:
+        K0_inv = torch.linalg.inv(K0)
+        P0_inv = invert_P(P0)
+
     # 2D -> 3D camera
-    xyz_camera = unproject_to_3D(xy0, K0, depth0)  # B,n,3
+    xyz_camera = unproject_to_3D(xy0, K0_inv, depth0)  # B,n,3
 
     # 3D camera -> world
-    P_inv = invert_P(P0)  # B,4,4
-    R_inv, t_inv = P_inv[:, :3, :3], P_inv[:, :3, 3:]  # B,3,3 , B,3,1
+    R_inv, t_inv = P0_inv[:, :3, :3], P0_inv[:, :3, 3:]  # B,3,3 , B,3,1
     xyz_world = (R_inv @ xyz_camera.permute(0, 2, 1) + t_inv).permute(0, 2, 1)  # B,n,3
 
     return xyz_world
