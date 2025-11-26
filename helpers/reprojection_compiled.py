@@ -132,7 +132,7 @@ def from_homogeneous(points: Tensor) -> Tensor:
 
 
 def filter_outside_safe(
-    xy: Tensor, shape: Tensor, border: int = 0
+    xy: Tensor, shape: Tensor | tuple[int, int], border: int = 0
 ) -> tuple[Tensor, Tensor]:
     """
     Identifies points outside the image.
@@ -141,7 +141,7 @@ def filter_outside_safe(
         outside_mask: Boolean mask where True indicates the point was outside.
     """
     # Handle both single shape [H, W] and batched shapes [B, 2]
-    if shape.ndim == 1:
+    if isinstance(shape, tuple) or (shape).ndim == 1:
         H, W = shape[0], shape[1]
     else:
         # shape is (B, 2). We need (B, 1) for broadcasting against (B, n)

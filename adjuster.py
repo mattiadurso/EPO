@@ -56,7 +56,6 @@ from helpers.reprojection_compiled import (
 )
 from helpers.reconstruction import build_reconstruction
 from helpers.frustum import build_view_graph_from_frustums
-from extractors.canny import CannyEdgeDetector
 from modules.camera import CameraModule
 from modules.pose import PoseModule
 from modules.parameters_module import ParameterModule
@@ -134,7 +133,12 @@ class Adjuster(nn.Module):
     ):
         super().__init__()
 
-        assert detector in ["canny"], f"Detector {detector} not supported."
+        assert detector in [
+            "canny",
+            "sam2",
+            "bdcn",
+            "teed",
+        ], f"Detector {detector} not supported."
 
         self.max_workers = os.cpu_count() if max_workers < 0 else max_workers
         self.images_size = 518
@@ -158,6 +162,8 @@ class Adjuster(nn.Module):
 
         # Edge extractor
         if detector == "canny":
+            from extractors.canny import CannyEdgeDetector
+
             self.edge_extractor = CannyEdgeDetector(
                 low_threshold=detector_params.get("low_threshold", 0.20),
                 high_threshold=detector_params.get("high_threshold", 0.25),
@@ -166,7 +172,22 @@ class Adjuster(nn.Module):
                 sigma=detector_params.get("sigma", 2.0),
                 device=device,
             )
+        elif detector == "sam2":
+            from extractors.SAM2.sam2_wrapper import SAM2EdgePointExtractor
 
+            self.edge_extractor = SAM2EdgePointExtractor(device=device, size="large")
+
+        elif detector == "bdcn":
+            from extractors.BDCN.bdcn_wrapper import BDCNEdgeDetector
+
+            self.edge_extractor = BDCNEdgeDetector(device=device)
+        elif detector == "teed":
+            from extractors.TEED.teed_wrapper import TeedWrapper
+
+            self.edge_extractor = TeedWrapper(
+                checkpoint_path="extractors/TEED/checkpoints/BIPED/5/5_model.pth",  # not cleare which is best, demo uses 5
+                device=device,
+            )
         # what to train
         self.grad_q = grad_q
         self.grad_t = grad_t
@@ -319,9 +340,11 @@ class Adjuster(nn.Module):
         self,
         max_steps=100,
         batch_size=128,
+        residuals_chunk_size=1024,
         early_stopping=True,
         verbose=True,
         drop_last=True,
+        debug=True,
     ):
         """
         Main optimization loop.
@@ -373,12 +396,17 @@ class Adjuster(nn.Module):
             self.timings["step_pre_computation"] += time.time() - t_pre
 
             # Compute residuals
-            residuals = self.compute_forward_step(
-                self.viewgraph, batch_size=batch_size, drop_last=drop_last
+            residuals, sampled_viewgraphs = self.compute_forward_step(
+                self.viewgraph,
+                batch_size=batch_size,
+                drop_last=drop_last,
+                residuals_chunk_size=residuals_chunk_size,
             )
 
             # Compute loss
-            loss = self._compute_batched_loss(residuals)
+            loss = self._compute_batched_loss(
+                residuals, sampled_viewgraphs, debug=debug
+            )
 
             # Backpropagate and update using GradScaler if available
             self._scaler_and_scheduler_steps(loss)
@@ -405,7 +433,7 @@ class Adjuster(nn.Module):
             # DEBUG: Evaluate AUC if GT available
             if self.gt_path is not None and step % 1 == 0:
                 auc_th = [1, 3, 5]
-                opt = "optimized_reconstruction_GD"
+                opt = "optimized_reconstruction_GD/_current_test"
                 self.to_colmap(opt, save_points=False, verbose=False)
                 AUC_score_max, num_images, df_optim = eval_colmap_model(
                     opt, self.gt_path, return_df=False, thrs=auc_th
@@ -514,7 +542,11 @@ class Adjuster(nn.Module):
         return batch, pad_masks, dt_fields
 
     def compute_forward_step(
-        self, sampled_viewgraph, batch_size=1024, chunk_size=4096, drop_last=False
+        self,
+        sampled_viewgraph,
+        batch_size=1024,
+        residuals_chunk_size=1024,
+        drop_last=True,
     ):
         """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss."""
 
@@ -527,12 +559,17 @@ class Adjuster(nn.Module):
         else:
             sampled_viewgraphs.append(sampled_viewgraph)
 
+        if (
+            len(sampled_viewgraphs) > 1  # to avoid dropping when only one batch
+            and len(sampled_viewgraphs[-1]) < batch_size
+            and drop_last
+        ):
+            sampled_viewgraphs = sampled_viewgraphs[:-1]
+
         # collect per-batch results in a python list (tensors)
         residuals_list = []
         # i might want to process batches of same size and drop last batch
         for sampled_viewgraph in sampled_viewgraphs:
-            if drop_last and len(sampled_viewgraph) < batch_size:
-                continue
             # prepare batched inputs
             s_time = time.time()
             batch, pad_masks, dt_fields = self._create_batched_inputs(sampled_viewgraph)
@@ -564,9 +601,9 @@ class Adjuster(nn.Module):
                 total_sum = torch.zeros(B, device=self.device, dtype=self.dtype)
                 total_count = torch.zeros(B, device=self.device, dtype=torch.long)
 
-                for i in range(0, N, chunk_size):
-                    r_chunk = residuals[:, i : i + chunk_size]
-                    m_chunk = valid_mask[:, i : i + chunk_size]
+                for i in range(0, N, residuals_chunk_size):
+                    r_chunk = residuals[:, i : i + residuals_chunk_size]
+                    m_chunk = valid_mask[:, i : i + residuals_chunk_size]
 
                     # Pass the clean residual chunk and the merged validity mask
                     s_chunk, c_chunk = compute_chunk_loss_logic(r_chunk, m_chunk)
@@ -589,9 +626,11 @@ class Adjuster(nn.Module):
         # concatenate all collected batch results
         residuals = torch.cat(residuals_list, dim=0)  # (num_pairs,)
 
-        return residuals
+        return residuals, sampled_viewgraphs
 
-    def _compute_batched_loss(self, residuals, delta=1.0):
+    def _compute_batched_loss(
+        self, residuals, sampled_viewgraphs=None, debug=False, delta=1.0
+    ):
         """Vectorized batched loss computation."""
         s_time = time.time()
 
@@ -601,7 +640,7 @@ class Adjuster(nn.Module):
         residuals_pairs = residuals.view(-1, 2)
 
         # clamp residuals. 15 is quite high already
-        residuals_pairs = torch.clamp(residuals_pairs, min=0, max=15.0)
+        residuals_pairs = torch.clamp(residuals_pairs, min=0, max=10.0)
 
         # Use Huber loss for robust cost
         pair_losses = F.huber_loss(
@@ -611,6 +650,21 @@ class Adjuster(nn.Module):
             delta=delta,
         )
         pair_losses = residuals_pairs.sum(dim=1)  # (num_pairs,)
+
+        # if sampled_viewgraphs is given, store per-pair losses for logging
+        if sampled_viewgraphs is not None and debug:
+            if not hasattr(self, "residuals"):
+                self.residuals = []
+
+            residuals_iteration = {}
+            pair_idx = 0
+            for viewgraph in sampled_viewgraphs:
+                for i, j in viewgraph:
+                    residuals_iteration[(i, j)] = (
+                        pair_losses[pair_idx].detach().cpu().item()
+                    )
+                    pair_idx += 1
+            self.residuals.append(residuals_iteration)
 
         # Mean over pairs
         loss = pair_losses.mean()
@@ -657,7 +711,7 @@ class Adjuster(nn.Module):
         else:  # one camera per image
             # Reading cameras from images
             for cam in self.recon.cameras.values():
-                cam_id, model, new_params = self.process_camera(cam)
+                cam_id, model, new_params = process_camera(cam)
                 intrinsics[cam.camera_id] = {
                     "cam_id": cam_id,
                     "model": model,
@@ -991,9 +1045,11 @@ class Adjuster(nn.Module):
 
     def _pad_edges(self):
         """Pad all edges to have same number (max_edges) of edges per image."""
-        max_edges = max(
-            [self.images[img]["edges"].shape[0] for img in self.images.keys()]
-        )
+        num_edges = [self.images[img]["edges"].shape[0] for img in self.images.keys()]
+        max_edges = max(num_edges)
+        min_edges = min(num_edges)
+        avg_edges = sum(num_edges) / len(num_edges)
+        median_edges = sorted(num_edges)[len(num_edges) // 2]
 
         for image_name in self.images.keys():
             edges = self.images[image_name]["edges"]
@@ -1018,7 +1074,10 @@ class Adjuster(nn.Module):
             )
 
         self.max_edges = max_edges
-        print(f"Max edges per image: {self.max_edges:,}")
+        print(f"Max edges per image: {self.max_edges:,.2f}")
+        print(f"Min edges per image: {min_edges:,.2f}")
+        print(f"Avg edges per image: {avg_edges:,.2f}")
+        print(f"Median edges per image: {median_edges:,.2f}")
 
     @torch.no_grad()
     def _compute_distance_fields(self):
@@ -1208,6 +1267,11 @@ class Adjuster(nn.Module):
             dbscan_min_samples=dbscan_min_samples,
         )
 
+        # save loading time and optimization time in timings.txt in same folder as output_path
+        timings_path = os.path.join(output_path, "timings.txt")
+        with open(timings_path, "w") as f:
+            for key, value in self.timings.items():
+                f.write(f"{key}: {value:.4f} s\n")
         return recon
 
     ### Misc

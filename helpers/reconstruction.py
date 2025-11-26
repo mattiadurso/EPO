@@ -133,9 +133,9 @@ def build_reconstruction(
     for cam_id in camera_scales:
         camera_scales[cam_id] = np.median(camera_scales[cam_id])
 
-    for (
-        cam_id
-    ) in unique_cam_ids:  # Fixed: iterate over unique camera IDs found in images
+    for idx, cam_id in enumerate(
+        unique_cam_ids
+    ):  # Fixed: iterate over unique camera IDs found in images
         # Get camera parameters as numpy array
         model, params = adjuster.intrinsics.get_camera_parameters(cam_id)
         params = params.detach().cpu().numpy()
@@ -158,6 +158,7 @@ def build_reconstruction(
             params[1] /= scale  # cx
             params[2] /= scale  # cy
             model = pycolmap.CameraModelId.SIMPLE_PINHOLE
+
         else:
             raise ValueError(f"Unsupported camera model: {model}")
 
@@ -177,7 +178,16 @@ def build_reconstruction(
         height = int(height / scale)
 
         # Convert cam_id to int for COLMAP
-        cam_id_int = int(cam_id) if isinstance(cam_id, str) else cam_id
+        if isinstance(cam_id, str):
+            cam_id_int = int(cam_id)
+        elif cam_id is None:
+            cam_id_int = idx + 1  # assign a new ID
+        elif isinstance(cam_id, int):
+            cam_id_int = cam_id
+        else:
+            raise ValueError(
+                f"Unsupported cam_id type: {type(cam_id)}, value: {cam_id}"
+            )
 
         # Create and register camera
         cam = pycolmap.Camera(
