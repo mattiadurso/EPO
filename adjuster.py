@@ -292,9 +292,10 @@ class Adjuster(nn.Module):
             grad=self.grad_z,
         )
 
-        self.viewgraph_ids = [
+        viewgraph_ids = [
             (self.image_id_map[i], self.image_id_map[j]) for i, j in self.viewgraph
         ]
+        self.viewgraph_ids = torch.tensor(viewgraph_ids).long().to(self.device)
         # ==========================================================================
         # Create optimizer
         params_to_optimize = self._collect_parameters_to_optimize()
@@ -480,8 +481,8 @@ class Adjuster(nn.Module):
         cam_ids = [self.images[name]["cam_id"] for name in image_names]
 
         # indexing data
-        K_batch = self.intrinsics.get_intrinsic_matrix(cam_ids)  # (B, 3, 3)
-        P_batch = self.poses.get_projection_matrix(image_names)  # (B, 4, 4)
+        K_batch = self.intrinsics.get_intrinsic_matrix_inverse(cam_ids)  # (B, 3, 3)
+        P_batch = self.poses.get_projection_matrix_inverse(image_names)  # (B, 4, 4)
         edges_batch = self.edges_padded.get_parameters(image_names)  # (B, N, 2)
         depth_batch = self.sampled_depth.get_parameters(image_names)  # (B, 1, H, W)
 
@@ -497,7 +498,7 @@ class Adjuster(nn.Module):
             P0 = P_batch[i : i + batch_size]
 
             pts3d = unproject_2D_to_world(
-                xy0=xy0, K0=K0, depth0=depth0, P0=P0
+                xy0=xy0, K0=K0, depth0=depth0, P0=P0, skip_inversion=True
             )  # (bs, N, 3)
             points_3D_list.append(pts3d)
 
