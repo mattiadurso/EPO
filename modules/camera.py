@@ -181,9 +181,10 @@ class CameraModule(nn.Module):
         indices = self.map_camera_ids_to_indices(camera_ids)
         return self._build_simple_pinhole(indices, indices.shape[0])
 
-    def intrinsic_matrix_inverse(self, camera_ids) -> torch.Tensor:
-        """Get inverse intrinsic matrices for given camera IDs. Works for any mix of models."""
-        return torch.linalg.inv(self.intrinsic_matrix(camera_ids))
+    def get_intrinsic_matrix_inverse(self, camera_ids) -> torch.Tensor:
+        """Get inverse intrinsic matrices for given camera IDs. Uses precomputed inverses."""
+        indices = self.map_camera_ids_to_indices(camera_ids)
+        return self.cameras_inv[indices]
 
     def __repr__(self):
         s = "CameraModel:\n"
@@ -211,3 +212,4 @@ class CameraModule(nn.Module):
         """Init/Update all intrinsic matrices for all cameras and store them internally."""
         all_ids = self.keys
         self.cameras = self.get_intrinsic_matrix(all_ids)
+        self.cameras_inv = torch.linalg.inv(self.cameras)
