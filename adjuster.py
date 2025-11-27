@@ -46,7 +46,6 @@ from losses.dt_loss import (
 )
 from helpers.reprojection import (
     filter_viewgraph_by_reprojection,
-    reproject_2D_2D,
     grid_sample_nan,
 )
 from helpers.reprojection_compiled import (
@@ -345,7 +344,7 @@ class Adjuster(nn.Module):
         early_stopping=True,
         verbose=True,
         drop_last=True,
-        debug=True,
+        debug=False,
     ):
         """
         Main optimization loop.
@@ -1242,7 +1241,7 @@ class Adjuster(nn.Module):
         # scheduler step
         if self.scheduler is not None:
             if self.scheduler.__class__.__name__ == "ReduceLROnPlateau":
-                self.scheduler.step(loss)
+                self.scheduler.step(loss.detach())
             else:
                 self.scheduler.step()
 
