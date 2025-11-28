@@ -59,14 +59,16 @@ class Edges3DModule(nn.Module):
         # Return as LongTensor on the correct device for indexing
         return torch.tensor(indices, dtype=torch.long, device=self.device)
 
-    def get_parameters(self, ids) -> torch.Tensor:
+    def get_parameters(self, indices) -> torch.Tensor:
         """
         Returns parameters for the requested IDs.
 
         Args:
-            ids: Single ID (str/int), list, tuple, or tensor of IDs
+            indices: Single index (int), list, tuple, or tensor of indices
         """
-        indices = self.map_ids_to_indices(ids)
+        indices = (
+            self.map_ids_to_indices(indices) if isinstance(indices[0], str) else indices
+        )
         return self.params[indices]
 
     def __repr__(self) -> str:

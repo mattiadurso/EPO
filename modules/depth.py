@@ -62,7 +62,7 @@ class DepthModule(nn.Module):
 
     def get_parameters(self, ids):
         """Return depth parameters - ensures gradient flow"""
-        indices = self.map_ids_to_indices(ids)
+        indices = self.map_ids_to_indices(ids) if isinstance(ids[0], str) else ids
         # Return depth in linear space by exponentiating the stored log-depths
         return torch.exp(self.params[indices])
 

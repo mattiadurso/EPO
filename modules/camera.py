@@ -79,23 +79,25 @@ class CameraModule(nn.Module):
     def get_all_intrinsic_matrix(self):
         return self.keys, self.get_intrinsic_matrix(self.keys)
 
-    def get_intrinsic_matrix(self, camera_ids) -> torch.Tensor:
+    def get_intrinsic_matrix(self, indices) -> torch.Tensor:
         """Construct K matrix from parameters on-the-fly. Handles mixed models."""
 
         # 1. Get the internal row indices for the requested cameras
-        tensor_indices = self.map_camera_ids_to_indices(camera_ids)
-        batch_size = tensor_indices.shape[0]
+        if isinstance(indices[0], str):
+            indices = self.map_camera_ids_to_indices(indices)
+
+        batch_size = indices.shape[0]
 
         # 2. Retrieve the model type for these specific cameras
         # Use standard indexing, k_models_ids is a buffer
-        models_in_batch = self.k_models_ids[tensor_indices]
+        models_in_batch = self.k_models_ids[indices]
 
         # 3. Check if we can take a fast path (all cameras are the same type)
         if (models_in_batch == 0).all():
-            return self._build_pinhole(tensor_indices, batch_size)
+            return self._build_pinhole(indices, batch_size)
 
         elif (models_in_batch == 1).all():
-            return self._build_simple_pinhole(tensor_indices, batch_size)
+            return self._build_simple_pinhole(indices, batch_size)
 
         # 4. Mixed Case: Vectorized Masking
         else:
@@ -110,13 +112,13 @@ class CameraModule(nn.Module):
             # Process PINHOLE cameras
             if mask_pinhole.any():
                 # Filter indices relevant to pinhole
-                idx_pinhole = tensor_indices[mask_pinhole]
+                idx_pinhole = indices[mask_pinhole]
                 # Calculate and assign to the masked slice of K
                 K[mask_pinhole] = self._build_pinhole(idx_pinhole, idx_pinhole.shape[0])
 
             # Process SIMPLE_PINHOLE cameras
             if mask_simple.any():
-                idx_simple = tensor_indices[mask_simple]
+                idx_simple = indices[mask_simple]
                 K[mask_simple] = self._build_simple_pinhole(
                     idx_simple, idx_simple.shape[0]
                 )
@@ -160,30 +162,13 @@ class CameraModule(nn.Module):
         K[:, 2, 2] = 1.0
         return K
 
-    # --- Wrappers for backward compatibility or specific calls ---
-    def intrinsic_matrix_pinhole(self, camera_ids) -> torch.Tensor:
-        """Assumes all cameras are PINHOLE
-        Args:
-            camera_ids: list or tensor of camera IDs in the reconstruction
-        Returns:
-            K: Bx3x3 intrinsic matrices
-        """
-        indices = self.map_camera_ids_to_indices(camera_ids)
-        return self._build_pinhole(indices, indices.shape[0])
-
-    def intrinsic_matrix_simple_pinhole(self, camera_ids) -> torch.Tensor:
-        """Assumes all cameras are SIMPLE_PINHOLE
-        Args:
-            camera_ids: list or tensor of camera IDs in the reconstruction
-        Returns:
-            K: Bx3x3 intrinsic matrices
-        """
-        indices = self.map_camera_ids_to_indices(camera_ids)
-        return self._build_simple_pinhole(indices, indices.shape[0])
-
-    def get_intrinsic_matrix_inverse(self, camera_ids) -> torch.Tensor:
+    def get_intrinsic_matrix_inverse(self, indices) -> torch.Tensor:
         """Get inverse intrinsic matrices for given camera IDs. Uses precomputed inverses."""
-        indices = self.map_camera_ids_to_indices(camera_ids)
+        indices = (
+            self.map_camera_ids_to_indices(indices)
+            if isinstance(indices[0], str)
+            else indices
+        )
         return self.cameras_inv[indices]
 
     def __repr__(self):
@@ -203,9 +188,11 @@ class CameraModule(nn.Module):
         """Return list of trainable parameters - only self.params is a leaf tensor"""
         return [self.k_params]  # Changed: return iterator like nn.Module
 
-    def get_camera_parameters(self, camera_ids) -> torch.Tensor:
+    def get_camera_parameters(self, indices) -> torch.Tensor:
         """Get camera parameters for given camera IDs."""
-        indices = self.map_camera_ids_to_indices(camera_ids)
+        if isinstance(indices[0], str):
+            indices = self.map_camera_ids_to_indices(indices)
+
         return self.k_models[indices], self.k_params[indices].squeeze()
 
     def update_all_matrices(self):

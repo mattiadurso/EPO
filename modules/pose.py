@@ -65,30 +65,29 @@ class PoseModule(nn.Module):
 
         self.update_all_matrices()  # Precompute all extrinsic matrices
 
-    def map_names_to_indices(self, image_names) -> torch.LongTensor:
+    def map_names_to_indices(self, indices) -> torch.LongTensor:
         """Robustly maps string names to tensor indices."""
         # Handle single string input
-        if isinstance(image_names, str):
-            image_names = [image_names]
+        if isinstance(indices, str):
+            indices = [indices]
+
+        elif isinstance(indices, torch.Tensor):
+            return torch.tensor(indices, dtype=torch.long, device=self.device)
 
         try:
-            indices = [self.image_to_tensor_idx[name] for name in image_names]
+            indices = [self.image_to_tensor_idx[name] for name in indices]
         except KeyError as e:
             raise ValueError(
                 f"Image name {e} not found in PoseModel initialization dict."
             )
-
         return torch.tensor(indices, dtype=torch.long, device=self.device)
 
-    def get_rotation_matrix(self, image_names) -> torch.Tensor:
+    def get_rotation_matrix(self, indices) -> torch.Tensor:
         """
         Returns (B, 3, 3) Rotation Matrix for the requested images.
         """
         # First normalize all quaternions (important for stability)
         self.q_batch = self.q_param / torch.norm(self.q_param, dim=1, keepdim=True)
-
-        # Map names to indices
-        indices = self.map_names_to_indices(image_names)
 
         # 1. Get raw quaternions for batch
         q_batch = self.q_param[indices]
@@ -97,21 +96,21 @@ class PoseModule(nn.Module):
         # PyPose SO3 wraps (x,y,z,w)
         return pp.SO3(q_batch).matrix()
 
-    def get_translation(self, image_names) -> torch.Tensor:
+    def get_translation(self, indices) -> torch.Tensor:
         """Returns (B, 3) Translation vectors"""
-        indices = self.map_names_to_indices(image_names)
         return self.t_param[indices]
 
-    def get_projection_matrix(self, image_names) -> torch.Tensor:
+    def get_projection_matrix(self, indices) -> torch.Tensor:
         """
         Constructs 4x4 SE3 Matrix [R|t].
         Standard convention: World-to-Camera.
         """
-        indices = self.map_names_to_indices(image_names)
         batch_size = len(indices)
+        if isinstance(indices[0], str):
+            indices = self.map_names_to_indices(indices)
 
         # Retrieve components
-        R = self.get_rotation_matrix(image_names)  # (B, 3, 3)
+        R = self.get_rotation_matrix(indices)  # (B, 3, 3)
         t = self.t_param[indices]  # (B, 3)
 
         # Build 4x4 Matrix
@@ -121,17 +120,18 @@ class PoseModule(nn.Module):
 
         return P
 
-    def get_projection_matrix_inverse(self, image_names) -> torch.Tensor:
+    def get_projection_matrix_inverse(self, indices) -> torch.Tensor:
         """
         Constructs 4x4 SE3 Inverse Matrix [R^T | -R^T * t].
         Numerically stable inversion (Camera-to-World).
         """
-        indices = self.map_names_to_indices(image_names)
-        batch_size = len(indices)
+
+        if isinstance(indices[0], str):
+            indices = self.map_names_to_indices(indices)
 
         # Get components
-        R = self.get_rotation_matrix(image_names)  # (B, 3, 3)
-        t = self.t_param[indices]  # (B, 3)
+        R = self.get_rotation_matrix(indices)  # (B, 3, 3)
+        t = self.get_translation(indices)  # (B, 3)
 
         # Stable Inversion Logic:
         # P_inv = | R^T   -R^T * t |
@@ -142,6 +142,7 @@ class PoseModule(nn.Module):
         t_inv = -torch.bmm(R_T, t.unsqueeze(2))
 
         # Build Matrix
+        batch_size = len(indices)
         P_inv = torch.eye(4, device=self.device, dtype=R.dtype).repeat(batch_size, 1, 1)
         P_inv[:, :3, :3] = R_T
         P_inv[:, :3, 3:4] = t_inv  # Assign Bx3x1 directly to column slice
