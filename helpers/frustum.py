@@ -38,7 +38,7 @@ def build_view_graph_from_frustums(
     recon,  # or recon_path
     z_near_default=0.1,
     z_far_default=5.0,
-    max_view_angle_deg=75.0,
+    max_view_angle_deg=30.0,
     distance_factor=2,
     verbose=True,
     images_with_depth=None,

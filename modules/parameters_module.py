@@ -66,7 +66,7 @@ class ParameterModule(nn.Module):
         Args:
             ids: Single ID (str/int), list, tuple, or tensor of IDs
         """
-        indices = self.map_ids_to_indices(ids)
+        indices = self.map_ids_to_indices(ids) if isinstance(ids[0], str) else ids
         return self.params[indices]
 
     def __repr__(self) -> str:

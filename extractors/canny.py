@@ -10,11 +10,11 @@ class CannyEdgeDetector(nn.Module):
 
     def __init__(
         self,
-        low_threshold: float = 0.15,
+        low_threshold: float = 0.2,
         high_threshold: float = 0.25,
         hysteresis: bool = True,
         kernel_size: int = 7,
-        sigma: float = 5.0,
+        sigma: float = 2.0,
         device: str = "cuda",
     ):
         """
