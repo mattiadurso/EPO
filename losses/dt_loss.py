@@ -39,7 +39,7 @@ def compute_distance_field_cv2(
     field = torch.from_numpy(field_np).to(device=device, dtype=dtype)
 
     # Normalize to [-1, 1] using tanh
-    field = torch.tanh(field)
+    # field = torch.tanh(field)
 
     return field
 
