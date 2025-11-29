@@ -47,21 +47,19 @@ for scene in scenes:
         reconstruction_path=reconstruction_path,
         images_path=images_path,
         depths_path=depths_path,
-        unreliable_area_masks_path=images_path.replace(
-            dataset_cfg["images_folder"], "depth_masks_mask2former"
-        ),
-        # intrinsics
+        # unreliable_area_masks_path=images_path.replace(
+        #     dataset_cfg["images_folder"], "depth_masks_mask2former"
+        # ),
+        # intrinsics averaging
         single_camera_per_folder=True,
         # detect and match
-        detector="teed",
-        matcher_type="frustum",  # or "exhaustive", "sequential"
-        scheduler_params={"factor": 0.75, "patience": 3, "min_lr": 1e-5},
+        detector="canny",
+        matcher_type="frustums",  # or "exhaustive", "sequential"
         # optimization
-        lr=5e-4,
         grad_z=True,
-        grad_q=True,
         grad_k=True,
         grad_t=True,
+        grad_q=True,
     )
 
     adjuster(batch_size=256, max_steps=-1, residuals_chunk_size=2048, debug=False)
