@@ -93,7 +93,6 @@ class PoseModule(nn.Module):
         q_batch = self.q_param[indices]
 
         # 3. Convert to Matrix via PyPose
-        # PyPose SO3 wraps (x,y,z,w)
         return pp.SO3(q_batch).matrix()
 
     def get_translation(self, indices) -> torch.Tensor:

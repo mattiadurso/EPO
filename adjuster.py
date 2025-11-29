@@ -135,7 +135,6 @@ class Adjuster(nn.Module):
         k_lr_scale=0.5,
         z_lr_scale=0.1,
         viz=False,  # it true del non used stuff during computation
-        gt_path=None,
     ):
         super().__init__()
 
@@ -160,7 +159,6 @@ class Adjuster(nn.Module):
         self.use_amp = use_amp
         self.amp_dtype = amp_dtype
         self.dtype = torch.float32  # hardcode to float32 for stability
-        self.gt_path = gt_path
         self.auc_th = [1, 3, 5]
         self.auc_saving_freq = 3
         self.viewgraph_path = viewgraph_path
@@ -272,7 +270,7 @@ class Adjuster(nn.Module):
         edges_padded = torch.stack(edges_padded, dim=0).to(
             self.device, dtype=self.dtype
         )
-        pad_masks = torch.stack(pad_masks, dim=0).to(self.device, dtype=self.dtype)
+        pad_masks = torch.stack(pad_masks, dim=0).to(self.device).bool()
         dt_fields = torch.stack(dt_fields, dim=0).to(self.device, dtype=self.dtype)
         images_shapes = torch.stack(images_shapes, dim=0).to(
             self.device, dtype=self.dtype
@@ -373,6 +371,7 @@ class Adjuster(nn.Module):
         verbose=True,
         drop_last=True,
         debug=False,
+        gt_path=None,
     ):
         """
         Main optimization loop.
@@ -387,7 +386,7 @@ class Adjuster(nn.Module):
         """
         time_start = time.time()
 
-        num_batches = len(self.viewgraph) // batch_size
+        num_batches = math.ceil(len(self.viewgraph) / batch_size)
         num_batches = num_batches if drop_last else num_batches + 1
         max_steps = max_steps if max_steps > 0 else 1_000
         if verbose:
@@ -459,16 +458,12 @@ class Adjuster(nn.Module):
                 self.lr_list[i].append(param_group["lr"])
 
             # DEBUG: Evaluate AUC if GT available
-            if (
-                self.gt_path is not None
-                and step % self.auc_saving_freq == 0
-                and step > 0
-            ):
+            if gt_path is not None and step % self.auc_saving_freq == 0 and step > 0:
 
                 opt = "optimized_reconstruction_GD/_current_test"
                 self.to_colmap(opt, save_points=False, verbose=False)
                 AUC_score_max, num_images, df_optim = eval_colmap_model(
-                    opt, self.gt_path, return_df=False, thrs=self.auc_th
+                    opt, gt_path, return_df=False, thrs=self.auc_th
                 )
                 # store AUC
                 for i, th in enumerate(self.auc_th):
@@ -628,7 +623,7 @@ class Adjuster(nn.Module):
                 enabled=self.use_amp,
             ):
                 # projection and sampling
-                residuals, outside_mask = project_and_sample_logic(
+                residuals, inside_mask = project_and_sample_logic(
                     batch["xyz_world"],
                     batch["K1"],
                     batch["P1"],
@@ -638,10 +633,9 @@ class Adjuster(nn.Module):
                 )
 
                 # chunked computation of loss over residuals
-                valid_mask = (pad_masks > 0) & (~outside_mask)
+                valid_mask = pad_masks & inside_mask
 
                 B, N = residuals.shape
-
                 total_sum = torch.zeros(B, device=self.device, dtype=self.dtype)
                 total_count = torch.zeros(B, device=self.device, dtype=torch.long)
 
@@ -1665,3 +1659,51 @@ class Adjuster(nn.Module):
 
         plt.savefig(filepath, dpi=100, bbox_inches="tight")
         plt.close()
+
+
+if __name__ == "__main__":
+    scene = "vienna_state_opera"
+    which_data = "data_test" if scene == "graz_main_square" else "data"
+
+    reconstruction_path = (
+        f"/home/mattia/Desktop/Repos/vggt/wrapper_output/{scene}/sparse"
+    )
+    images_path = f"/home/mattia/Desktop/datasets/mydataset/{which_data}/{scene}/frames"
+    depths_path = (
+        f"/home/mattia/Desktop/Repos/vggt/wrapper_output/{scene}/sparse/depth_maps"
+    )
+    gt_path = (
+        f"/home/mattia/Desktop/datasets/mydataset/{which_data}/{scene}/colmap/sparse/0"
+    )
+    # unreliable_area_masks_path = images_path.replace(dataset_cfg["images_folder"], "depth_masks_mask2former")
+
+    adjuster = Adjuster(
+        reconstruction_path=reconstruction_path,
+        images_path=images_path,
+        depths_path=depths_path,
+        # unreliable_area_masks_path=unreliable_area_masks_path,
+        single_camera_per_folder=True,
+        grad_k=True,
+        grad_q=True,
+        grad_t=True,
+        grad_z=True,
+        detector="teed",  # or "canny", "bdcn", "sam2"
+        # # outdoor
+        lr=5e-4,
+        matcher_type="frustums",  # or "exhaustive", "sequential"
+        scheduler_params={"factor": 0.75, "patience": 3, "min_lr": 1e-4},
+        detector_params={
+            "low_threshold": 0.20,
+            "high_threshold": 0.25,
+            "kernel_size": 7,
+            "sigma": 2,
+        },
+        viz=True,
+    )
+
+    adjuster(
+        batch_size=256,
+        max_steps=-1,
+        debug=True,  # tracks the residuals, slightly increases timing
+        gt_path=gt_path,
+    )

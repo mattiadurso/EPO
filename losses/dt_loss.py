@@ -36,10 +36,12 @@ def compute_distance_field_cv2(
     field_np = cv2.distanceTransform(mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
 
     # 4. Convert back to Torch
-    field = torch.from_numpy(field_np)
+    field = torch.from_numpy(field_np).to(device=device, dtype=dtype)
 
-    # 5. Match requested device and dtype
-    return field.to(device=device, dtype=dtype)
+    # Normalize to [-1, 1] using tanh
+    field = torch.tanh(field)
+
+    return field
 
 
 # this has 1:1 correspondence with cv2 version, but is slower
@@ -104,9 +106,6 @@ def sample_distance_field(
 
     norm_x = (x / (W - 1)) * 2 - 1
     norm_y = (y / (H - 1)) * 2 - 1
-
-    # Note: We don't check for NaNs here anymore.
-    # Inputs must be filtered before calling this function.
 
     # Stack: (B, N, 1, 2) required for grid_sample 4D input
     grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(2)
