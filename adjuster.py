@@ -109,7 +109,7 @@ class Adjuster(nn.Module):
         depths_path,
         viewgraph_path=None,  # for testing with GT viewgraph
         unreliable_area_masks_path=None,
-        lr=1e-3,
+        lr=5e-3,
         single_camera_per_folder=True,
         load_with_pad=False,
         detector="canny",
@@ -120,7 +120,7 @@ class Adjuster(nn.Module):
         max_edges_points=16_384,  # reasonabe number
         max_viewgraph_pairs=8_192,  # limit on 4090
         scheduler_name="ReduceLROnPlateau",
-        scheduler_params={"factor": 0.75, "patience": 2, "min_lr": 1e-6},
+        scheduler_params={"factor": 0.75, "patience": 3, "min_lr": 1e-5},
         use_amp=True,
         amp_dtype=torch.bfloat16,  # torch.float16
         matcher_type="frustums",  # or "sequential"
@@ -168,6 +168,8 @@ class Adjuster(nn.Module):
         self.max_edges = max_edges_points
         self.max_viewgraph_pairs = max_viewgraph_pairs
         self.unreliable_area_masks_path = unreliable_area_masks_path
+        self.scheduler_name = scheduler_name
+        self.scheduler_params = scheduler_params
 
         # Edge extractor
         if detector == "canny":
@@ -328,7 +330,7 @@ class Adjuster(nn.Module):
 
         # Create optimizer with collected parameters
         self._load_optimizer(params_to_optimize)
-        self._load_scheduler(scheduler_name, self.optimizer, scheduler_params)
+        self._load_scheduler(self.scheduler_name, self.optimizer, self.scheduler_params)
         if self.use_amp:
             self.scaler = torch.amp.GradScaler()
 
@@ -372,6 +374,7 @@ class Adjuster(nn.Module):
         drop_last=True,
         debug=False,
         gt_path=None,
+        min_lr=1e-5,
     ):
         """
         Main optimization loop.
@@ -392,7 +395,7 @@ class Adjuster(nn.Module):
         if verbose:
             print(
                 f"Processing {len(self.viewgraph):,} pairs with batch size {batch_size:,} ({num_batches} batches per iteration).",
-                f"Using {self.images[list(self.images.keys())[0]]['edges_padded'].numel()//2:,} edges per image",  # // due to x and y
+                f"Using {self.images[list(self.images.keys())[0]]['edges_padded'].numel()//2:,} edges per image.",  # // due to x and y
             )
 
             total_points = self.max_edges * len(self.viewgraph)
@@ -483,9 +486,9 @@ class Adjuster(nn.Module):
 
                 self.timings["logging"] += time.time() - logging_time_start
 
-            # Stopping criterion: stop when lr stops decreasing
+            # Stopping criterion: stop when lr stops decreasing | change for cosine annealing
             if early_stopping and current_lr <= self.scheduler_params.get(
-                "min_lr", 1e-4
+                "min_lr", min_lr
             ):
                 print(
                     f"Learning rate reached minimum threshold {current_lr:.2e}"
@@ -1129,15 +1132,16 @@ class Adjuster(nn.Module):
     def _print_params_summary(self, params_to_optimize):
         total_params = 0
         print("\nTotal parameters to optimize:")
-        for key in ["k", "t", "q", "z"]:
+        for key in ["k", "t", "q", "z", "mlp"]:
+            space = 14 if key == "mlp" else 16
             if key not in params_to_optimize:
-                print(f"  {key}: {0:>16,} parameters")
+                print(f"  {key}: {0:>{space},}")
                 continue
             set_params = sum(p.numel() for p in params_to_optimize[key])
-            print(f"  {key}: {set_params:>16,} parameters")
+            print(f"  {key}: {set_params:>{space},}")
             total_params += set_params
-
-        print(f"  {'Total':}: {total_params:>12,} parameters\n")
+        print("-" * 23)
+        print(f"  {'Total':}: {total_params:>12,}\n")
 
     def _load_optimizer(self, params):
         param_groups = []
@@ -1395,9 +1399,13 @@ class Adjuster(nn.Module):
         print("=" * w)
 
     def fix_seed(self):
+        random.seed(self.seed)
+        np.random.seed(self.seed)
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
-        np.random.seed(self.seed)
+        # torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
     def __repr__(self):
         repr_str = f"Adjuster(\n"
