@@ -893,9 +893,9 @@ class Adjuster(nn.Module):
             self,
             viewgraph,
             self.images,
-            min_points=10_000,
-            sampling_factor=1,
-            reprojection_error=5.0,
+            min_points=100,  # 10_000
+            sampling_factor=5,  # 1
+            reprojection_error=5.0,  # 5
             border=10,
             use_amp=self.use_amp,
         )
