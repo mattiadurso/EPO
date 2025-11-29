@@ -238,4 +238,4 @@ def project_and_sample_logic(
     # uv_proj is guaranteed safe, so we don't need NaN checks inside
     sampled_vals = sample_distance_field(dt_fields, uv_proj)
 
-    return sampled_vals, outside_mask
+    return sampled_vals, ~outside_mask
