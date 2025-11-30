@@ -110,6 +110,7 @@ class Adjuster(nn.Module):
         viewgraph_path=None,  # for testing with GT viewgraph
         unreliable_area_masks_path=None,
         lr=5e-3,
+        images_size=518,
         single_camera_per_folder=True,
         load_with_pad=False,
         detector="canny",
@@ -146,7 +147,7 @@ class Adjuster(nn.Module):
         ], f"Detector {detector} not supported."
 
         self.max_workers = os.cpu_count() if max_workers < 0 else max_workers
-        self.images_size = 518
+        self.images_size = images_size
         self.device = device
         self.lr = lr
         self.load_with_pad = load_with_pad
