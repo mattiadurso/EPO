@@ -690,7 +690,7 @@ class Adjuster(nn.Module):
             reduction="none",
             delta=delta,
         )
-        pair_losses = residuals_pairs.sum(dim=1)  # (num_pairs,)
+        pair_losses = pair_losses.sum(dim=1)  # (num_pairs,)
 
         # if sampled_viewgraphs is given, store per-pair losses for logging
         if sampled_viewgraphs is not None and debug:
