@@ -242,16 +242,16 @@ class Adjuster(nn.Module):
         self._extract_edges()  # into self.images
         self.timings["extract_edges"] = time.time() - s_time
 
+        ## Compute Distance Fields
+        s_time = time.time()
+        self._compute_distance_fields()  # into self.images
+        self.timings["compute_distance_fields"] = time.time() - s_time
+
         ## Viewgraph from frustums
         s_time = time.time()
         # compute viewgraph
         self._compute_viewgraph(type=self.matcher_type)
         self.timings["compute_viewgraph"] = time.time() - s_time
-
-        ## Compute Distance Fields
-        s_time = time.time()
-        self._compute_distance_fields()  # into self.images
-        self.timings["compute_distance_fields"] = time.time() - s_time
 
         ## Prepare batched parameters modules that do not need to be optimized
         self.image_id_map = {}
