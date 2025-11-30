@@ -1039,43 +1039,56 @@ class Adjuster(nn.Module):
         num_edges = [self.images[img]["edges"].shape[0] for img in self.images.keys()]
         max_edges = max(num_edges)
         min_edges = min(num_edges)
+        std_edges = torch.std(torch.tensor(num_edges, dtype=self.dtype)).item()
         avg_edges = sum(num_edges) / len(num_edges)
         median_edges = sorted(num_edges)[len(num_edges) // 2]
+        q90 = (
+            torch.quantile(torch.tensor(num_edges, dtype=self.dtype), 0.9).long().item()
+        )
+
+        # this to save some computation/memory
+        # likely only few images have very large number of edges
+        max_edges_to_retain = min(q90, max_edges)
 
         for image_name in self.images.keys():
             edges = self.images[image_name]["edges"]
             n_edges = edges.shape[0]
 
-            if n_edges > self.max_edges:
+            if n_edges > max_edges_to_retain:
                 # randomly sample max_edges
-                indices = torch.randperm(n_edges, device=edges.device)[: self.max_edges]
+                indices = torch.randperm(n_edges, device=edges.device)[
+                    :max_edges_to_retain
+                ]
                 edges = edges[indices]
-                n_edges = self.max_edges
+                n_edges = max_edges_to_retain
 
-            if n_edges < max_edges:
-                pad_size = max_edges - n_edges
+            if n_edges < max_edges_to_retain:
+                pad_size = max_edges_to_retain - n_edges
                 pad = torch.zeros((pad_size, 2), device=edges.device)
                 edges = torch.cat([edges, pad], dim=0)
 
                 pad_mask = torch.zeros(
-                    (max_edges,), device=edges.device, dtype=self.dtype
+                    (max_edges_to_retain,), device=edges.device, dtype=self.dtype
                 )
                 pad_mask[:n_edges] = 1.0
             else:
-                # n_edges == max_edges: all edges are valid
+                # n_edges == max_edges_to_retain: all edges are valid
                 pad_mask = torch.ones(
-                    (max_edges,), device=edges.device, dtype=self.dtype
+                    (max_edges_to_retain,), device=edges.device, dtype=self.dtype
                 )
 
             self.images[image_name].update(
                 {"edges_padded": edges, "pad_mask": pad_mask}
             )
 
-        self.max_edges = max_edges
-        print(f"Max edges per image: {self.max_edges:,.2f}")
-        print(f"Min edges per image: {min_edges:,.2f}")
-        print(f"Avg edges per image: {avg_edges:,.2f}")
-        print(f"Median edges per image: {median_edges:,.2f}")
+        self.max_edges = max_edges_to_retain
+        print(
+            f"Edges stats:\n",
+            f"max: {max_edges:,} |",
+            f"min: {min_edges:,} | avg: {int(avg_edges):,} |",
+            f"std: {std_edges:.2f} |",
+            f"quantiles (0.5, 0.9): {median_edges:,}, {q90:,}",
+        )
 
     @torch.no_grad()
     def _compute_distance_fields(self):
