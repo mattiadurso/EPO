@@ -52,18 +52,10 @@ from helpers.reprojection import (
 )
 from helpers.reprojection_compiled import (
     unproject_2D_to_world,
-    project_world_to_2D,
     project_and_sample_logic,
 )
-from helpers.reconstruction import build_reconstruction
 from helpers.frustum import build_view_graph_from_frustums
-from modules import (
-    CameraModule,
-    PoseModule,
-    ParameterModule,
-    DepthModule,
-    Edges3DModule,
-)
+from modules import *
 
 import sys
 
@@ -71,7 +63,7 @@ sys.path.append("/home/mattia/Desktop/Repos/posebench/benchmarks_3D")
 from benchmark_pose import eval_colmap_model
 
 
-class Adjuster(nn.Module):
+class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
     """
     Module to adjust poses and intrinsics of a given reconstruction using edge alignment losses.
     Args:
