@@ -123,7 +123,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         grad_k=True,
         grad_z=True,
         use_depth_confidence=True,
-        pose_mlp=True,
         q_lr_scale=0.1,
         t_lr_scale=1.0,
         k_lr_scale=0.5,
@@ -864,6 +863,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 images_with_depth=self.images,
                 dtype=self.dtype,
             )
+            min_points = 100
+            sampling_factor = 5
+            reprojection_error = 5.0
 
         elif type == "sequential":
             # Build sequential viewgraph based on sorted image names with a window size of 10
@@ -872,14 +874,17 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             for i in range(len(image_names) - self.sequential_matcher_window):
                 for j in range(1, self.sequential_matcher_window + 1):
                     viewgraph.append((image_names[i], image_names[i + j]))
+            min_points = 200
+            sampling_factor = 5
+            reprojection_error = 3.0
 
         elif type == "exhaustive":
             # Build exhaustive viewgraph (all pairs)
             image_names = sorted(list(self.images.keys()))
-            viewgraph = []
-            for i in range(len(image_names)):
-                for j in range(i + 1, len(image_names)):
-                    viewgraph.append((image_names[i], image_names[j]))
+            viewgraph = list(combinations(image_names, 2))
+            min_points = 750  
+            sampling_factor = 5
+            reprojection_error = 3.0
 
         else:
             raise ValueError(f"Viewgraph type {type} not supported.")
@@ -887,18 +892,23 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         # Filter viewgraph by reprojection
         # min_points shouldbe set such images have enough overlap, maybe at least 25%
         # 518*345*0.25 = 44_677
-        filtered_viewgraph = filter_viewgraph_by_reprojection(
-            self,
-            viewgraph,
-            self.images,
-            min_points=100,  # 10_000
-            sampling_factor=5,  # 1
-            reprojection_error=5.0,  # 5
-            border=10,
-            use_amp=self.use_amp,
+        self.viewgraph, self.valid_points_per_pair = (
+            filter_viewgraph_by_reprojection_batched(
+                viewgraph=viewgraph,
+                images=self.images,
+                intrinsics=self.intrinsics,
+                poses=self.poses,
+                # === parameters =====
+                min_points=min_points,
+                sampling_factor=sampling_factor,
+                reprojection_error=reprojection_error,
+                border=10,
+                # ====================
+                device=self.device,
+                verbose=False,
+            )
         )
 
-        self.viewgraph = filtered_viewgraph
         self.viewgraph.sort(key=lambda x: (x[0], x[1]))
 
     ### Edges
@@ -1221,7 +1231,7 @@ if __name__ == "__main__":
         grad_z=True,
         detector="teed",  # or "canny", "bdcn", "sam2"
         # # outdoor
-        lr=5e-4,
+        lr=1e-3,
         matcher_type="frustums",  # or "exhaustive", "sequential"
         scheduler_params={"factor": 0.75, "patience": 3, "min_lr": 1e-4},
         detector_params={
