@@ -100,7 +100,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         depths_path,
         viewgraph_path=None,  # for testing with GT viewgraph
         unreliable_area_masks_path=None,
-        lr=5e-3,
         images_size=518,
         single_camera_per_folder=True,
         load_with_pad=False,
@@ -111,22 +110,16 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         seed=0,
         max_edges_points=16_384,  # reasonabe number
         max_viewgraph_pairs=8_192,  # limit on 4090
-        scheduler_name="ReduceLROnPlateau",
-        scheduler_params={"factor": 0.75, "patience": 3, "min_lr": 1e-5},
         use_amp=True,
         amp_dtype=torch.bfloat16,  # torch.float16
         matcher_type="frustums",  # or "sequential"
         sequential_matcher_window=5,  # only for sequential matcher
         scene_type="outdoor",  # or "indoor", "object_centric" (not used yet)
-        grad_q=True,
-        grad_t=True,
-        grad_k=True,
-        grad_z=True,
-        use_depth_confidence=True,
-        q_lr_scale=0.1,
-        t_lr_scale=1.0,
-        k_lr_scale=0.5,
-        z_lr_scale=0.1,
+        use_depth_confidence=False,
+        q_lr=1e-4,
+        t_lr=1e-3,
+        k_lr=5e-4,
+        z_lr=1e-4,
         viz=False,  # it true del non used stuff during computation
     ):
         super().__init__()
@@ -141,7 +134,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.max_workers = os.cpu_count() if max_workers < 0 else max_workers
         self.images_size = images_size
         self.device = device
-        self.lr = lr
         self.load_with_pad = load_with_pad
         self.images_path = images_path
         self.depths_path = depths_path
@@ -156,13 +148,10 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.auc_saving_freq = 3
         self.viewgraph_path = viewgraph_path
         self.matcher_type = matcher_type
-        self.scheduler_params = scheduler_params
         self.scene_type = scene_type
         self.max_edges = max_edges_points
         self.max_viewgraph_pairs = max_viewgraph_pairs
         self.unreliable_area_masks_path = unreliable_area_masks_path
-        self.scheduler_name = scheduler_name
-        self.scheduler_params = scheduler_params
         self.use_depth_confidence = use_depth_confidence
 
         # Edge extractor
@@ -193,14 +182,10 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 device=device,
             )
         # what to train
-        self.grad_q = grad_q
-        self.grad_t = grad_t
-        self.grad_k = grad_k
-        self.grad_z = grad_z
-        self.q_lr_scale = q_lr_scale
-        self.t_lr_scale = t_lr_scale
-        self.k_lr_scale = k_lr_scale
-        self.z_lr_scale = z_lr_scale
+        self.q_lr = q_lr
+        self.t_lr = t_lr
+        self.k_lr = k_lr
+        self.z_lr = z_lr
 
         # Loading
         self.timings = {}
@@ -287,7 +272,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             image_id_map=self.image_id_map,
             depth=sampled_depth,
             device=self.device,
-            grad=self.grad_z,
+            lr=self.z_lr,
         )
 
         # Prepare viewgraph with indices for faster access during optimization
@@ -323,8 +308,10 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self._print_params_summary(params_to_optimize)
 
         # Create optimizer with collected parameters
-        self._load_optimizer(params_to_optimize)
-        self._load_scheduler(self.scheduler_name, self.optimizer, self.scheduler_params)
+        # self._load_optimizer(params_to_optimize)
+        # self._load_scheduler(self.scheduler_name, self.optimizer, self.scheduler_params)
+        self.scheduler = None  # init to None
+
         if self.use_amp:
             self.scaler = torch.amp.GradScaler()
 
@@ -348,9 +335,15 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                     self.images[image_name].pop("sky_mask")
 
         self.loss_list = []
-        self.lr_list = {}
+        self.lr_list = {"q": [], "t": [], "k": [], "z": []}
         self.auc_list = {"auc": {th: [] for th in self.auc_th}, "steps": []}
         self.blacklist = set()  # Add this line
+        # current order of optimization: qt -> z -> k
+        self.q_step = True
+        self.t_step = True
+        self.k_step = False
+        self.z_step = False
+        self.convergence = False
 
         self.seed = seed
         self.fix_seed()
@@ -395,9 +388,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             total_points = self.max_edges * len(self.viewgraph)
 
             print(
-                f"Total points to process per iteration: {total_points:,}.\n"
-                + f"Initial learning rate: {self.lr:.2e}.\n"
-                + f"Target learning rate:  {self.scheduler_params.get('min_lr',1e-4):.2e}.",
+                f"Total points to process per iteration: {total_points:,}.",
                 end="\n\n",
             )
 
@@ -405,11 +396,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         else:
             bar = range(max_steps)
 
+        # Forward and backward loop
         for step in bar:
             t_pre = time.time()
 
-            # Initialize optimizer gradients
-            self.optimizer.zero_grad()
+            # Initialize optimizer gradients for all optimizers
+            self.optimizers_zero_grad()
 
             # Update geometric modules
             self.poses.update_all_matrices()
@@ -432,69 +424,108 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 residuals, sampled_viewgraphs, debug=debug
             )
 
-            # Backpropagate and update using GradScaler if available
-            self._scaler_and_scheduler_steps(loss)
+            loss.backward()
 
-            # save lr for stopping criterion
-            current_lr = (
-                self.scheduler.get_last_lr()[0]
-                if self.scheduler is not None
-                else self.lr
-            )
+            self.optimizer_step_and_scheduler_step(step, loss.detach())
+
             # ============================================================
             # Logging
             # ============================================================
-            logging_time_start = time.time()
+            # logging_time_start = time.time()
             self.loss_list.append(loss.detach().item())
 
-            # self.lr_list.append(current_lr)
             # store lr for each group
-            for i, param_group in enumerate(self.optimizer.param_groups):
-                if i not in self.lr_list:
-                    self.lr_list[i] = []
-                self.lr_list[i].append(param_group["lr"])
+            self.lr_list["q"].append((step, self.poses.scheduler_q.get_last_lr()[0]))
+            self.lr_list["t"].append((step, self.poses.scheduler_t.get_last_lr()[0]))
+            self.lr_list["k"].append((step, self.intrinsics.scheduler.get_last_lr()[0]))
+            self.lr_list["z"].append(
+                (step, self.sampled_depth.scheduler.get_last_lr()[0])
+            )
 
-            # DEBUG: Evaluate AUC if GT available
-            if gt_path is not None and step % self.auc_saving_freq == 0 and step > 0:
+            # # DEBUG: Evaluate AUC if GT available
+            # if gt_path is not None and step % self.auc_saving_freq == 0 and step > 0:
 
-                opt = "optimized_reconstruction_GD/_current_test"
-                self.to_colmap(opt, save_points=False, verbose=False)
-                AUC_score_max, num_images, df_optim = eval_colmap_model(
-                    opt, gt_path, return_df=False, thrs=self.auc_th
-                )
-                # store AUC
-                for i, th in enumerate(self.auc_th):
-                    self.auc_list["auc"][th].append(AUC_score_max[i].item())
-                self.auc_list["steps"].append(step)
+            #     opt = "optimized_reconstruction_GD/_current_test"
+            #     self.to_colmap(opt, save_points=False, verbose=False)
+            #     AUC_score_max, num_images, df_optim = eval_colmap_model(
+            #         opt, gt_path, return_df=False, thrs=self.auc_th
+            #     )
+            #     # store AUC
+            #     for i, th in enumerate(self.auc_th):
+            #         self.auc_list["auc"][th].append(AUC_score_max[i].item())
+            #     self.auc_list["steps"].append(step)
 
             if verbose:
                 bar.set_postfix(
                     loss=f"{self.loss_list[-1]:.4f}",
-                    auc5=(
-                        f"{self.auc_list['auc'][self.auc_th[-1]][-1]:.4f}"
-                        if len(self.auc_list["auc"][self.auc_th[-1]]) > 0
-                        else 0
-                    ),
-                    lr=f"{current_lr:.2e}",
+                    # auc5=(
+                    #     f"{self.auc_list['auc'][self.auc_th[-1]][-1]:.4f}"
+                    #     if len(self.auc_list["auc"][self.auc_th[-1]]) > 0
+                    #     else 0
+                    # ),
                 )
 
-                self.timings["logging"] += time.time() - logging_time_start
+            #     self.timings["logging"] += time.time() - logging_time_start
 
-            # Stopping criterion: stop when lr stops decreasing | change for cosine annealing
-            if early_stopping and current_lr <= self.scheduler_params.get(
-                "min_lr", min_lr
-            ):
-                print(
-                    f"Learning rate reached minimum threshold {current_lr:.2e}"
-                    + f" <= {self.scheduler_params.get('min_lr', 1e-4):.2e}. "
-                    + "Stopping optimization."
-                )
-                break
+            # # Stopping criterion: stop when lr stops decreasing | change for cosine annealing
+            # if early_stopping and current_lr <= self.scheduler_params.get(
+            #     "min_lr", min_lr
+            # ):
+            #     print(
+            #         f"Learning rate reached minimum threshold {current_lr:.2e}"
+            #         + f" <= {self.scheduler_params.get('min_lr', 1e-4):.2e}. "
+            #         + "Stopping optimization."
+            #     )
+            #     break
+            # if self.convergence:
+            #     print("Optimization has converged. Stopping.")
+            #     break
 
         self.timings["total_optimization"] += time.time() - time_start
         self.print_summary() if verbose else None
 
     ### Forward and backward helpers ###
+    def optimizers_zero_grad(self):
+        """Zero the gradients of all optimizers."""
+        self.poses.optimizer_q.zero_grad()
+        self.poses.optimizer_t.zero_grad()
+        self.sampled_depth.optimizer.zero_grad()
+        self.intrinsics.optimizer.zero_grad()
+
+    def optimizer_step_and_scheduler_step(self, step, loss):
+        """Perform optimizer step and scheduler step for all optimizers."""
+        # Ideally each of them should be able to run independently until needed (reaching min lr),
+        # but for now we keep them in sync for simplicity.
+
+        if step < 20:
+            self.poses.optimizer_q.step()
+            self.poses.scheduler_q.step(loss)
+
+        if step < 50:
+            self.poses.optimizer_t.step()
+            self.poses.scheduler_t.step(loss)
+
+        if step >= 50 and step < 180:
+            self.sampled_depth.optimizer.step()
+            self.sampled_depth.scheduler.step(loss)
+
+        if step >= 180 and step < 200:
+            self.intrinsics.optimizer.step()
+            self.intrinsics.scheduler.step(loss)
+
+        # if step >= 150:
+        #     # all jointly
+        #     self.poses.optimizer_q.step()
+        #     self.poses.scheduler_q.step(loss)
+
+        #     self.poses.optimizer_t.step()
+        #     self.poses.scheduler_t.step(loss)
+
+        #     self.sampled_depth.optimizer.step()
+        #     self.sampled_depth.scheduler.step(loss)
+
+        #     self.intrinsics.optimizer.step()
+        #     self.intrinsics.scheduler.step(loss)
 
     def _unproject_edges_to_3D(self, batch_size=None):
         """Unproject 2D edges to 3D points for all images as a batch."""
@@ -767,7 +798,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             cam_id=cam_id_to_tensor_id,
             k_models=k_models,
             k_params=torch.stack(k_params),
-            k_grad=self.grad_k,
+            lr=self.k_lr,
             device=self.device,
             dtype=self.dtype,
         )
@@ -798,8 +829,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             images_id_map,
             R=torch.stack(R_tensor),
             t=torch.stack(t_tensor),
-            grad_q=self.grad_q,
-            grad_t=self.grad_t,
+            q_lr=self.q_lr,
+            t_lr=self.t_lr,
             device=self.device,
             dtype=self.dtype,
         )
@@ -848,8 +879,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                         self.device, dtype=self.dtype
                     )
 
-    # In your Adjuster class, before calling filter_viewgraph_by_reprojection:
-
     @torch.no_grad()
     def _compute_viewgraph(self, type="frustums"):
         """Compute viewgraph and filter by reprojection error and returns the sorted viewgraph."""
@@ -882,7 +911,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             # Build exhaustive viewgraph (all pairs)
             image_names = sorted(list(self.images.keys()))
             viewgraph = list(combinations(image_names, 2))
-            min_points = 750  
+            min_points = 750
             sampling_factor = 5
             reprojection_error = 3.0
 
@@ -1063,17 +1092,13 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         params_to_optimize = {}
 
         # Collect parameters to optimize
-        if self.grad_k:
-            params_to_optimize["k"] = self.intrinsics.parameters()
+        params_to_optimize["k"] = self.intrinsics.parameters()
 
-        if self.grad_q:
-            params_to_optimize["q"] = self.poses.parameters(q=True, t=False)
+        params_to_optimize["q"] = self.poses.parameters(q=True, t=False)
 
-        if self.grad_t:
-            params_to_optimize["t"] = self.poses.parameters(q=False, t=True)
+        params_to_optimize["t"] = self.poses.parameters(q=False, t=True)
 
-        if self.grad_z:
-            params_to_optimize["z"] = self.sampled_depth.parameters()
+        params_to_optimize["z"] = self.sampled_depth.parameters()
 
         return params_to_optimize
 
@@ -1090,107 +1115,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             total_params += set_params
         print("-" * 23)
         print(f"  {'Total':}: {total_params:>12,}\n")
-
-    def _load_optimizer(self, params):
-        param_groups = []
-        if "t" in params:
-            param_groups.append(
-                {"params": params["t"], "lr": self.lr * self.t_lr_scale}
-            )
-        if "k" in params:
-            param_groups.append(
-                {"params": params["k"], "lr": self.lr * self.k_lr_scale}
-            )
-        if "z" in params:
-            param_groups.append(
-                {"params": params["z"], "lr": self.lr * self.z_lr_scale}
-            )
-        if "q" in params:
-            param_groups.append(
-                {"params": params["q"], "lr": self.lr * self.q_lr_scale}
-            )
-
-        self.optimizer = torch.optim.AdamW(param_groups, lr=self.lr)
-
-    def _load_scheduler(self, name, optimizer, params=None):
-        """
-        Dynamically loads a PyTorch scheduler by name.
-
-        Args:
-            name (str): Name of the scheduler class (e.g., 'StepLR', 'CosineAnnealingLR').
-            optimizer (torch.optim.Optimizer): The optimizer instance to attach the scheduler to.
-            params (dict, optional): Keyword arguments for the scheduler (e.g., step_size, gamma).
-
-        Returns:
-            torch.optim.lr_scheduler._LRScheduler or None: The initialized scheduler.
-        """
-        if not name:
-            self.scheduler = None
-            return
-
-        params = {} if params is None else params
-
-        # Retrieve all available schedulers in torch.optim.lr_scheduler
-        schedulers = {
-            cls_name.lower(): cls
-            for cls_name, cls in torch.optim.lr_scheduler.__dict__.items()
-            if isinstance(cls, type)
-        }
-
-        key = name.lower()
-        if key not in schedulers:
-            raise ValueError(
-                f"Unknown scheduler '{name}'. Available: {list(schedulers.keys())}"
-            )
-
-        SchedulerClass = schedulers[key]
-        self.scheduler = SchedulerClass(optimizer, **params)
-
-        print(f"Using scheduler: {name} with params: {params}")
-
-    def _scheduler_step(self, loss):
-        if self.scheduler is not None:
-            if self.scheduler.__class__.__name__ == "ReduceLROnPlateau":
-                self.scheduler.step(loss)
-            else:
-                self.scheduler.step()
-
-    def _scaler_and_scheduler_steps(self, loss, clip_gradients=False):
-        # scaler step
-        if hasattr(self, "scaler") and self.scaler is not None:
-            # gradients computation
-            s_time = time.time()
-            self.scaler.scale(loss).backward()
-            self.timings["gradient_computation"] += time.time() - s_time
-
-            if clip_gradients:
-                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-
-            # parameter update
-            s_time = time.time()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.timings["parameter_update"] += time.time() - s_time
-        else:
-            # Gradients computation
-            s_time = time.time()
-            loss.backward()
-            self.timings["gradient_computation"] += time.time() - s_time
-
-            if clip_gradients:
-                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-
-            # Parameter update
-            s_time = time.time()
-            self.optimizer.step()
-            self.timings["parameter_update"] += time.time() - s_time
-
-        # scheduler step
-        if self.scheduler is not None:
-            if self.scheduler.__class__.__name__ == "ReduceLROnPlateau":
-                self.scheduler.step(loss.detach())
-            else:
-                self.scheduler.step()
 
 
 if __name__ == "__main__":
@@ -1233,7 +1157,6 @@ if __name__ == "__main__":
         # # outdoor
         lr=1e-3,
         matcher_type="frustums",  # or "exhaustive", "sequential"
-        scheduler_params={"factor": 0.75, "patience": 3, "min_lr": 1e-4},
         detector_params={
             "low_threshold": 0.20,
             "high_threshold": 0.25,

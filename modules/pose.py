@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import pypose as pp
-import kornia.geometry.conversions as kgc
+import kornia.geometry.conversions as kgc  # maybe I can remove kornia
 
 
 class PoseModule(nn.Module):
@@ -10,8 +10,8 @@ class PoseModule(nn.Module):
         image_id_map: dict[str, int],
         R: torch.Tensor,
         t: torch.Tensor,
-        grad_q: bool = True,
-        grad_t: bool = True,
+        t_lr: float = 1e-3,
+        q_lr: float = 1e-4,
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
     ):
@@ -53,17 +53,62 @@ class PoseModule(nn.Module):
         # Store as Raw Parameter (requires normalization on usage)
         self.q_param = nn.Parameter(
             q_init.clone().detach().to(self.device, dtype=self.dtype),
-            requires_grad=grad_q,
+            requires_grad=True,
         )
 
         # --- Translation Prep ---
         t_init = t.reshape(num_cams, 3)
         self.t_param = nn.Parameter(
             t_init.clone().detach().to(self.device, dtype=self.dtype),
-            requires_grad=grad_t,
+            requires_grad=True,
         )
 
+        # init optimizer lr
+        self.t_lr = float(t_lr)
+        self.q_lr = float(q_lr)
+        self.init_optimizer(t_lr=self.t_lr, q_lr=self.q_lr)
+        self.init_scheduler(
+            lr_reduce_factor=0.75,
+            patience=3,
+            min_q_lr=self.q_lr / 20,
+            min_t_lr=self.t_lr / 20,
+        )  # this params seem good
+
         self.update_all_matrices()  # Precompute all extrinsic matrices
+
+    def init_optimizer(self, t_lr: float, q_lr: float):
+        """Re-initialize optimizer with new learning rate."""
+        self.optimizer_t = torch.optim.AdamW(
+            [
+                {"params": self.t_param, "lr": t_lr},
+            ]
+        )
+        self.optimizer_q = torch.optim.AdamW(
+            [
+                {"params": self.q_param, "lr": q_lr},
+            ]
+        )
+
+    def init_scheduler(
+        self, lr_reduce_factor: float, patience: int, min_q_lr: float, min_t_lr: float
+    ):
+        """Initialize LR scheduler for the optimizers."""
+
+        if not hasattr(self, "optimizer_t") or not hasattr(self, "optimizer_q"):
+            raise ValueError("Optimizers must be initialized before scheduler.")
+
+        self.scheduler_t = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer_t,
+            factor=lr_reduce_factor,
+            patience=patience,
+            min_lr=min_t_lr,
+        )
+        self.scheduler_q = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer_q,
+            factor=lr_reduce_factor,
+            patience=patience,
+            min_lr=min_q_lr,
+        )
 
     def map_names_to_indices(self, indices) -> torch.LongTensor:
         """Robustly maps string names to tensor indices."""
@@ -86,14 +131,14 @@ class PoseModule(nn.Module):
         """
         Returns (B, 3, 3) Rotation Matrix for the requested images.
         """
-        # First normalize all quaternions (important for stability)
-        self.q_batch = self.q_param / torch.norm(self.q_param, dim=1, keepdim=True)
-
-        # 1. Get raw quaternions for batch
+        # 2. Get quaternions for batch
         q_batch = self.q_param[indices]
 
+        # 1. Normalize all quaternions (important for stability)
+        q_norm = q_batch / torch.norm(q_batch, dim=1, keepdim=True)
+
         # 3. Convert to Matrix via PyPose
-        return pp.SO3(q_batch).matrix()
+        return pp.SO3(q_norm).matrix()
 
     def get_translation(self, indices) -> torch.Tensor:
         """Returns (B, 3) Translation vectors"""
@@ -112,6 +157,10 @@ class PoseModule(nn.Module):
         R = self.get_rotation_matrix(indices)  # (B, 3, 3)
         t = self.t_param[indices]  # (B, 3)
 
+        # # mlp Refinement
+        # if self.use_mlp:
+        #     R, t = self.apply_mlp(R, t)
+
         # Build 4x4 Matrix
         P = torch.eye(4, device=self.device, dtype=R.dtype).repeat(batch_size, 1, 1)
         P[:, :3, :3] = R
@@ -119,38 +168,42 @@ class PoseModule(nn.Module):
 
         return P
 
-    def get_projection_matrix_inverse(self, indices) -> torch.Tensor:
-        """
-        Constructs 4x4 SE3 Inverse Matrix [R^T | -R^T * t].
-        Numerically stable inversion (Camera-to-World).
-        """
-
-        if isinstance(indices[0], str):
-            indices = self.map_names_to_indices(indices)
-
-        # Get components
-        R = self.get_rotation_matrix(indices)  # (B, 3, 3)
-        t = self.get_translation(indices)  # (B, 3)
-
-        # Stable Inversion Logic:
-        # P_inv = | R^T   -R^T * t |
-        #         | 0        1     |
-
-        R_T = R.permute(0, 2, 1)  # Transpose R
-        # -R^T * t (Need t as Bx3x1 for matmul)
-        t_inv = -torch.bmm(R_T, t.unsqueeze(2))
-
-        # Build Matrix
-        batch_size = len(indices)
-        P_inv = torch.eye(4, device=self.device, dtype=R.dtype).repeat(batch_size, 1, 1)
-        P_inv[:, :3, :3] = R_T
-        P_inv[:, :3, 3:4] = t_inv  # Assign Bx3x1 directly to column slice
-
-        return P_inv
-
     def forward(self, image_names):
         """Convenience method to get RT matrices"""
         return self.get_projection_matrix(image_names)
+
+    # def apply_and_init_mlp(self):
+    #     """Apply MLP refinement to all poses, then initialize a new MLP."""
+    #     # Get all current poses
+    #     all_poses_ids = list(range(len(self.t_param)))
+    #     R = self.get_rotation_matrix(all_poses_ids)
+    #     t = self.get_translation(all_poses_ids)
+
+    #     # Apply MLP
+    #     R_refined, t_refined = self.apply_mlp(R, t)
+
+    #     # Update q_param and t_param with refined poses
+    #     # Convert R_refined to quaternions
+    #     q_refined = kgc.rotation_matrix_to_quaternion(R_refined)
+    #     q_refined = torch.roll(q_refined, shifts=-1, dims=1)
+
+    #     self.q_param[all_poses_ids] = q_refined.detach()
+    #     self.t_param[all_poses_ids] = t_refined.detach()
+
+    #     # Re-initialize MLP
+    #     self.mlp = PoseRefinementMLP().to(self.device, dtype=self.dtype)
+
+    # def apply_mlp(self, R, t) -> torch.Tensor:
+    #     """Apply MLP refinement to given poses."""
+    #     if not self.use_mlp:
+    #         return R, t
+
+    #     P_3x4 = torch.cat([R, t.unsqueeze(2)], dim=2)  # (B, 3, 4)
+    #     P_3x4_refined = self.mlp(P_3x4)  # adding mlp residual and orthonormalization
+    #     R = P_3x4_refined[:, :3, :3]
+    #     t = P_3x4_refined[:, :3, 3]
+
+    #     return R, t
 
     def __repr__(self):
         limit = 3
@@ -166,19 +219,33 @@ class PoseModule(nn.Module):
             s += f"  ... {len(self.t_param) - limit} more."
         return s
 
-    def parameters(self, t=True, q=True, recurse: bool = True):
+    def parameters(self, t=False, q=False, recurse: bool = True):
         """Return list of trainable parameters - only leaf tensors"""
         params = []
         if q and self.q_param.requires_grad:
             params.append(self.q_param)
         if t and self.t_param.requires_grad:
             params.append(self.t_param)
-        return params  # Changed: return list instead of iterator
+        # if mlp and self.use_mlp:
+        #     params.extend([p for p in self.mlp.parameters() if p.requires_grad])
+        return params
 
-    def get_image_qt(self, image_names):
+    def get_image_qt(self, indices):
         """Get quaternion and translation for given image names."""
-        indices = self.map_names_to_indices(image_names)
-        return self.q_param[indices].squeeze(), self.t_param[indices].squeeze()
+        indices = (
+            self.map_names_to_indices(indices)
+            if isinstance(indices[0], str)
+            else indices
+        )
+
+        # # Ensure MLP is applied before returning values
+        # if self.use_mlp:
+        #     self.apply_and_init_mlp()
+
+        q = self.q_param[indices].squeeze()
+        t = self.t_param[indices].squeeze()
+
+        return q, t
 
     def update_all_matrices(self):
         """Init/Update all extrinsic matrices for all images and store them internally."""
