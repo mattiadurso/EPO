@@ -44,7 +44,7 @@ def compute_distance_field_cv2(
     return field
 
 
-# this has 1:1 correspondence with cv2 version, but is slower
+# this has 1:1 correspondence with cv2 version, but is slower since it is quadratic
 @torch.no_grad()
 def compute_distance_field_torch(
     edges_map: torch.Tensor,

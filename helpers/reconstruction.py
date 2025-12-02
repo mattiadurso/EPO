@@ -179,7 +179,7 @@ def build_reconstruction(
 
         # Convert cam_id to int for COLMAP
         if isinstance(cam_id, str):
-            cam_id_int = int(cam_id)
+            cam_id_int = adjuster.intrinsics.recon_to_tensor_cam_id[cam_id]
         elif cam_id is None:
             cam_id_int = idx + 1  # assign a new ID
         elif isinstance(cam_id, int):
@@ -213,8 +213,7 @@ def build_reconstruction(
         scale = image_data.get("scale", 1.0)
 
         # Convert cam_id to int for COLMAP
-        cam_id_int = int(cam_id) if isinstance(cam_id, str) else cam_id
-
+        cam_id_int = adjuster.intrinsics.recon_to_tensor_cam_id[cam_id]
         # Get rotation matrix and translation
         q, t = adjuster.poses.get_image_qt([image_name])
         q = q.detach().cpu().numpy()

@@ -28,7 +28,6 @@ def unproject_to_virtual_plane(
             B,n,3
     """
     xy_hom = to_homogeneous(xy)  # B,n,3
-    # K_inv = torch.linalg.inv(K.float()).to(dtype=dtype)
     xyz = K_inv @ (xy_hom.permute(0, 2, 1))
     return xyz.permute(0, 2, 1)
 
@@ -86,7 +85,7 @@ def invert_P(P: Tensor) -> Tensor:
 
 
 def unproject_2D_to_world(
-    xy0: Tensor, K0: Tensor, depth0: Tensor, P0: Tensor, skip_inversion: bool = False
+    xy0: Tensor, K0: Tensor, depth0: Tensor, P0: Tensor
 ) -> Tensor:
     """unproject points to world coordinates
     Args:
@@ -98,17 +97,13 @@ def unproject_2D_to_world(
             B,n
         P: camera extrinsics matrix
             B,4,4
-        skip_inversion: whether to skip inversion of K and P matrices
     Returns:
         xyz_world: unprojected 3D points in the world reference system
             B,n,3
     """
     # invert K and P
-    if skip_inversion:
-        K0_inv, P0_inv = K0, P0
-    else:
-        K0_inv = torch.linalg.inv(K0)
-        P0_inv = invert_P(P0)
+    K0_inv = torch.linalg.inv(K0)
+    P0_inv = invert_P(P0)
 
     # 2D -> 3D camera
     xyz_camera = unproject_to_3D(xy0, K0_inv, depth0)  # B,n,3
