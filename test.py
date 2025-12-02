@@ -42,24 +42,24 @@ for scene in scenes:
     # ==============================================================================
     # Adjuster
     # ==============================================================================
+    lr = 1e-3
     adjuster = Adjuster(
         # paths
         reconstruction_path=reconstruction_path,
         images_path=images_path,
         depths_path=depths_path,
-        # unreliable_area_masks_path=images_path.replace(
-        #     dataset_cfg["images_folder"], "depth_masks_mask2former"
-        # ),
-        # intrinsics averaging
-        single_camera_per_folder=True,
+        use_depth_confidence=False,  # doesnt seem to help much
         # detect and match
         detector="canny",
-        matcher_type="frustums",  # or "exhaustive", "sequential"
+        matcher_type="exhaustive",  # or "exhaustive", "sequential", "frustums"
         # optimization
         grad_z=True,
         grad_k=True,
         grad_t=True,
         grad_q=True,
+        lr=lr,
+        scheduler_name="ReduceLROnPlateau",
+        scheduler_params={"factor": 0.75, "patience": 3, "min_lr": lr / 20},
     )
 
     adjuster(batch_size=256, max_steps=-1, residuals_chunk_size=2048, debug=False)
