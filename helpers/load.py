@@ -13,6 +13,7 @@ from torchvision import transforms as TF
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import h5py
 import torch.nn.functional as F
+import torchvision.transforms.functional as TVF
 
 
 ### Loading and preprocessing images and depths
@@ -88,6 +89,9 @@ def _process_single_image(
         # Create a new black square image and paste original
         square_img = Image.new("RGB", (max_dim, max_dim), (0, 0, 0))
         square_img.paste(img, (left, top))
+
+        # blur images
+        # square_img = square_img.filter(ImageFilter.GaussianBlur(radius=2))
 
         # Resize to target size
         square_img = square_img.resize(
@@ -190,10 +194,19 @@ def _process_single_depth(
     if not depth_file.exists():
         return image_name, None
 
-    depth = h5py.File(depth_file, "r")["depth"][()]
+    h5 = h5py.File(depth_file, "r")
+    depth = h5["depth"][()]
+    if "confidence" in h5.keys():
+        confidence = h5["confidence"][()]
+    else:
+        confidence = None
 
     # Convert to tensor and add batch+channel dimensions
     depth_tensor = torch.tensor(depth).unsqueeze(0).unsqueeze(0)
+    if confidence is not None:
+        confidence_tensor = torch.tensor(confidence).unsqueeze(0).unsqueeze(0)
+    else:
+        confidence_tensor = None
 
     # Get original dimensions
     h, w = depth_tensor.shape[-2:]
@@ -210,6 +223,10 @@ def _process_single_depth(
 
         # Use NaN for invalid depth padding
         depth_tensor = F.pad(depth_tensor, pad, mode="constant", value=float("nan"))
+        if confidence_tensor is not None:
+            confidence_tensor = F.pad(
+                confidence_tensor, pad, mode="constant", value=0.0
+            )
 
         # Resize to target size
         depth_tensor = F.interpolate(
@@ -218,6 +235,13 @@ def _process_single_depth(
             mode="bilinear",
             align_corners=False,
         )
+        if confidence_tensor is not None:
+            confidence_tensor = F.interpolate(
+                confidence_tensor,
+                size=(target_size, target_size),
+                mode="bilinear",
+                align_corners=False,
+            )
 
     else:
         # Resize such that longest edge is target_size. It might be square if from vggt.
@@ -231,6 +255,10 @@ def _process_single_depth(
         depth_tensor = depth_tensor[
             :, :, y1 + pad_y : y2 + pad_y, x1 + pad_x : x2 + pad_x
         ]
+        if confidence_tensor is not None:
+            confidence_tensor = confidence_tensor[
+                :, :, y1 + pad_y : y2 + pad_y, x1 + pad_x : x2 + pad_x
+            ]
 
         h, w = depth_tensor.shape[-2:]
         if w >= h:
@@ -245,11 +273,20 @@ def _process_single_depth(
             mode="bilinear",
             align_corners=False,
         )
+        if confidence_tensor is not None:
+            confidence_tensor = F.interpolate(
+                confidence_tensor,
+                size=(int(h * scale), int(w * scale)),
+                mode="bilinear",
+                align_corners=False,
+            )
 
     # Remove batch and channel dimensions
     depth_tensor = depth_tensor.squeeze()
+    if confidence_tensor is not None:
+        confidence_tensor = confidence_tensor.squeeze()
 
-    return image_name, depth_tensor
+    return image_name, depth_tensor, confidence_tensor
 
 
 def load_and_preprocess_depths(
@@ -301,7 +338,7 @@ def load_and_preprocess_depths(
         for future in tqdm(
             as_completed(futures), total=len(futures), desc="Loading depth maps"
         ):
-            image_name, depth_tensor = future.result()
+            image_name, depth_tensor, confidence_tensor = future.result()
 
             if depth_tensor is not None:
                 images_dict[image_name].update(
@@ -309,7 +346,11 @@ def load_and_preprocess_depths(
                 )
             else:
                 print(f"Warning: Depth map not found for {image_name}")
-
+                
+            if confidence_tensor is not None:
+                images_dict[image_name].update(
+                    {"confidence": confidence_tensor.to(device, dtype=dtype)}
+                )
     return images_dict
 
 

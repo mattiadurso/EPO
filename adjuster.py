@@ -11,7 +11,7 @@ import random
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 
-
+from itertools import combinations
 import glob
 from PIL import Image
 from tqdm import tqdm
@@ -44,11 +44,10 @@ from helpers.load import (
 )
 from losses.dt_loss import (
     compute_distance_field_cv2,
-    sample_distance_field,
     compute_chunk_loss_logic,
 )
 from helpers.reprojection import (
-    filter_viewgraph_by_reprojection,
+    filter_viewgraph_by_reprojection_batched,
     grid_sample_nan,
 )
 from helpers.reprojection_compiled import (
@@ -131,6 +130,8 @@ class Adjuster(nn.Module):
         grad_t=True,
         grad_k=True,
         grad_z=True,
+        use_depth_confidence=True,
+        pose_mlp=True,
         q_lr_scale=0.1,
         t_lr_scale=1.0,
         k_lr_scale=0.5,
@@ -291,9 +292,9 @@ class Adjuster(nn.Module):
         self.images_hw = ParameterModule(self.image_id_map, images_shapes, self.device)
 
         self.sampled_depth = DepthModule(
-            self.image_id_map,
-            sampled_depth,
-            self.device,
+            image_id_map=self.image_id_map,
+            depth=sampled_depth,
+            device=self.device,
             grad=self.grad_z,
         )
 
@@ -907,123 +908,42 @@ class Adjuster(nn.Module):
         self.viewgraph = filtered_viewgraph
         self.viewgraph.sort(key=lambda x: (x[0], x[1]))
 
-    def filter_images_by_registration_time(self, threshold=1 / 3):
-        """
-        Blacklist images with poor registration times.
-        These images will be skipped during optimization and reconstruction.
-
-        Args:
-            threshold (float): Threshold for filtering (default 0.3)
-
-        Returns:
-            list: Names of blacklisted images
-        """
-        blacklisted = [
-            img_name
-            for img_name, reg_time in self.times_image_was_registered.items()
-            if reg_time < threshold
-        ]
-
-        if blacklisted:
-            self.blacklist = set(blacklisted)
-            # Filter viewgraph
-            original_pairs = len(self.viewgraph)
-            new_viewgraph = [
-                (i, j)
-                for i, j in self.viewgraph
-                if i not in self.blacklist and j not in self.blacklist
-            ]
-            self.viewgraph = new_viewgraph
-            removed_pairs = original_pairs - len(self.viewgraph)
-            print(
-                f"Blacklisted {len(blacklisted)} images with registration time < {threshold:.3f}"
-            )
-            print(f"Removed {removed_pairs:,} viewgraph pairs")
-        else:
-            print(f"No images found with registration time < {threshold:.3f}")
-
     ### Edges
     def _extract_edges(self, min_percentile=10, max_percentile=75):
         for image_name in tqdm(self.images.keys(), desc=f"Extracting edges"):
             img_tensor = self.images[image_name]["image"].unsqueeze(0)
-            edges_map = self.edge_extractor(img_tensor)
-
-            # --- NEW: Filter edges at depth discontinuities for object-centric scenes ---
-            if (
-                self.scene_type == "object_centric"
-                and "depth" in self.images[image_name]
-            ):
-                depth = self.images[image_name]["depth"].squeeze()  # (H, W)
-
-                valid_depth_mask = (depth > 0) & (~torch.isnan(depth))
-                depth_jump_mask = torch.zeros_like(depth, dtype=torch.bool)
-
-                # 2. Filter point too close or too far depth wise
-                background_mask = torch.zeros_like(depth, dtype=torch.bool)
-                if valid_depth_mask.any():
-                    # Compute 75th percentile of valid depth values
-                    valid_depths = depth[valid_depth_mask]
-                    depth_p75 = torch.quantile(valid_depths, max_percentile / 100)
-                    background_mask = (depth > depth_p75) & valid_depth_mask
-
-                    # exclude also very close depths (e.g., depth < 5th percentile)
-                    depth_p5 = torch.quantile(valid_depths, min_percentile / 100)
-                    background_mask = background_mask | (depth < depth_p5)
-
-                # Combine masks: remove jumps AND background
-                mask_to_remove = depth_jump_mask | background_mask
-
-                # Apply mask
-                edges_map = edges_map.squeeze()  # (H, W)
-                # Use multiplication for masking float tensor
-                edges_map = edges_map * (~mask_to_remove).float()
-                edges_map = edges_map.unsqueeze(0)  # Restore (1, H, W)
-            # ----------------------------------------------------------------------------
-
-            edges = edges_map.squeeze().nonzero().flip(dims=(1, 0))  # (N, 2)
-            self.images[image_name].update(
-                {
-                    "edges_map": edges_map.squeeze().to(self.device, dtype=self.dtype),
-                    "edges": edges.to(self.device, dtype=self.dtype),
-                }
+            edges_map = (
+                self.edge_extractor(img_tensor)
+                .squeeze()
+                .to(self.device, dtype=self.dtype)
             )
 
-        # if binary mask with unreliable ares are provided, load and apply to edge_maps
-        if self.unreliable_area_masks_path is not None:
-            # load images
-            for image_name in tqdm(
-                self.images.keys(), desc="Applying unreliable area masks"
-            ):
-                mask_path = os.path.join(
-                    self.unreliable_area_masks_path,
-                    image_name.split(".")[0] + "_mask.png",
+            # Discard points at invalid depth locations
+            if "confidence" in self.images[image_name] and self.use_depth_confidence:
+                confidence = self.images[image_name]["confidence"]
+                # create valid depth mask, normalize between 0 and 1
+                confidence = (confidence - confidence.min()) / (
+                    confidence.max() - confidence.min()
                 )
-                if os.path.exists(mask_path):
-                    mask_pil = Image.open(mask_path).convert("L")
-                    mask_tensor = (
-                        torch.from_numpy(np.array(mask_pil)).to(self.device).bool()
-                    )  # (1, H, W)
-                    mask_tensor = TF.resize(
-                        mask_tensor.unsqueeze(0),
-                        self.images[image_name]["edges_map"].shape,
-                        interpolation=TF.InterpolationMode.NEAREST,
-                    ).squeeze()
+                valid_depth_mask = (confidence > confidence_threshold) & (
+                    ~torch.isnan(confidence)
+                )
+                valid_edges_map = edges_map * valid_depth_mask.float()
 
-                    # Apply mask to edges_map
-                    edges_map = self.images[image_name]["edges_map"]
-                    edges_map = edges_map * ~mask_tensor
-                    self.images[image_name]["edges_map"] = edges_map
+                # Extract edges from valid edges map
+                valid_edges = (
+                    valid_edges_map.squeeze().nonzero().flip(dims=(1, 0))
+                )  # (N, 2)
+            else:
+                valid_edges_map = edges_map
+                # Extract edges from edges map
+                valid_edges = edges_map.squeeze().nonzero().flip(dims=(1, 0))  # (N, 2)
 
-                    # Re-extract edges
-                    edges = edges_map.squeeze().nonzero().flip(dims=(1, 0))  # (N, 2)
-                    self.images[image_name]["edges"] = edges.to(
-                        self.device, dtype=self.dtype
-                    )
-                    # add mask for logging
-                    self.images[image_name]["unreliable_area_mask"] = mask_tensor
-
-                else:
-                    print(f"Warning: Unreliable area mask not found for {mask_path}")
+            # Store edges and edges map
+            self.images[image_name]["edges_map"] = valid_edges_map
+            self.images[image_name]["edges"] = valid_edges.to(
+                self.device, dtype=self.dtype
+            )
 
         # pad to have same number of edges per image
         self._pad_edges()
@@ -1033,6 +953,13 @@ class Adjuster(nn.Module):
             edges_padded = self.images[image_name]["edges_padded"]  # (N, 2)
             depth = self.images[image_name]["depth"]  # (H, W)
             sampled_depth, _ = grid_sample_nan(edges_padded[None], depth[None])
+            # if invalid points set at 0,0 have nan depth, then I'll have sampled depth as nan.
+            # fill with zeros, these points will be masked out during optimization anyway
+            sampled_depth = torch.where(
+                torch.isnan(sampled_depth),
+                torch.zeros_like(sampled_depth) + 1e-6,
+                sampled_depth,
+            )
             self.images[image_name]["sampled_depth"] = sampled_depth.squeeze()
 
     def _pad_edges(self):
@@ -1050,6 +977,7 @@ class Adjuster(nn.Module):
         # this to save some computation/memory
         # likely only few images have very large number of edges
         max_edges_to_retain = min(q90, max_edges)
+        images_with_more_than_max = sum(1 for n in num_edges if n > max_edges_to_retain)
 
         for image_name in self.images.keys():
             edges = self.images[image_name]["edges"]
@@ -1083,11 +1011,13 @@ class Adjuster(nn.Module):
             )
 
         self.max_edges = max_edges_to_retain
+
         print(
             f"Edges stats:\n",
+            f"{images_with_more_than_max:,} images have more than {max_edges_to_retain:,} edges. \n",
             f"max: {max_edges:,} |",
             f"min: {min_edges:,} | avg: {int(avg_edges):,} |",
-            f"std: {std_edges:.2f} |",
+            f"std: {std_edges:,.2f} |",
             f"quantiles (0.5, 0.9): {median_edges:,}, {q90:,}",
         )
 
@@ -1258,446 +1188,32 @@ class Adjuster(nn.Module):
             else:
                 self.scheduler.step()
 
-    ### Reconstruction
-    def to_colmap(
-        self,
-        output_path="optimized_reconstruction_GD",
-        save_points=False,
-        verbose=False,
-        max_points_per_image=100_000,
-        final_dbscan_filtering=False,
-        dbscan_eps=0.05,
-        dbscan_min_samples=5,
-    ):
-        recon = build_reconstruction(
-            self,
-            output_path=output_path,
-            save_points=save_points,
-            verbose=verbose,
-            max_points_per_image=max_points_per_image,
-            final_dbscan_filtering=final_dbscan_filtering,
-            dbscan_eps=dbscan_eps,
-            dbscan_min_samples=dbscan_min_samples,
-        )
-
-        # save loading time and optimization time in timings.txt in same folder as output_path
-        timings_path = os.path.join(output_path, "timings.txt")
-        with open(timings_path, "w") as f:
-            for key, value in self.timings.items():
-                f.write(f"{key}: {value:.4f} s\n")
-        return recon
-
-    ### Misc
-    def print_summary(self, w=None):
-        # Column widths
-        key_width = 30
-        val_width = 10
-        perc_width = 8
-        avg_width = 12
-
-        # Total line width
-        if w is None:
-            w = key_width + val_width + perc_width + avg_width + 6
-
-        print("\n" + "=" * w)
-        print(f"{'Summary':^{w}}")
-        print("-" * w)
-
-        # Compute total
-        self.timings["total"] = self.timings.get("total_loading", 0) + self.timings.get(
-            "total_optimization", 0
-        )
-
-        # Header row
-        print(
-            f"{'Stage':<{key_width}}"
-            f"{'Time (s)':>{val_width}}"
-            f"{'%':>{perc_width+1}}"
-            f"{'Per Iter':>{avg_width}}"
-        )
-        print("-" * w)
-
-        num_iters = len(getattr(self, "loss_list", []))
-
-        ordered_keys = [
-            "total_loading",
-            "step_pre_computation",
-            "prepare_batched_inputs",
-            "forward_pass",
-            "loss_computation",
-            "gradient_computation",
-            "parameter_update",
-            "logging",
-            "total_optimization",
-        ]
-
-        per_iter_keys = {
-            "step_pre_computation",
-            "prepare_batched_inputs",
-            "forward_pass",
-            "loss_computation",
-            "gradient_computation",
-            "parameter_update",
-            "logging",
-        }
-
-        for key in ordered_keys:
-            if key not in self.timings:
-                continue
-
-            value = self.timings[key]
-
-            if value == 0 and key not in per_iter_keys:
-                continue
-
-            if key in per_iter_keys and num_iters > 0:
-                # Show total time, percentage, AND per-iteration average
-                perc = (
-                    (value / self.timings["total"]) * 100
-                    if self.timings["total"] > 0
-                    else 0
-                )
-                value_avg = value / num_iters
-                row_str = (
-                    f"{key:<{key_width}}"
-                    f"{value:>{val_width}.2f}"
-                    f"{perc:>{perc_width}.1f}%"
-                    f"{value_avg:>{avg_width}.4f}"
-                )
-            else:
-                # Show total time and percentage
-                perc = (
-                    (value / self.timings["total"]) * 100
-                    if self.timings["total"] > 0
-                    else 0
-                )
-                row_str = (
-                    f"{key:<{key_width}}"
-                    f"{value:>{val_width}.2f}"
-                    f"{perc:>{perc_width}.1f}%"
-                    f"{'':>{avg_width}}"
-                )
-
-            print(row_str)
-
-        print("-" * w)
-        print(
-            f"{'Total':<{key_width}}"
-            f"{self.timings['total']:>{val_width}.2f}"
-            f"{'':>{perc_width + avg_width + 3}}"
-        )
-
-        # Loss summary
-        if len(self.loss_list) > 0:
-            initial_loss = self.loss_list[0]
-            final_loss = self.loss_list[-1]
-            delta = initial_loss - final_loss
-
-            print("-" * w)
-            print(f"{'Initial loss:':<{key_width}}{initial_loss:>{val_width}.6f}")
-            print(f"{'Final loss:':<{key_width}}{final_loss:>{val_width}.6f}")
-            # loss and percentage with sign under % column on same row
-            perc_improvement = (
-                (delta / initial_loss) * 100 if initial_loss != 0 else 0.0
-            )
-            sign = "-" if perc_improvement > 0 else "+"
-            perc_improvement = sign + f"{abs(perc_improvement):.1f}"
-            print(
-                f"{'Loss reduction:':<{key_width}}{delta:>{val_width}.6f}"
-                f"{perc_improvement:>{perc_width}}%"
-            )
-            steps = len(self.loss_list)
-            conv = " (converged)" if getattr(self, "convergence", False) else ""
-            print(f"{f'Total steps{conv}:':<{key_width}}{steps:>{val_width}d}")
-
-        print("=" * w)
-
-    def fix_seed(self):
-        random.seed(self.seed)
-        np.random.seed(self.seed)
-        torch.manual_seed(self.seed)
-        torch.cuda.manual_seed_all(self.seed)
-        # torch.use_deterministic_algorithms(True)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-    def __repr__(self):
-        repr_str = f"Adjuster(\n"
-        repr_str += f"  Reconstruction path: {self.reconstruction_path}\n"
-        repr_str += f"  Images path: {self.images_path}\n"
-        repr_str += f"  Depths path: {self.depths_path}\n"
-        repr_str += f"  Number of images: {len(self.images)}\n"
-        if hasattr(self, "viewgraph"):
-            repr_str += f"  Number of viewgraph edges: {len(self.viewgraph):,}\n"
-
-        total_params = 0
-        params_to_optimize = self._collect_parameters_to_optimize()
-        for key in ["k", "t", "q", "z"]:
-            if key in params_to_optimize:
-                set_params = sum(p.numel() for p in params_to_optimize[key])
-                total_params += set_params
-
-        repr_str += f"  Total parameters to optimize: {total_params:,}\n"
-        converged_str = " (converged)" if getattr(self, "convergence", False) else ""
-        repr_str += (
-            f"  Number of optimization steps: {len(self.loss_list)}{converged_str}\n"
-        )
-
-        if len(self.loss_list) >= 2:
-            initial_loss = self.loss_list[0]
-            final_loss = self.loss_list[-1]
-            delta = initial_loss - final_loss
-            perc_improvement = (
-                (delta / initial_loss) * 100 if initial_loss != 0 else 0.0
-            )
-            repr_str += f"  Loss improvement: {delta:.3f} ({perc_improvement:.2f}%)\n"
-
-        repr_str += f")"
-        return repr_str
-
-    @torch.no_grad()
-    def visualize_residuals(
-        self,
-        output_dir="residual_maps",
-        percentile=99,
-        max_images=100,
-        custom_viewgraph=None,
-    ):
-        """
-        Visualize reprojection residuals for all image pairs in the viewgraph.
-        Creates error maps showing where edges align well or poorly between image pairs.
-
-        Args:
-            output_dir (str): Directory to save residual visualization maps
-            percentile (float): Percentile for colormap scaling (default 95 to avoid outliers)
-        """
-        import os
-        import matplotlib.pyplot as plt
-        import matplotlib.cm as cm
-        from matplotlib.colors import Normalize
-
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Select viewgraph pairs
-        if custom_viewgraph:
-            viewgraph = custom_viewgraph
-        else:
-            viewgraph = (
-                self.viewgraph
-                if max_images < 0
-                else random.choices(self.viewgraph, k=max_images)
-            )
-        num_pairs = len(viewgraph)
-        print(f"Visualizing residuals for {num_pairs:,} image pairs...")
-
-        for pair_idx, (img_i, img_j) in enumerate(
-            tqdm(viewgraph, desc="Computing residuals")
-        ):
-            sampled_vg = [(img_i, img_j)]
-            batch, pad_masks, dt_fields = self._create_batched_inputs(sampled_vg)
-            # Project edges and compute residuals
-            edges_reprojected, _ = project_world_to_2D(**batch)
-            residuals = sample_distance_field(dt_fields, edges_reprojected).squeeze(1)
-
-            # Forward: i->j
-            res_ij = residuals[0]  # (N,)
-            edges_ij = edges_reprojected[0]  # (N, 2)
-            pad_mask_j = self.images[img_j]["pad_mask"]
-            img_j_tensor = (
-                self.images[img_j]["image"]
-                if "image" in self.images[img_j]
-                else torch.zeros(3, *self.images[img_j]["hw"])
-            )
-            edges_map_j = self.images[img_j]["edges_map"].cpu().numpy()
-            hw_j = self.images[img_j]["hw"]
-
-            # Backward: j->i
-            res_ji = residuals[1]
-            edges_ji = edges_reprojected[1]
-            pad_mask_i = self.images[img_i]["pad_mask"]
-            img_i_tensor = (
-                self.images[img_i]["image"]
-                if "image" in self.images[img_i]
-                else torch.zeros(3, *self.images[img_i]["hw"])
-            )
-            edges_map_i = self.images[img_i]["edges_map"].cpu().numpy()
-            hw_i = self.images[img_i]["hw"]
-
-            # Save visualization
-            self._save_residual_visualization_custom(
-                img_i_tensor,
-                edges_map_i,
-                img_j_tensor,
-                edges_map_j,
-                edges_ij,
-                res_ij,
-                pad_mask_j,
-                hw_j,
-                edges_ji,
-                res_ji,
-                pad_mask_i,
-                hw_i,
-                img_i,
-                img_j,
-                output_dir,
-                pair_idx,
-                percentile,
-            )
-
-    @torch.no_grad()
-    def _save_residual_visualization_custom(
-        self,
-        img_i_tensor,
-        edges_map_i,
-        img_j_tensor,
-        edges_map_j,
-        edges_ij,
-        res_ij,
-        pad_mask_j,
-        hw_j,
-        edges_ji,
-        res_ji,
-        pad_mask_i,
-        hw_i,
-        img_i,
-        img_j,
-        output_dir,
-        pair_idx,
-        percentile,
-    ):
-        import matplotlib.pyplot as plt
-        import matplotlib.cm as cm
-        from matplotlib.colors import Normalize
-
-        # Prepare filenames
-        safe_img_i = img_i.replace("/", "_").replace("\\", "_")
-        safe_img_j = img_j.replace("/", "_").replace("\\", "_")
-        filename = f"{pair_idx:04d}_{safe_img_i}_to_{safe_img_j}.png"
-        filepath = os.path.join(output_dir, filename)
-
-        # Normalize images
-        img_i_np = img_i_tensor.cpu().numpy().transpose(1, 2, 0)
-        img_j_np = img_j_tensor.cpu().numpy().transpose(1, 2, 0)
-        img_i_np = np.clip(
-            img_i_np / (img_i_np.max() if img_i_np.max() > 1.0 else 1.0), 0, 1
-        )
-        img_j_np = np.clip(
-            img_j_np / (img_j_np.max() if img_j_np.max() > 1.0 else 1.0), 0, 1
-        )
-
-        # Edge maps: white edges on black
-        edges_img_i = np.zeros((*hw_i, 3), dtype=np.float32)
-        edges_img_i[edges_map_i > 0] = 1.0
-        edges_img_j = np.zeros((*hw_j, 3), dtype=np.float32)
-        edges_img_j[edges_map_j > 0] = 1.0
-
-        # Row 1, Col 3: image i edges (white) + projected edges from j (colored)
-        combined_i = np.zeros((*hw_i, 3), dtype=np.float32)
-        combined_i[edges_map_i > 0] = 1.0  # white edges from i
-        valid_mask = pad_mask_i > 0.5
-        valid_edges = edges_ji[valid_mask].long().cpu().numpy()
-        valid_residuals = res_ji[valid_mask].cpu().numpy()
-        if valid_edges.shape[0] > 0:
-            vmax = np.percentile(valid_residuals, percentile)
-            norm = Normalize(vmin=0, vmax=vmax)
-            cmap = cm.get_cmap("RdYlGn_r")
-            for idx, (x, y) in enumerate(valid_edges):
-                color = cmap(norm(valid_residuals[idx]))[:3]
-                x = np.clip(x, 0, hw_i[1] - 1)
-                y = np.clip(y, 0, hw_i[0] - 1)
-                combined_i[y, x] = color
-
-        # Row 2, Col 3: image j edges (white) + projected edges from i (colored)
-        combined_j = np.zeros((*hw_j, 3), dtype=np.float32)
-        combined_j[edges_map_j > 0] = 1.0  # white edges from j
-        valid_mask = pad_mask_j > 0.5
-        valid_edges = edges_ij[valid_mask].long().cpu().numpy()
-        valid_residuals = res_ij[valid_mask].cpu().numpy()
-        if valid_edges.shape[0] > 0:
-            vmax = np.percentile(valid_residuals, percentile)
-            norm = Normalize(vmin=0, vmax=vmax)
-            cmap = cm.get_cmap("RdYlGn_r")
-            for idx, (x, y) in enumerate(valid_edges):
-                color = cmap(norm(valid_residuals[idx]))[:3]
-                x = np.clip(x, 0, hw_j[1] - 1)
-                y = np.clip(y, 0, hw_j[0] - 1)
-                combined_j[y, x] = color
-
-        # Compute mean residual for display (as in loss), clmap and apply huber loss
-        # mean_residual = 0.5 * (res_ij.mean().item() + res_ji.mean().item())
-        max_residual_ij = res_ij.max().item()
-        max_residual_ji = res_ji.max().item()
-
-        res_ij = res_ij.clamp(max=10.0)
-        res_ji = res_ji.clamp(max=10.0)
-        delta = 1.0
-        huber_ij = (
-            0.5 * res_ij**2 * (res_ij <= delta).float()
-            + (delta * (res_ij - 0.5 * delta)) * (res_ij > delta).float()
-        )
-        huber_ji = (
-            0.5 * res_ji**2 * (res_ji <= delta).float()
-            + (delta * (res_ji - 0.5 * delta)) * (res_ji > delta).float()
-        )
-        mean_residual = 0.5 * (huber_ij.mean().item() + huber_ji.mean().item())
-
-        # Plot
-        fig, axes = plt.subplots(2, 3, figsize=(14, 8))  # Reduced size
-        plt.subplots_adjust(wspace=0.08, hspace=0.08)  # Less space between columns/rows
-
-        # Add residual value in top-left corner (black text)
-        fig.text(
-            0.12,
-            0.9,
-            f"Residual: {mean_residual:.3f}, Max residuals: {max_residual_ij:.3f} and {max_residual_ji:.3f}",
-            ha="left",
-            va="top",
-            color="black",
-            fontsize=10,
-            weight="bold",
-        )
-
-        # Row 1: image i, edges i, edges i + projected edges from j
-        axes[0, 0].imshow(img_i_np)
-        axes[0, 0].set_title(f"Image: {img_i}")
-        axes[0, 0].axis("off")
-        axes[0, 1].imshow(edges_img_i)
-        axes[0, 1].set_title(f"Edges: {img_i}")
-        axes[0, 1].axis("off")
-        axes[0, 2].imshow(combined_i)
-        axes[0, 2].set_title(f"Edges {img_i} + proj. edges from {img_j}")
-        axes[0, 2].axis("off")
-
-        # Row 2: image j, edges j, edges j + projected edges from i
-        axes[1, 0].imshow(img_j_np)
-        axes[1, 0].set_title(f"Image: {img_j}")
-        axes[1, 0].axis("off")
-        axes[1, 1].imshow(edges_img_j)
-        axes[1, 1].set_title(f"Edges: {img_j}")
-        axes[1, 1].axis("off")
-        axes[1, 2].imshow(combined_j)
-        axes[1, 2].set_title(f"Edges {img_j} + proj. edges from {img_i}")
-        axes[1, 2].axis("off")
-
-        plt.savefig(filepath, dpi=100, bbox_inches="tight")
-        plt.close()
-
 
 if __name__ == "__main__":
-    scene = "vienna_state_opera"
-    which_data = "data_test" if scene == "graz_main_square" else "data"
+    import json
 
-    reconstruction_path = (
-        f"/home/mattia/Desktop/Repos/vggt/wrapper_output/{scene}/sparse"
+    dataset = "terrasky3D"  # terrasky3D, mipnerf360,
+    scene = "vienna_state_opera"  # vienna_state_opera, bicycle, bonsai, statue
+
+    # Load dataset paths and parameters from JSON
+    with open("benchmark/paths.json") as f:
+        paths_cfg = json.load(f)
+
+    dataset_cfg = paths_cfg[dataset]
+
+    images_path = os.path.join(
+        dataset_cfg["images_path"], scene, dataset_cfg["images_folder"]
     )
-    images_path = f"/home/mattia/Desktop/datasets/mydataset/{which_data}/{scene}/frames"
-    depths_path = (
-        f"/home/mattia/Desktop/Repos/vggt/wrapper_output/{scene}/sparse/depth_maps"
+    base_path = dataset_cfg["base_path"]
+    reconstruction_path = os.path.join(
+        base_path, scene, dataset_cfg["reconstruction_folder"]
     )
-    gt_path = (
-        f"/home/mattia/Desktop/datasets/mydataset/{which_data}/{scene}/colmap/sparse/0"
+    depths_path = os.path.join(
+        base_path,
+        scene,
+        dataset_cfg.get("depths_folder", dataset_cfg.get("depth_folder", "")),
     )
-    # unreliable_area_masks_path = images_path.replace(dataset_cfg["images_folder"], "depth_masks_mask2former")
+    gt_path = os.path.join(dataset_cfg["gt_path"], scene, dataset_cfg["gt_folder"])
 
     adjuster = Adjuster(
         reconstruction_path=reconstruction_path,
