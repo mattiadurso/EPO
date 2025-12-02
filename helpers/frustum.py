@@ -84,8 +84,13 @@ def build_view_graph_from_frustums(
 
         if images_with_depth is not None and img.name in images_with_depth:
             depth = images_with_depth[img.name]["depth"]
-            z_near = depth.min().detach().cpu()
-            z_far = depth.max().detach().cpu()
+            # Filter out NaN and invalid depth values
+            valid_depth = depth[torch.isfinite(depth) & (depth > 0)]
+            if valid_depth.numel() > 0:
+                z_near = valid_depth.min().detach().cpu().item()
+                z_far = valid_depth.max().detach().cpu().item()
+            else:
+                z_near, z_far = z_near_default, z_far_default
         else:
             z_near, z_far = z_near_default, z_far_default
         # shrink far plane slightly (avoid wide skinny cones)
