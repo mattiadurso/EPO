@@ -307,11 +307,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         params_to_optimize = self._collect_parameters_to_optimize()
         self._print_params_summary(params_to_optimize)
 
-        # Create optimizer with collected parameters
-        # self._load_optimizer(params_to_optimize)
-        # self._load_scheduler(self.scheduler_name, self.optimizer, self.scheduler_params)
-        self.scheduler = None  # init to None
-
         if self.use_amp:
             self.scaler = torch.amp.GradScaler()
 
@@ -338,12 +333,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.lr_list = {"q": [], "t": [], "k": [], "z": []}
         self.auc_list = {"auc": {th: [] for th in self.auc_th}, "steps": []}
         self.blacklist = set()  # Add this line
-        # current order of optimization: qt -> z -> k
-        self.q_step = True
-        self.t_step = True
-        self.k_step = False
-        self.z_step = False
-        self.convergence = False
 
         self.seed = seed
         self.fix_seed()
@@ -356,12 +345,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         max_steps=100,
         batch_size=128,
         residuals_chunk_size=2048,
-        early_stopping=True,
         verbose=True,
         drop_last=True,
         debug=False,
-        gt_path=None,
-        min_lr=1e-5,
     ):
         """
         Main optimization loop.
@@ -466,20 +452,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 )
 
             #     self.timings["logging"] += time.time() - logging_time_start
-
-            # # Stopping criterion: stop when lr stops decreasing | change for cosine annealing
-            # if early_stopping and current_lr <= self.scheduler_params.get(
-            #     "min_lr", min_lr
-            # ):
-            #     print(
-            #         f"Learning rate reached minimum threshold {current_lr:.2e}"
-            #         + f" <= {self.scheduler_params.get('min_lr', 1e-4):.2e}. "
-            #         + "Stopping optimization."
-            #     )
-            #     break
-            # if self.convergence:
-            #     print("Optimization has converged. Stopping.")
-            #     break
 
         self.timings["total_optimization"] += time.time() - time_start
         self.print_summary() if verbose else None
