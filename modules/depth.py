@@ -4,16 +4,11 @@ import torch.nn as nn
 
 class DepthModule(nn.Module):
     def __init__(
-        self,
-        image_id_map: dict,
-        depth: torch.Tensor,
-        device="cuda",
-        grad=True,
+        self, image_id_map: dict, depth: torch.Tensor, lr: float = 5e-3, device="cuda"
     ):
         """Depth module to hold depth parameters"""
         super().__init__()
         self.device = device
-        self.grad = grad
 
         # ID Mappings
         self.image_to_tensor_idx = image_id_map
@@ -23,7 +18,33 @@ class DepthModule(nn.Module):
         depth = torch.log(depth)
 
         self.params = nn.Parameter(
-            depth.clone().detach().to(device), requires_grad=self.grad
+            depth.clone().detach().to(device), requires_grad=True
+        )
+
+        self.lr = float(lr)
+        self.init_optimizer(z_lr=self.lr)
+        self.init_scheduler(
+            lr_reduce_factor=0.75, patience=3, min_lr=self.lr / 20
+        )  # this params seem good
+
+    def init_optimizer(self, z_lr: float):
+        """Re-initialize optimizer with new learning rate."""
+        self.optimizer = torch.optim.AdamW(
+            [
+                {"params": self.params, "lr": z_lr},
+            ]
+        )
+
+    def init_scheduler(self, lr_reduce_factor: float, patience: int, min_lr: float):
+        """Initialize LR scheduler for the optimizer."""
+        if not hasattr(self, "optimizer"):
+            raise ValueError("Optimizer must be initialized before scheduler.")
+
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            factor=lr_reduce_factor,
+            patience=patience,
+            min_lr=min_lr,
         )
 
     def forward(self, ids):
