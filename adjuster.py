@@ -172,6 +172,7 @@ class Adjuster(nn.Module):
         self.unreliable_area_masks_path = unreliable_area_masks_path
         self.scheduler_name = scheduler_name
         self.scheduler_params = scheduler_params
+        self.use_depth_confidence = use_depth_confidence
 
         # Edge extractor
         if detector == "canny":
@@ -510,8 +511,8 @@ class Adjuster(nn.Module):
         cam_ids = self.images_cams_ids[:, 1]
 
         # indexing data
-        K_batch = self.intrinsics.get_intrinsic_matrix_inverse(cam_ids)  # (B, 3, 3)
-        P_batch = self.poses.get_projection_matrix_inverse(image_names_id)  # (B, 4, 4)
+        K_batch = self.intrinsics.get_intrinsic_matrix(cam_ids)  # (B, 3, 3)
+        P_batch = self.poses.get_projection_matrix(image_names_id)  # (B, 4, 4)
         edges_batch = self.edges_padded.get_parameters(image_names_id)  # (B, N, 2)
         depth_batch = self.sampled_depth.get_parameters(image_names_id)  # (B, 1, H, W)
 
@@ -528,7 +529,7 @@ class Adjuster(nn.Module):
             P0 = P_batch[i : i + batch_size]
 
             pts3d = unproject_2D_to_world(
-                xy0=xy0, K0=K0, depth0=depth0, P0=P0, skip_inversion=True
+                xy0=xy0, K0=K0, depth0=depth0, P0=P0
             )  # (bs, N, 3)
             points_3D_list.append(pts3d)
 
@@ -851,7 +852,7 @@ class Adjuster(nn.Module):
                     pad_bottom = max_h - h
                     pad_right = max_w - w
                     pad = (0, pad_right, 0, pad_bottom)  # left, right, top, bottom
-                    depth = F.pad(depth, pad, mode="constant", value=depth.max())
+                    depth = F.pad(depth, pad, mode="constant", value=torch.nan)
                     self.images[image_name]["depth"] = depth.to(
                         self.device, dtype=self.dtype
                     )
@@ -909,8 +910,9 @@ class Adjuster(nn.Module):
         self.viewgraph.sort(key=lambda x: (x[0], x[1]))
 
     ### Edges
-    def _extract_edges(self, min_percentile=10, max_percentile=75):
+    def _extract_edges(self, confidence_threshold=0.2):
         for image_name in tqdm(self.images.keys(), desc=f"Extracting edges"):
+            # Extract edge map
             img_tensor = self.images[image_name]["image"].unsqueeze(0)
             edges_map = (
                 self.edge_extractor(img_tensor)

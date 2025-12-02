@@ -90,9 +90,6 @@ def _process_single_image(
         square_img = Image.new("RGB", (max_dim, max_dim), (0, 0, 0))
         square_img.paste(img, (left, top))
 
-        # blur images
-        # square_img = square_img.filter(ImageFilter.GaussianBlur(radius=2))
-
         # Resize to target size
         square_img = square_img.resize(
             (target_size, target_size), Image.Resampling.BICUBIC
