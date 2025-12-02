@@ -343,7 +343,7 @@ def load_and_preprocess_depths(
                 )
             else:
                 print(f"Warning: Depth map not found for {image_name}")
-                
+
             if confidence_tensor is not None:
                 images_dict[image_name].update(
                     {"confidence": confidence_tensor.to(device, dtype=dtype)}

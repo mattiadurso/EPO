@@ -3,3 +3,5 @@ from modules.depth import DepthModule
 from modules.edges3d import Edges3DModule
 from modules.parameters_module import ParameterModule
 from modules.pose import PoseModule
+from modules.reconstruct_and_viz import ReconstructAndVizModule
+from modules.misc import MiscModule

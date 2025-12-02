@@ -9,8 +9,6 @@ from helpers.reprojection_compiled import (
     unproject_to_3D,
     invert_P,
     project_to_2D,
-    unproject_2D_to_world,
-    project_world_to_2D,
 )
 
 
@@ -95,7 +93,7 @@ def grid_sample_nan(xy: Tensor, img: Tensor, mode="nearest") -> tuple[Tensor, Te
     return sampled, mask_img_nan
 
 
-def create_grid(image, permute=False, sampling_factor=10, border=30):
+def create_grid(image, permute=False, sampling_factor=10, border=0):
     """
     Function to create a grid of the same size as the image.
     Args:
@@ -126,17 +124,18 @@ def compute_121_reprojection(
     img1,
     verbose=True,
     reprojection_error=3.0,
-    border=30,
+    border=1,
     sampling_factor=10,
     device="cuda",
 ):
+    border = max(border, 1)  # to cut out pixels at 0,0
+
     # create a grid of points in img 0
     kpts0 = create_grid(img0, sampling_factor=sampling_factor, border=border)[None].to(
         device, dtype=img0.dtype
     )
-    # starting from depth valid locations, in nan is invalid in any case
-    # kpts0 = torch.nonzero(~torch.isnan(data['depth0'][0]))[None].float() # why not working?
-    tot = kpts0.numel()
+
+    tot = kpts0.shape[1]  # B, num_points, z
 
     # project the points to img1
     kpts1 = reproject_2D_2D(
@@ -164,6 +163,7 @@ def compute_121_reprojection(
         print(kpts0.shape, kpts1.shape, kpts0_back.shape, "projected")
 
     # detect nans and remove if any, no need for kpts0
+    # it should be a problem, invalid points are set to (0,0)
     nan_mask = torch.logical_and(
         torch.isnan(kpts1).any(dim=-1), torch.isnan(kpts0_back)[0].any(dim=-1)
     )
@@ -290,7 +290,8 @@ def reproject_2D_2D(
         selected_depths0 = depthmap0
 
     # ? use the depth to define the 3D coordinates of points in the ref system of camera0
-    xyz0 = unproject_to_3D(xy0, K0, selected_depths0)  # B,n,3
+    K0_inv = torch.linalg.inv(K0)
+    xyz0 = unproject_to_3D(xy0, K0_inv, selected_depths0)  # B,n,3
 
     # ? change the ref system of the 3d point to camera1
     xyz0_proj = change_reference_3D_points(xyz0, P0, P1)  # B,n,3
@@ -308,206 +309,142 @@ def reproject_2D_2D(
 
 
 @torch.no_grad()
-def filter_viewgraph_by_reprojection(
-    self,
-    viewgraph,
-    images,
-    min_points=100,
-    border=0,
-    sampling_factor=10,
-    reprojection_error=5.0,  # Threshold in pixels (2D)
-    device="cuda",
-    batch_size=512,
-    use_amp=False,
-):
+def filter_viewgraph_by_reprojection_batched(
+    viewgraph: list[tuple[str, str]],
+    images: dict,
+    intrinsics,  # CameraModule
+    poses,  # PoseModule
+    min_points: int = 100,
+    border: int = 10,
+    sampling_factor: int = 5,
+    reprojection_error: float = 5.0,
+    device: str = "cuda",
+    batch_size: int = 512,
+    verbose: bool = False,
+) -> tuple[list[tuple[str, str]], dict[tuple[str, str], int]]:
     """
-    Refactored viewgraph filtering using Round-Trip 2D Reprojection consistency.
-    Path: Img_i (2D) -> World_i (3D) -> Img_j (2D) -> World_j (3D) -> Img_i (2D).
+    Batched version of filter_viewgraph_by_reprojection.
+    Processes multiple pairs in parallel for better GPU utilization.
+
+    Note: This assumes all images have the same resolution for batching.
     """
-
-    # --- Step 1: Pre-compute 3D World Points and keep 2D Grids for all images ---
-    image_names = sorted(list(images.keys()))
-    self.times_image_was_registered = {name: 0 for name in image_names}
-    self.valid_points_per_pair = {}
-    name_to_idx = {name: i for i, name in enumerate(image_names)}
-
-    # Collect camera parameters for all images
-    cam_ids = [images[name]["cam_id"] for name in image_names]
-    Ks = self.intrinsics.get_intrinsic_matrix(cam_ids)  # (N_imgs, 3, 3)
-    Ps = self.poses.get_projection_matrix(image_names)  # (N_imgs, 4, 4)
-
-    all_world_points = []
-    all_2d_grids = []  # Store original 2D points for final comparison
-
-    for i, name in enumerate(image_names):
-        depth = images[name]["depth"]  # (H, W) or (1, H, W)
-        if depth.ndim == 2:
-            depth = depth.unsqueeze(0)
-
-        # Create grid for this specific image size
-        # (N_points, 2)
-        grid = create_grid(depth, sampling_factor=sampling_factor, border=border).to(
-            device
-        )
-
-        # Sample depth at grid points
-        sampled_depth, _ = grid_sample_nan(grid[None], depth[None])
-        sampled_depth = sampled_depth.squeeze(0).squeeze(0)  # (N_points,)
-
-        # Unproject to World: Img_i (2D) -> World_i (3D)
-        pts_world = unproject_2D_to_world(
-            grid[None], Ks[i : i + 1], sampled_depth[None], Ps[i : i + 1]
-        )  # (1, N_points, 3)
-
-        all_world_points.append(pts_world.squeeze(0))  # Store (N_points, 3)
-        all_2d_grids.append(grid)  # Store (N_points, 2)
-
-    # --- Step 2: Batch Process the Viewgraph ---
     filtered_viewgraph = []
+    valid_points_per_pair = {}
 
-    # Convert viewgraph list of strings to list of indices
-    vg_indices = []
-    for i_name, j_name in viewgraph:
-        vg_indices.append((name_to_idx[i_name], name_to_idx[j_name]))
+    # Pre-compute all projection matrices and intrinsics
+    image_names = sorted(list(images.keys()))
+    name_to_idx = {name: idx for idx, name in enumerate(image_names)}
 
-    vg_tensor = torch.tensor(vg_indices, dtype=torch.long, device=device)
+    # Get all camera data
+    all_Ps = poses.get_projection_matrix(image_names)  # (N, 4, 4)
+    cam_ids = [images[name]["cam_id"] for name in image_names]
+    all_Ks = intrinsics.get_intrinsic_matrix(cam_ids)  # (N, 3, 3)
+
+    # Pre-compute grids and world points for all images
+    all_depths = {}
+
+    for name in image_names:
+        depth = images[name]["depth"]
+        if depth.ndim == 2:
+            depth = depth
+        all_depths[name] = depth.to(device)
+
+    # Create grid for all images once since we assume same resolution
+    # We take the first image resolution as reference for the grid
+    first_img_name = image_names[0]
+    grid = create_grid(
+        images[first_img_name]["image"], sampling_factor=sampling_factor, border=border
+    ).to(device)[None]
+
     num_pairs = len(viewgraph)
 
-    print(f"Filtering {num_pairs:,} pairs in batches of {batch_size}")
+    for batch_start in tqdm(
+        range(0, num_pairs, batch_size), desc="Filtering viewgraph"
+    ):
+        batch_end = min(batch_start + batch_size, num_pairs)
+        batch_pairs = viewgraph[batch_start:batch_end]
+        current_batch_size = len(batch_pairs)
 
-    for k in tqdm(range(0, num_pairs, batch_size), desc="Filtering viewgraph"):
-        batch_end = min(k + batch_size, num_pairs)
-        batch_indices = vg_tensor[k:batch_end]  # (B, 2)
+        # Prepare batch indices
+        idx_i = [name_to_idx[p[0]] for p in batch_pairs]
+        idx_j = [name_to_idx[p[1]] for p in batch_pairs]
 
-        idx_i = batch_indices[:, 0]  # Source indices
-        idx_j = batch_indices[:, 1]  # Target indices
-        B = len(idx_i)
+        # Gather batch data
+        P0_batch = all_Ps[idx_i]
+        P1_batch = all_Ps[idx_j]
+        K0_batch = all_Ks[idx_i]
+        K1_batch = all_Ks[idx_j]
 
-        # 2.1 Prepare Camera Matrices
-        P_i = Ps[idx_i]  # Source Poses (B, 4, 4)
-        K_i = Ks[idx_i]  # Source Intrinsics (B, 3, 3)
-        P_j = Ps[idx_j]  # Target Poses (B, 4, 4)
-        K_j = Ks[idx_j]  # Target Intrinsics (B, 3, 3)
+        depths_i = torch.stack([all_depths[p[0]] for p in batch_pairs])
+        depths_j = torch.stack([all_depths[p[1]] for p in batch_pairs])
 
-        # 2.2 Prepare Source Data (Points 3D and Points 2D)
-        batch_pts_world_i_list = [all_world_points[idx] for idx in idx_i]
-        batch_pts_2d_i_list = [all_2d_grids[idx] for idx in idx_i]
-
-        max_pts = max([p.shape[0] for p in batch_pts_world_i_list])
-
-        # Pad with NaNs
-        batch_pts_world_i = torch.full(
-            (B, max_pts, 3), float("nan"), device=device, dtype=self.dtype
+        # Prepare shapes for projection check
+        shapes_i = torch.tensor(
+            [images[p[0]]["image"].shape[-2:] for p in batch_pairs], device=device
         )
-        batch_pts_2d_i = torch.full(
-            (B, max_pts, 2), float("nan"), device=device, dtype=self.dtype
+        shapes_j = torch.tensor(
+            [images[p[1]]["image"].shape[-2:] for p in batch_pairs], device=device
         )
 
-        for b in range(B):
-            n_p = batch_pts_world_i_list[b].shape[0]
-            batch_pts_world_i[b, :n_p] = batch_pts_world_i_list[b]
-            batch_pts_2d_i[b, :n_p] = batch_pts_2d_i_list[b]
+        # Expand grid
+        kpts0 = grid.expand(current_batch_size, -1, -1)  # (B, N, 2)
+        tot = kpts0.shape[1]
 
-        # 2.3 Prepare Target Metadata (Shapes and Depths)
-        shapes_j = torch.stack(
-            [
-                torch.tensor(images[image_names[idx]]["hw"], device=device)
-                for idx in idx_j
-            ]
-        )
-        # Shapes for I are needed for the final reprojection check (bounds check)
-        shapes_i = torch.stack(
-            [
-                torch.tensor(images[image_names[idx]]["hw"], device=device)
-                for idx in idx_i
-            ]
+        # Forward projection: img_i -> img_j
+        kpts1 = reproject_2D_2D(
+            xy0=kpts0,
+            depthmap0=depths_i,
+            P0=P0_batch,
+            P1=P1_batch,
+            K0=K0_batch,
+            K1=K1_batch,
+            img1_shape=shapes_j,  # Pass tensor of shapes
+            border=border,
         )
 
-        with torch.amp.autocast(
-            device_type=device, dtype=self.amp_dtype, enabled=use_amp
-        ):
-            # --- A. Project World_i -> Image_j ---
-            # uv_proj_j: (B, N_pts, 2)
-            uv_proj_j, mask_outside_j = project_world_to_2D(
-                batch_pts_world_i, P_j, K_j, shapes_j, border=border
-            )
+        # Backward projection: img_j -> img_i
+        kpts0_back = reproject_2D_2D(
+            xy0=kpts1,
+            depthmap0=depths_j,
+            P0=P1_batch,
+            P1=P0_batch,
+            K0=K1_batch,
+            K1=K0_batch,
+            img1_shape=shapes_i,  # Pass tensor of shapes
+            border=border,
+        )
 
-            # --- B. Sample Depth at Image_j ---
-            depths_j_list = [images[image_names[idx]]["depth"] for idx in idx_j]
-            depths_j = torch.stack(depths_j_list)  # (B, H, W) or (B, 1, H, W)
-            if depths_j.ndim == 3:
-                depths_j = depths_j.unsqueeze(1)
+        # Filter by NaN
+        nan_mask = torch.isnan(kpts1).any(dim=-1) | torch.isnan(kpts0_back).any(dim=-1)
 
-            # d_j_sampled: (B, 1, N_pts)
-            d_j_sampled, _ = grid_sample_nan(uv_proj_j, depths_j)
-            if d_j_sampled.ndim == 3:
-                d_j_sampled = d_j_sampled.squeeze(1)  # (B, N_pts)
+        # Filter by reprojection error
+        reproj_dist = torch.sqrt(((kpts0 - kpts0_back) ** 2).sum(dim=-1))
+        reproj_mask = reproj_dist < reprojection_error
 
-            # --- C. Unproject Image_j -> World_j ---
-            # Use the sampled depth to put points back into 3D space from J's perspective
-            pts_world_j = unproject_2D_to_world(uv_proj_j, K_j, d_j_sampled, P_j)
+        # Filter by border (using shapes_j for kpts1)
+        H_j = shapes_j[:, 0:1]
+        W_j = shapes_j[:, 1:2]
 
-            # --- D. Project World_j -> Image_i (Back to start) ---
-            # uv_reproj_i: (B, N_pts, 2)
-            uv_reproj_i, mask_outside_i_back = project_world_to_2D(
-                pts_world_j, P_i, K_i, shapes_i, border=border
-            )
+        border_mask_x = (kpts1[..., 0] > border) & (kpts1[..., 0] < W_j - border)
+        border_mask_y = (kpts1[..., 1] > border) & (kpts1[..., 1] < H_j - border)
+        border_mask = border_mask_x & border_mask_y
 
-            # --- E. Verification (2D Error in Image i) ---
-            # Compare original grid points (batch_pts_2d_i) with round-trip points (uv_reproj_i)
-            diff = batch_pts_2d_i - uv_reproj_i
-            dist_sq = (diff**2).sum(dim=-1)  # (B, N_pts)
+        # Combined mask
+        valid_mask = (~nan_mask) & reproj_mask & border_mask
+        num_valid_batch = valid_mask.sum(dim=1)  # (B,)
 
-            # Check 1: 2D Reprojection Error threshold
-            consistent = dist_sq < reprojection_error
+        # Collect results
+        for k, (i_name, j_name) in enumerate(batch_pairs):
+            num_valid = num_valid_batch[k].item()
 
-            # Check 2: All validity masks
-            # - Points must project inside J
-            # - Points must project back inside I
-            # - Original points must not be NaN (implicit in dist calculation but good to be explicit)
-            valid_mask = (
-                consistent
-                & (~mask_outside_j)
-                & (~mask_outside_i_back)
-                & (~torch.isnan(dist_sq))
-            )
+            if num_valid >= min_points:
+                filtered_viewgraph.append((i_name, j_name))
+                valid_points_per_pair[(i_name, j_name)] = num_valid
 
-            # Count valid points per pair
-            valid_counts = valid_mask.sum(dim=1)
+            if verbose:
+                print(f"Pair ({i_name}, {j_name}): {num_valid}/{tot} valid points")
 
-            # 2.8 Filter Batch
-            keep_mask = valid_counts >= min_points
-
-            # Extract indices of pairs to keep
-            kept_indices_local = torch.nonzero(keep_mask).squeeze(1)
-
-            # Map back to global Viewgraph and stats
-            for local_idx in kept_indices_local:
-                global_idx = k + local_idx.item()
-                filtered_viewgraph.append(viewgraph[global_idx])
-
-                i_name = image_names[idx_i[local_idx]]
-                j_name = image_names[idx_j[local_idx]]
-
-                self.times_image_was_registered[i_name] += 1
-                self.times_image_was_registered[j_name] += 1
-
-                self.valid_points_per_pair[(i_name, j_name)] = valid_counts[
-                    local_idx
-                ].item()
-
-    # Normalize frequencies
-    freq = {}
-    for pair in filtered_viewgraph:
-        i, j = pair
-        freq[i] = freq.get(i, 0) + 1
-        freq[j] = freq.get(j, 0) + 1
-
-    for image_name in self.times_image_was_registered.keys():
-        if image_name in freq:
-            self.times_image_was_registered[image_name] /= freq[image_name]
-        else:
-            self.times_image_was_registered[image_name] = 0.0
-
-    print(f"Filtered viewgraph: {len(filtered_viewgraph):,} pairs retained")
-    return filtered_viewgraph
+    print(
+        f"Filtered viewgraph: {len(filtered_viewgraph):,}/{len(viewgraph):,} pairs retained"
+    )
+    return filtered_viewgraph, valid_points_per_pair
