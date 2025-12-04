@@ -9,6 +9,7 @@ class CameraModule(nn.Module):
         k_models: list[str],
         k_params: torch.Tensor,
         lr: float = 1e-3,
+        grad: bool = True,
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
     ):
@@ -51,24 +52,21 @@ class CameraModule(nn.Module):
         self.k_params = k_params.clone().detach().to(self.device, dtype=self.dtype)
         self.alphas = nn.Parameter(
             torch.zeros((self.k_params.shape[0], 2), device=self.device),
-            requires_grad=True,
+            requires_grad=grad,
         )
 
         self.lr = float(lr)
-        self.init_optimizer(k_lr=self.lr)
-        self.init_scheduler(
-            lr_reduce_factor=0.75, patience=3, min_lr=self.lr / 20
-        )  # this params seem good
+        if grad:
+            self.init_optimizer(k_lr=self.lr)
+            self.init_scheduler(
+                lr_reduce_factor=0.75, patience=3, min_lr=self.lr / 20
+            )  # this params seem good
 
         self.update_all_matrices()  # Precompute all intrinsic matrices
 
     def init_optimizer(self, k_lr: float):
         """Re-initialize optimizer with new learning rate."""
-        self.optimizer = torch.optim.AdamW(
-            [
-                {"params": self.alphas, "lr": k_lr},
-            ]
-        )
+        self.optimizer = torch.optim.AdamW([self.alphas], lr=k_lr)
 
     def init_scheduler(self, lr_reduce_factor: float, patience: int, min_lr: float):
         """Initialize LR scheduler for the optimizer."""
@@ -82,6 +80,12 @@ class CameraModule(nn.Module):
             patience=patience,
             min_lr=min_lr,
         )
+
+    def optimizer_and_scheduler_step(self, loss):
+        """Perform optimizer step and update scheduler based on loss."""
+        self.optimizer.step()
+        if hasattr(self, "scheduler"):
+            self.scheduler.step(loss.detach())
 
     def map_camera_ids_to_indices(self, camera_ids) -> torch.LongTensor:
         """
@@ -210,7 +214,7 @@ class CameraModule(nn.Module):
 
     def parameters(self, recurse=True):  # Changed: match nn.Module signature
         """Return list of trainable parameters - only self.params is a leaf tensor"""
-        return [self.alphas]  # Changed: return iterator like nn.Module
+        return [self.alphas] if self.alphas.requires_grad else []
 
     def get_camera_parameters(self, indices) -> torch.Tensor:
         """Get camera parameters for given camera IDs."""
