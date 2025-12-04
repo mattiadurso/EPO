@@ -86,6 +86,20 @@ class MiscModule:
                     f"{perc:>{perc_width}.1f}%"
                     f"{value_avg:>{avg_width}.4f}"
                 )
+            elif key == "total_optimization" and num_iters > 0:
+                # Show total optimization time with per-iteration average
+                perc = (
+                    (value / self.timings["total"]) * 100
+                    if self.timings["total"] > 0
+                    else 0
+                )
+                value_avg = value / num_iters
+                row_str = (
+                    f"{key:<{key_width}}"
+                    f"{value:>{val_width}.2f}"
+                    f"{perc:>{perc_width}.1f}%"
+                    f"{value_avg:>{avg_width}.4f}"
+                )
             else:
                 # Show total time and percentage
                 perc = (
