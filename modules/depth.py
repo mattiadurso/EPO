@@ -4,7 +4,12 @@ import torch.nn as nn
 
 class DepthModule(nn.Module):
     def __init__(
-        self, image_id_map: dict, depth: torch.Tensor, lr: float = 5e-3, device="cuda"
+        self,
+        image_id_map: dict,
+        depth: torch.Tensor,
+        lr: float = 5e-3,
+        device="cuda",
+        grad: bool = True,
     ):
         """Depth module to hold depth parameters"""
         super().__init__()
@@ -14,26 +19,24 @@ class DepthModule(nn.Module):
         self.image_to_tensor_idx = image_id_map
         self.tensor_idx_to_image = {v: k for k, v in image_id_map.items()}
 
-        # store loss in log space to avoid negative depths
-        depth = torch.log(depth)
+        # storing as inverse depth for better numerical stability
+        depth = depth.pow(-1)
 
         self.params = nn.Parameter(
-            depth.clone().detach().to(device), requires_grad=True
+            depth.clone().detach().to(device), requires_grad=grad
         )
 
         self.lr = float(lr)
-        self.init_optimizer(z_lr=self.lr)
-        self.init_scheduler(
-            lr_reduce_factor=0.75, patience=3, min_lr=self.lr / 20
-        )  # this params seem good
+        self.lr_min = self.lr / 20
+        if grad:
+            self.init_optimizer(z_lr=self.lr)
+            self.init_scheduler(
+                lr_reduce_factor=0.75, patience=3, min_lr=self.lr_min
+            )  # this params seem good
 
     def init_optimizer(self, z_lr: float):
         """Re-initialize optimizer with new learning rate."""
-        self.optimizer = torch.optim.AdamW(
-            [
-                {"params": self.params, "lr": z_lr},
-            ]
-        )
+        self.optimizer = torch.optim.AdamW([self.params], lr=z_lr)
 
     def init_scheduler(self, lr_reduce_factor: float, patience: int, min_lr: float):
         """Initialize LR scheduler for the optimizer."""
@@ -46,6 +49,12 @@ class DepthModule(nn.Module):
             patience=patience,
             min_lr=min_lr,
         )
+
+    def optimizer_and_scheduler_step(self, loss):
+        """Perform optimizer step and update scheduler based on loss."""
+        self.optimizer.step()
+        if hasattr(self, "scheduler"):
+            self.scheduler.step(loss.detach())
 
     def forward(self, ids):
         """Return depth parameters - ensures gradient flow"""
@@ -85,10 +94,10 @@ class DepthModule(nn.Module):
         """Return depth parameters - ensures gradient flow"""
         indices = self.map_ids_to_indices(ids) if isinstance(ids[0], str) else ids
         # Return depth in linear space by exponentiating the stored log-depths
-        return torch.exp(self.params[indices])
+        return self.params[indices].pow(-1)
 
     def parameters(self, recurse: bool = True):
-        return [self.params]
+        return [self.params] if self.params.requires_grad else []
 
     def __repr__(self):
         out = (

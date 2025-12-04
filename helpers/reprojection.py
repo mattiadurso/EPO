@@ -159,8 +159,8 @@ def compute_121_reprojection(
         img1_shape=(img0.shape[-2], img0.shape[-1]),
     )
 
-    if verbose:
-        print(kpts0.shape, kpts1.shape, kpts0_back.shape, "projected")
+    # if verbose:
+    #     print(kpts0.shape, kpts1.shape, kpts0_back.shape, "projected")
 
     # detect nans and remove if any, no need for kpts0
     # it should be a problem, invalid points are set to (0,0)
@@ -171,8 +171,8 @@ def compute_121_reprojection(
     kpts1 = kpts1[~nan_mask]
     kpts0_back = kpts0_back[~nan_mask]
 
-    if verbose:
-        print(kpts0.shape, kpts1.shape, "removed nan")
+    # if verbose:
+    #     print(kpts0.shape, kpts1.shape, "removed nan")
 
     # check if back projections is close enough to the original points
     mask = torch.sqrt(((kpts0 - kpts0_back) ** 2).sum(dim=-1)) < reprojection_error
@@ -441,10 +441,10 @@ def filter_viewgraph_by_reprojection_batched(
                 filtered_viewgraph.append((i_name, j_name))
                 valid_points_per_pair[(i_name, j_name)] = num_valid
 
-            if verbose:
-                print(f"Pair ({i_name}, {j_name}): {num_valid}/{tot} valid points")
+            # print(f"Pair ({i_name}, {j_name}): {num_valid}/{tot} valid points")
 
-    print(
-        f"Filtered viewgraph: {len(filtered_viewgraph):,}/{len(viewgraph):,} pairs retained"
-    )
+    if verbose:
+        print(
+            f"Filtered viewgraph: {len(filtered_viewgraph):,}/{len(viewgraph):,} pairs retained"
+        )
     return filtered_viewgraph, valid_points_per_pair

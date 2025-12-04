@@ -120,6 +120,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         t_lr=1e-3,
         k_lr=5e-4,
         z_lr=1e-4,
+        mlp_pose_lr=1e-3,
+        grad_q=False,
+        grad_t=False,
+        grad_k=False,
+        grad_z=False,
+        use_mlp_pose_refinement=True,
         viz=False,  # it true del non used stuff during computation
         verbose=False,
     ):
@@ -145,7 +151,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.use_amp = use_amp
         self.amp_dtype = amp_dtype
         self.dtype = torch.float32  # hardcode to float32 for stability
-        self.auc_th = [1, 3, 5]
+        self.auc_th = [1, 3, 5, 10]
         self.auc_saving_freq = 3
         self.viewgraph_path = viewgraph_path
         self.matcher_type = matcher_type
@@ -183,11 +189,22 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.edge_extractor = TeedWrapper(
                 device=device,
             )
+
         # what to train
         self.q_lr = q_lr
         self.t_lr = t_lr
         self.k_lr = k_lr
         self.z_lr = z_lr
+        self.mlp_pose_lr = mlp_pose_lr
+        self.grad_q = grad_q
+        self.grad_t = grad_t
+        self.grad_k = grad_k
+        self.grad_z = grad_z
+        self.use_mlp_pose_refinement = use_mlp_pose_refinement
+
+        # fix seed
+        self.seed = seed
+        self.fix_seed()
 
         # Loading
         self.timings = {}
@@ -269,12 +286,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.pad_masks = ParameterModule(self.image_id_map, pad_masks, self.device)
         self.dt_fields = ParameterModule(self.image_id_map, dt_fields, self.device)
         self.images_hw = ParameterModule(self.image_id_map, images_shapes, self.device)
-
         self.sampled_depth = DepthModule(
             image_id_map=self.image_id_map,
             depth=sampled_depth,
             device=self.device,
             lr=self.z_lr,
+            grad=self.grad_z,
         )
 
         # Prepare viewgraph with indices for faster access during optimization
@@ -306,7 +323,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
         # ==========================================================================
         # Create optimizer
-        if not self.verbose:
+        if self.verbose:
             params_to_optimize = self._collect_parameters_to_optimize()
             self._print_params_summary(params_to_optimize)
 
@@ -319,8 +336,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.timings["prepare_batched_inputs"] = 0
         self.timings["forward_pass"] = 0
         self.timings["loss_computation"] = 0
-        self.timings["gradient_computation"] = 0
-        self.timings["parameter_update"] = 0
+        self.timings["gradients_computation"] = 0
+        self.timings["parameters_update"] = 0
         self.timings["logging"] = 0
 
         # # At this point I might get rid of rgb images to save memory as not needed for edge loss
@@ -329,16 +346,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 self.images[image_name].pop("image")
                 self.images[image_name].pop("depth")
                 self.images[image_name].pop("edges_map")
-                if "sky_mask" in self.images[image_name]:
-                    self.images[image_name].pop("sky_mask")
 
         self.loss_list = []
-        self.lr_list = {"q": [], "t": [], "k": [], "z": []}
+        self.lr_list = {"q": [], "t": [], "mlp": [], "k": [], "z": []}
         self.auc_list = {"auc": {th: [] for th in self.auc_th}, "steps": []}
-        self.blacklist = set()  # Add this line
-
-        self.seed = seed
-        self.fix_seed()
+        self.convergence = False
+        self.blacklist = set()
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -348,27 +361,26 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         max_steps=100,
         batch_size=128,
         residuals_chunk_size=2048,
-        verbose=True,
         drop_last=True,
         debug=False,
+        gt_path=None,
     ):
         """
         Main optimization loop.
         Args:
             max_steps (int): Maximum number of optimization steps.
-            batch_size (int): Maximum number of image pairs per batch.
-                            In "quick" mode: samples this many pairs and backprops immediately.
-                            In "full" mode: batch size for accumulation over full viewgraph.
-            early_stopping (bool): Whether to stop early if learning rate reaches minimum.
-            verbose (bool): Whether to print progress.
-            drop_last (bool): Whether to drop the last batch if smaller than batch_size.
+            batch_size (int): Maximum number of image pairs per batch. Affects computation marginally if drop_last=True.
+            residuals_chunk_size (int): Chunk size for residual computation to save memory.
+            drop_last (bool): Whether to drop the last batch if smaller than batch_size. Useful for consistent batch sizes.
+            debug (bool): Whether to enable debug mode (tracks residuals).
+            gt_path
         """
         time_start = time.time()
 
         num_batches = math.ceil(len(self.viewgraph) / batch_size)
         num_batches = num_batches if drop_last else num_batches + 1
         max_steps = max_steps if max_steps > 0 else 1_000
-        if verbose:
+        if self.verbose:
             print(
                 f"Processing {len(self.viewgraph):,} pairs with batch size {batch_size:,} ({num_batches} batches per iteration).",
                 f"Using {self.images[list(self.images.keys())[0]]['edges_padded'].numel()//2:,} edges per image.",  # // due to x and y
@@ -381,10 +393,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 end="\n\n",
             )
 
-            bar = tqdm(range(max_steps), desc="Adjusting poses and intrinsics")
-        else:
-            bar = range(max_steps)
-
+        bar = tqdm(range(max_steps), desc="Optimizing the scene")
         # Forward and backward loop
         for step in bar:
             t_pre = time.time()
@@ -412,102 +421,97 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             loss = self._compute_batched_loss(
                 residuals, sampled_viewgraphs, debug=debug
             )
-
+            s_time = time.time()
             loss.backward()
+            self.timings["gradients_computation"] += time.time() - s_time
 
             self.optimizer_step_and_scheduler_step(step, loss.detach())
 
             # ============================================================
             # Logging
             # ============================================================
-            # logging_time_start = time.time()
+            logging_time_start = time.time()
             self.loss_list.append(loss.detach().item())
 
             # store lr for each group
-            self.lr_list["q"].append((step, self.poses.scheduler_q.get_last_lr()[0]))
-            self.lr_list["t"].append((step, self.poses.scheduler_t.get_last_lr()[0]))
-            self.lr_list["k"].append((step, self.intrinsics.scheduler.get_last_lr()[0]))
-            self.lr_list["z"].append(
-                (step, self.sampled_depth.scheduler.get_last_lr()[0])
+            self.collect_lrs(step)
+
+            # DEBUG: Evaluate AUC if GT available
+            if gt_path is not None and step % self.auc_saving_freq == 0:
+
+                opt = "optimized_reconstruction_GD/_current_test"
+                self.to_colmap(opt, save_points=False, verbose=False)
+                AUC_score_max, num_images, df_optim = eval_colmap_model(
+                    opt, gt_path, return_df=False, thrs=self.auc_th
+                )
+                # store AUC
+                for i, th in enumerate(self.auc_th):
+                    self.auc_list["auc"][th].append(AUC_score_max[i].item())
+                self.auc_list["steps"].append(step)
+
+            bar.set_postfix(
+                loss=f"{self.loss_list[-1]:.4f}",
+                auc5=(
+                    f"{self.auc_list['auc'][5][-1]:.4f}"
+                    if len(self.auc_list["auc"][5]) > 0
+                    else 0
+                ),
+                # lr=f"{self.lr_list['mlp'][-1][1]:.1e}",
             )
 
-            # # DEBUG: Evaluate AUC if GT available
-            # if gt_path is not None and step % self.auc_saving_freq == 0 and step > 0:
-
-            #     opt = "optimized_reconstruction_GD/_current_test"
-            #     self.to_colmap(opt, save_points=False, verbose=False)
-            #     AUC_score_max, num_images, df_optim = eval_colmap_model(
-            #         opt, gt_path, return_df=False, thrs=self.auc_th
-            #     )
-            #     # store AUC
-            #     for i, th in enumerate(self.auc_th):
-            #         self.auc_list["auc"][th].append(AUC_score_max[i].item())
-            #     self.auc_list["steps"].append(step)
-
-            if verbose:
-                bar.set_postfix(
-                    loss=f"{self.loss_list[-1]:.4f}",
-                    # auc5=(
-                    #     f"{self.auc_list['auc'][self.auc_th[-1]][-1]:.4f}"
-                    #     if len(self.auc_list["auc"][self.auc_th[-1]]) > 0
-                    #     else 0
-                    # ),
-                )
-
-            #     self.timings["logging"] += time.time() - logging_time_start
+            self.timings["logging"] += time.time() - logging_time_start
 
             if self.convergence:
-                if verbose:
-                    print(
-                        f"Both rotation and translation optimizers have reached the minimum learning rate. Stopping optimization at step {step}."
-                    )
+                print(
+                    f"Stopping optimization at step {step}. Convergence reached."
+                )
                 break
 
         self.timings["total_optimization"] += time.time() - time_start
-        self.print_summary() if verbose else None
+        if self.verbose:
+            self.print_summary()
 
     ### Forward and backward helpers ###
     def optimizers_zero_grad(self):
         """Zero the gradients of all optimizers."""
-        self.poses.optimizer_q.zero_grad()
-        self.poses.optimizer_t.zero_grad()
-        self.sampled_depth.optimizer.zero_grad()
-        self.intrinsics.optimizer.zero_grad()
+        if hasattr(self.poses, "optimizer"):
+            self.poses.optimizer.zero_grad()
+
+        if hasattr(self.intrinsics, "optimizer"):
+            self.intrinsics.optimizer.zero_grad()
+
+        if hasattr(self.sampled_depth, "optimizer"):
+            self.sampled_depth.optimizer.zero_grad()
 
     def optimizer_step_and_scheduler_step(self, step, loss):
         """Perform optimizer step and scheduler step for all optimizers."""
         # Ideally each of them should be able to run independently until needed (reaching min lr),
         # but for now we keep them in sync for simplicity.
+        s_time = time.time()
+        self.poses.optimizer_and_scheduler_step(loss)
 
-        if step < 20:
-            self.poses.optimizer_q.step()
-            self.poses.scheduler_q.step(loss)
+        # self.intrinsics.optimizer_and_scheduler_step(loss)
+        # self.sampled_depth.optimizer_and_scheduler_step(loss)
 
-        if step < 50:
-            self.poses.optimizer_t.step()
-            self.poses.scheduler_t.step(loss)
+        self.timings["parameters_update"] += time.time() - s_time
 
-        if step >= 50 and step < 180:
-            self.sampled_depth.optimizer.step()
-            self.sampled_depth.scheduler.step(loss)
+    def collect_lrs(self, step):
+        """Collect learning rates for all optimizers."""
+        if hasattr(self.poses, "scheduler_q"):
+            self.lr_list["q"].append((step, self.poses.scheduler_q.get_last_lr()[0]))
 
-        if step >= 180 and step < 200:
-            self.intrinsics.optimizer.step()
-            self.intrinsics.scheduler.step(loss)
+        if hasattr(self.poses, "scheduler_t"):
+            self.lr_list["t"].append((step, self.poses.scheduler_t.get_last_lr()[0]))
 
-        # if step >= 150:
-        #     # all jointly
-        #     self.poses.optimizer_q.step()
-        #     self.poses.scheduler_q.step(loss)
+        if hasattr(self.intrinsics, "scheduler"):
+            self.lr_list["k"].append((step, self.intrinsics.scheduler.get_last_lr()[0]))
 
-        #     self.poses.optimizer_t.step()
-        #     self.poses.scheduler_t.step(loss)
-
-        #     self.sampled_depth.optimizer.step()
-        #     self.sampled_depth.scheduler.step(loss)
-
-        #     self.intrinsics.optimizer.step()
-        #     self.intrinsics.scheduler.step(loss)
+        if hasattr(self.sampled_depth, "scheduler"):
+            self.lr_list["z"].append(
+                (step, self.sampled_depth.scheduler.get_last_lr()[0])
+            )
+        if hasattr(self.poses, "optimizer_mlp"):
+            self.lr_list["mlp"].append((step, self.poses.mlp_lr))
 
     def _unproject_edges_to_3D(self, batch_size=None):
         """Unproject 2D edges to 3D points for all images as a batch."""
@@ -783,6 +787,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             lr=self.k_lr,
             device=self.device,
             dtype=self.dtype,
+            grad=self.grad_k,
         )
 
         # Read poses from images
@@ -813,6 +818,10 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             t=torch.stack(t_tensor),
             q_lr=self.q_lr,
             t_lr=self.t_lr,
+            grad_q=self.grad_q,
+            grad_t=self.grad_t,
+            mlp_lr=self.mlp_pose_lr,
+            use_mlp=self.use_mlp_pose_refinement,
             device=self.device,
             dtype=self.dtype,
         )
@@ -916,7 +925,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 border=10,
                 # ====================
                 device=self.device,
-                verbose=False,
+                verbose=self.verbose,
             )
         )
 
@@ -1027,14 +1036,15 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
         self.max_edges = max_edges_to_retain
 
-        print(
-            f"Edges stats:\n",
-            f"{images_with_more_than_max:,} images have more than {max_edges_to_retain:,} edges. \n",
-            f"max: {max_edges:,} |",
-            f"min: {min_edges:,} | avg: {int(avg_edges):,} |",
-            f"std: {std_edges:,.2f} |",
-            f"quantiles (0.5, 0.9): {median_edges:,}, {q90:,}",
-        )
+        if self.verbose:
+            print(
+                f"Edges stats:\n",
+                f"{images_with_more_than_max:,} images have more than {max_edges_to_retain:,} edges. \n",
+                f"max: {max_edges:,} |",
+                f"min: {min_edges:,} | avg: {int(avg_edges):,} |",
+                f"std: {std_edges:,.2f} |",
+                f"quantiles (0.5, 0.9): {median_edges:,}, {q90:,}",
+            )
 
     @torch.no_grad()
     def _compute_distance_fields(self):
@@ -1076,9 +1086,11 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         # Collect parameters to optimize
         params_to_optimize["k"] = self.intrinsics.parameters()
 
-        params_to_optimize["q"] = self.poses.parameters(q=True, t=False)
+        params_to_optimize["q"] = self.poses.parameters(q=True)
 
-        params_to_optimize["t"] = self.poses.parameters(q=False, t=True)
+        params_to_optimize["t"] = self.poses.parameters(t=True)
+
+        params_to_optimize["mlp"] = self.poses.parameters(mlp=True)
 
         params_to_optimize["z"] = self.sampled_depth.parameters()
 
@@ -1087,7 +1099,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
     def _print_params_summary(self, params_to_optimize):
         total_params = 0
         print("\nTotal parameters to optimize:")
-        for key in ["k", "t", "q", "z", "mlp"]:
+        for key in ["t", "q", "mlp", "k", "z"]:
             space = 14 if key == "mlp" else 16
             if key not in params_to_optimize:
                 print(f"  {key}: {0:>{space},}")
@@ -1106,7 +1118,7 @@ if __name__ == "__main__":
     scene = "vienna_state_opera"  # vienna_state_opera, bicycle, bonsai, statue
 
     # Load dataset paths and parameters from JSON
-    with open("benchmark/paths.json") as f:
+    with open("benchmarks/paths.json") as f:
         paths_cfg = json.load(f)
 
     dataset_cfg = paths_cfg[dataset]
@@ -1131,13 +1143,8 @@ if __name__ == "__main__":
         depths_path=depths_path,
         # unreliable_area_masks_path=unreliable_area_masks_path,
         single_camera_per_folder=True,
-        grad_k=True,
-        grad_q=True,
-        grad_t=True,
-        grad_z=True,
-        detector="teed",  # or "canny", "bdcn", "sam2"
+        detector="canny",  # or "canny", "bdcn", "sam2"
         # # outdoor
-        lr=1e-3,
         matcher_type="frustums",  # or "exhaustive", "sequential"
         detector_params={
             "low_threshold": 0.20,
