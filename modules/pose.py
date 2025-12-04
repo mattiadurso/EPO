@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import pypose as pp
 import kornia.geometry.conversions as kgc  # maybe I can remove kornia
+from modules.mlp import PoseRefinementMLP
 
 
 class PoseModule(nn.Module):
@@ -12,6 +13,10 @@ class PoseModule(nn.Module):
         t: torch.Tensor,
         t_lr: float = 1e-3,
         q_lr: float = 1e-4,
+        grad_q: bool = False,
+        grad_t: bool = False,
+        use_mlp: bool = True,
+        mlp_lr: float = 1e-3,
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
     ):
@@ -30,6 +35,11 @@ class PoseModule(nn.Module):
         super().__init__()
         self.device = torch.device(device)
         self.dtype = dtype
+        if use_mlp:
+            print(f"When using MLP pose refinement, q and t gradients are disabled.")
+        grad_q = False if use_mlp else grad_q
+        grad_t = False if use_mlp else grad_t
+        self.mlp_lr = mlp_lr
 
         # --- ID Mappings ---
         # string name -> tensor index (0..N)
@@ -39,7 +49,7 @@ class PoseModule(nn.Module):
 
         num_cams = len(image_id_map)
         assert (
-            R.shape[0] == num_cams
+            R.shape[0] == t.shape[0] == num_cams
         ), f"R shape {R.shape} mismatch with num images {num_cams}"
 
         # --- Rotation Prep (Matrix -> Quat) ---
@@ -53,64 +63,86 @@ class PoseModule(nn.Module):
         # Store as Raw Parameter (requires normalization on usage)
         self.q_param = nn.Parameter(
             q_init.clone().detach().to(self.device, dtype=self.dtype),
-            requires_grad=True,
+            requires_grad=grad_q,
         )
 
         # --- Translation Prep ---
-        t_init = t.reshape(num_cams, 3)
+        t_init = t.reshape(num_cams, 3).to(self.device, dtype=self.dtype)
+
+        # I might/should find an effective way to scale translations
+        # self.t_scale = ...
+
+        # Store as Raw Parameter
         self.t_param = nn.Parameter(
-            t_scaled.clone().detach(),
-            requires_grad=True,
+            t_init.clone().detach(),
+            requires_grad=grad_t,
         )
 
-        # init optimizer lr
-        self.t_lr = float(t_lr)
-        self.min_t_lr = self.t_lr / 2
-        self.q_lr = float(q_lr)
-        self.min_q_lr = self.q_lr / 2
-        self.init_optimizer(t_lr=self.t_lr, q_lr=self.q_lr)
-        self.init_scheduler(
-            lr_reduce_factor=0.5,
-            patience=1,
-            min_q_lr=self.min_q_lr,
-            min_t_lr=self.min_t_lr,
-        )  # this params seem good
+        if use_mlp:
+            self.use_mlp = True
+            self.mlp = PoseRefinementMLP().to(self.device, dtype=self.dtype)
+            self.init_optimizer(mlp_lr=mlp_lr)
+            # self.scheduler_mlp = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            #     self.optimizer_mlp,
+            #     factor=0.75,
+            #     patience=1000,
+            #     min_lr=1e-4,
+            # )
+        else:
+            self.use_mlp = False
+            # init optimizer lr
+            self.t_lr = float(t_lr)
+            self.min_t_lr = self.t_lr / 20
+            self.q_lr = float(q_lr)
+            self.min_q_lr = self.q_lr / 20
+            self.init_optimizer(t_lr=self.t_lr, q_lr=self.q_lr)
+            self.init_scheduler(
+                lr_reduce_factor=0.75,
+                patience=3,
+                min_q_lr=self.min_q_lr,
+                min_t_lr=self.min_t_lr,
+            )  # this params seem good
 
         self.update_all_matrices()  # Precompute all extrinsic matrices
 
-    def init_optimizer(self, t_lr: float, q_lr: float):
+    def init_optimizer(
+        self, t_lr: float = 1e-3, q_lr: float = 1e-4, mlp_lr: float = 1e-3
+    ):
         """Re-initialize optimizer with new learning rate."""
-        self.optimizer_t = torch.optim.AdamW(
-            [
-                {"params": self.t_param, "lr": t_lr},
-            ]
-        )
-        self.optimizer_q = torch.optim.AdamW(
-            [
-                {"params": self.q_param, "lr": q_lr},
-            ]
-        )
+        if self.use_mlp:
+            self.optimizer = torch.optim.AdamW(self.mlp.parameters(), lr=mlp_lr)
+        else:
+            # Single optimizer with separate parameter groups for different LRs
+            self.optimizer = torch.optim.AdamW(
+                [
+                    {"params": [self.t_param], "lr": t_lr, "name": "t"},
+                    {"params": [self.q_param], "lr": q_lr, "name": "q"},
+                ],
+                weight_decay=0,
+            )
 
     def init_scheduler(
         self, lr_reduce_factor: float, patience: int, min_q_lr: float, min_t_lr: float
     ):
-        """Initialize LR scheduler for the optimizers."""
+        """Initialize LR scheduler for the optimizer."""
 
-        if not hasattr(self, "optimizer_t") or not hasattr(self, "optimizer_q"):
-            raise ValueError("Optimizers must be initialized before scheduler.")
+        if not hasattr(self, "optimizer") and not self.use_mlp:
+            raise ValueError("Optimizer must be initialized before scheduler.")
 
-        self.scheduler_t = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer_t,
+        # Single scheduler - will reduce all param group LRs by the same factor
+        # Note: ReduceLROnPlateau applies same factor to all groups
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
             factor=lr_reduce_factor,
             patience=patience,
-            min_lr=min_t_lr,
+            min_lr=min(min_t_lr, min_q_lr),  # Use the smaller min_lr
         )
-        self.scheduler_q = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer_q,
-            factor=lr_reduce_factor,
-            patience=patience,
-            min_lr=min_q_lr,
-        )
+
+    def optimizer_and_scheduler_step(self, loss: torch.Tensor):
+        """Step optimizer and scheduler based on current loss."""
+        self.optimizer.step()
+        if hasattr(self, "scheduler"):
+            self.scheduler.step(loss.detach())
 
     def map_names_to_indices(self, indices) -> torch.LongTensor:
         """Robustly maps string names to tensor indices."""
@@ -145,7 +177,7 @@ class PoseModule(nn.Module):
     def get_translation(self, indices) -> torch.Tensor:
         """Returns (B, 3) Translation vectors"""
         # Apply scaling to the learnable parameter
-        return self.t_param[indices] * self.t_scales[indices]
+        return self.t_param[indices]
 
     def get_projection_matrix(self, indices) -> torch.Tensor:
         """
@@ -159,10 +191,7 @@ class PoseModule(nn.Module):
         # Retrieve components
         R = self.get_rotation_matrix(indices)  # (B, 3, 3)
         t = self.get_translation(indices)  # (B, 3)
-
-        # # mlp Refinement
-        # if self.use_mlp:
-        #     R, t = self.apply_mlp(R, t)
+        R, t = self.apply_mlp(R, t)
 
         # Build 4x4 Matrix
         P = torch.eye(4, device=self.device, dtype=R.dtype).repeat(batch_size, 1, 1)
@@ -171,42 +200,24 @@ class PoseModule(nn.Module):
 
         return P
 
-    def forward(self, image_names):
-        """Convenience method to get RT matrices"""
-        return self.get_projection_matrix(image_names)
+    def apply_mlp(self, R, t) -> torch.Tensor:
+        """Apply MLP refinement to given poses."""
+        if not self.use_mlp:
+            return R, t
 
-    # def apply_and_init_mlp(self):
-    #     """Apply MLP refinement to all poses, then initialize a new MLP."""
-    #     # Get all current poses
-    #     all_poses_ids = list(range(len(self.t_param)))
-    #     R = self.get_rotation_matrix(all_poses_ids)
-    #     t = self.get_translation(all_poses_ids)
+        # Build 3x4 pose matrices and apply MLP
+        P_3x4 = torch.cat([R, t.unsqueeze(2)], dim=2)  # (B, 3, 4)
 
-    #     # Apply MLP
-    #     R_refined, t_refined = self.apply_mlp(R, t)
+        # Use mixed precision for MLP inference
+        with torch.amp.autocast(enabled=True, dtype=torch.bfloat16, device_type="cuda"):
+            P_3x4_refined = self.mlp(
+                P_3x4
+            )  # adding mlp residual and orthonormalization
 
-    #     # Update q_param and t_param with refined poses
-    #     # Convert R_refined to quaternions
-    #     q_refined = kgc.rotation_matrix_to_quaternion(R_refined)
-    #     q_refined = torch.roll(q_refined, shifts=-1, dims=1)
+        R = P_3x4_refined[:, :3, :3]
+        t = P_3x4_refined[:, :3, 3]
 
-    #     self.q_param[all_poses_ids] = q_refined.detach()
-    #     self.t_param[all_poses_ids] = t_refined.detach()
-
-    #     # Re-initialize MLP
-    #     self.mlp = PoseRefinementMLP().to(self.device, dtype=self.dtype)
-
-    # def apply_mlp(self, R, t) -> torch.Tensor:
-    #     """Apply MLP refinement to given poses."""
-    #     if not self.use_mlp:
-    #         return R, t
-
-    #     P_3x4 = torch.cat([R, t.unsqueeze(2)], dim=2)  # (B, 3, 4)
-    #     P_3x4_refined = self.mlp(P_3x4)  # adding mlp residual and orthonormalization
-    #     R = P_3x4_refined[:, :3, :3]
-    #     t = P_3x4_refined[:, :3, 3]
-
-    #     return R, t
+        return R, t
 
     def __repr__(self):
         limit = 3
@@ -225,15 +236,18 @@ class PoseModule(nn.Module):
             s += f"  ... {len(self.t_param) - limit} more."
         return s
 
-    def parameters(self, t=False, q=False, recurse: bool = True):
+    def parameters(self, t=False, q=False, mlp=False, recurse: bool = True):
         """Return list of trainable parameters - only leaf tensors"""
+
         params = []
-        if q and self.q_param.requires_grad:
-            params.append(self.q_param)
-        if t and self.t_param.requires_grad:
-            params.append(self.t_param)
-        # if mlp and self.use_mlp:
-        #     params.extend([p for p in self.mlp.parameters() if p.requires_grad])
+
+        if mlp and self.use_mlp:  # no q and t when mlp is used
+            params.extend([p for p in self.mlp.parameters() if p.requires_grad])
+        else:
+            if q and self.q_param.requires_grad:
+                params.append(self.q_param)
+            if t and self.t_param.requires_grad:
+                params.append(self.t_param)
         return params
 
     def get_image_qt(self, indices):
@@ -243,19 +257,24 @@ class PoseModule(nn.Module):
             if isinstance(indices[0], str)
             else indices
         )
+        R = self.get_rotation_matrix(indices)
+        t = self.get_translation(indices)
 
-        # # Ensure MLP is applied before returning values
-        # if self.use_mlp:
-        #     self.apply_and_init_mlp()
+        # Ensure MLP is applied before returning values
+        if self.use_mlp:
+            R, t = self.apply_mlp(R, t)
 
-        q = self.q_param[indices].squeeze()
+        # Convert R to quaternion
+        q = kgc.rotation_matrix_to_quaternion(R)
+        q = torch.roll(q, shifts=-1, dims=1)  # (x, y, z, w) to (w, x, y, z)
 
-        # Use get_translation to apply scale
-        t = self.get_translation(indices).squeeze()
-
-        return q, t
+        return q.squeeze(), t.squeeze()
 
     def update_all_matrices(self):
         """Init/Update all extrinsic matrices for all images and store them internally."""
         all_names = list(self.image_to_tensor_idx.keys())
         self.poses = self.get_projection_matrix(all_names)
+
+    def forward(self, image_names):
+        """Convenience method to get RT matrices"""
+        return self.get_projection_matrix(image_names)
