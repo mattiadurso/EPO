@@ -121,6 +121,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         k_lr=5e-4,
         z_lr=1e-4,
         viz=False,  # it true del non used stuff during computation
+        verbose=False,
     ):
         super().__init__()
 
@@ -153,6 +154,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.max_viewgraph_pairs = max_viewgraph_pairs
         self.unreliable_area_masks_path = unreliable_area_masks_path
         self.use_depth_confidence = use_depth_confidence
+        self.verbose = verbose
 
         # Edge extractor
         if detector == "canny":
@@ -304,11 +306,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
         # ==========================================================================
         # Create optimizer
-        params_to_optimize = self._collect_parameters_to_optimize()
-        self._print_params_summary(params_to_optimize)
+        if not self.verbose:
+            params_to_optimize = self._collect_parameters_to_optimize()
+            self._print_params_summary(params_to_optimize)
 
-        if self.use_amp:
-            self.scaler = torch.amp.GradScaler()
+        # if self.use_amp:
+        #     self.scaler = torch.amp.GradScaler()
 
         self.timings["total_loading"] = time.time() - time_start
         self.timings["total_optimization"] = 0
@@ -452,6 +455,13 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 )
 
             #     self.timings["logging"] += time.time() - logging_time_start
+
+            if self.convergence:
+                if verbose:
+                    print(
+                        f"Both rotation and translation optimizers have reached the minimum learning rate. Stopping optimization at step {step}."
+                    )
+                break
 
         self.timings["total_optimization"] += time.time() - time_start
         self.print_summary() if verbose else None
