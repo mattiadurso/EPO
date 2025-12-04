@@ -462,9 +462,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.timings["logging"] += time.time() - logging_time_start
 
             if self.convergence:
-                print(
-                    f"Stopping optimization at step {step}. Convergence reached."
-                )
+                print(f"Stopping optimization at step {step}. Convergence reached.")
                 break
 
         self.timings["total_optimization"] += time.time() - time_start
