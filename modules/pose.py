@@ -59,19 +59,21 @@ class PoseModule(nn.Module):
         # --- Translation Prep ---
         t_init = t.reshape(num_cams, 3)
         self.t_param = nn.Parameter(
-            t_init.clone().detach().to(self.device, dtype=self.dtype),
+            t_scaled.clone().detach(),
             requires_grad=True,
         )
 
         # init optimizer lr
         self.t_lr = float(t_lr)
+        self.min_t_lr = self.t_lr / 2
         self.q_lr = float(q_lr)
+        self.min_q_lr = self.q_lr / 2
         self.init_optimizer(t_lr=self.t_lr, q_lr=self.q_lr)
         self.init_scheduler(
-            lr_reduce_factor=0.75,
-            patience=3,
-            min_q_lr=self.q_lr / 20,
-            min_t_lr=self.t_lr / 20,
+            lr_reduce_factor=0.5,
+            patience=1,
+            min_q_lr=self.min_q_lr,
+            min_t_lr=self.min_t_lr,
         )  # this params seem good
 
         self.update_all_matrices()  # Precompute all extrinsic matrices
@@ -142,7 +144,8 @@ class PoseModule(nn.Module):
 
     def get_translation(self, indices) -> torch.Tensor:
         """Returns (B, 3) Translation vectors"""
-        return self.t_param[indices]
+        # Apply scaling to the learnable parameter
+        return self.t_param[indices] * self.t_scales[indices]
 
     def get_projection_matrix(self, indices) -> torch.Tensor:
         """
@@ -155,7 +158,7 @@ class PoseModule(nn.Module):
 
         # Retrieve components
         R = self.get_rotation_matrix(indices)  # (B, 3, 3)
-        t = self.t_param[indices]  # (B, 3)
+        t = self.get_translation(indices)  # (B, 3)
 
         # # mlp Refinement
         # if self.use_mlp:
@@ -211,7 +214,10 @@ class PoseModule(nn.Module):
         for i in range(min(limit, len(self.t_param))):
             name = self.tensor_idx_to_image[i]
             q_val = self.q_param[i].detach().cpu().numpy()
-            t_val = self.t_param[i].detach().cpu().numpy()
+
+            # Fetch physical translation (scaled) for representation
+            t_val = self.get_translation([i]).detach().cpu().numpy().flatten()
+
             # s += f"  Image '{name}': R={q_val:.3e}, t={t_val:.3e}\n"
             # print arrays with 3 decimal places signed, align them considering the sign too
             s += f"  Image '{name}': q=[{q_val[0]:+.3e}, {q_val[1]:+.3e}, {q_val[2]:+.3e}, {q_val[3]:+.3e}], t=[{t_val[0]:+.3e}, {t_val[1]:+.3e}, {t_val[2]:+.3e}]\n"
@@ -243,7 +249,9 @@ class PoseModule(nn.Module):
         #     self.apply_and_init_mlp()
 
         q = self.q_param[indices].squeeze()
-        t = self.t_param[indices].squeeze()
+
+        # Use get_translation to apply scale
+        t = self.get_translation(indices).squeeze()
 
         return q, t
 
