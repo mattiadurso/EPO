@@ -10,7 +10,7 @@ args = parser.parse_args()
 
 
 # Load dataset paths and parameters from JSON
-with open("benchmark/paths.json") as f:
+with open("benchmarks/paths.json") as f:
     paths_cfg = json.load(f)
 
 dataset = args.dataset  # Change this to switch dataset
@@ -40,31 +40,32 @@ for scene in scenes:
     gt_path = os.path.join(dataset_cfg["gt_path"], scene, dataset_cfg["gt_folder"])
 
     # ==============================================================================
-    # Adjuster
+    #                     Adjuster
     # ==============================================================================
-    lr = 1e-3
+
     adjuster = Adjuster(
-        # paths
         reconstruction_path=reconstruction_path,
         images_path=images_path,
         depths_path=depths_path,
-        use_depth_confidence=False,  # doesnt seem to help much
-        # detect and match
-        detector="canny",
+        q_lr=1e-4,
+        t_lr=1e-3,
+        k_lr=1e-3,
+        z_lr=1e-3,
+        detector="canny",  # or "canny", "bdcn", "sam2"
+        detector_params={
+            "low_threshold": 0.20,
+            "high_threshold": 0.25,
+            "kernel_size": 7,
+            "sigma": 2,
+        },
         matcher_type="exhaustive",  # or "exhaustive", "sequential", "frustums"
-        # optimization
-        grad_z=True,
-        grad_k=True,
-        grad_t=True,
-        grad_q=True,
-        lr=lr,
-        scheduler_name="ReduceLROnPlateau",
-        scheduler_params={"factor": 0.75, "patience": 3, "min_lr": lr / 20},
+        viz=True,
+        use_amp=False,
     )
 
-    adjuster(batch_size=256, max_steps=-1, residuals_chunk_size=2048, debug=False)
+    adjuster(batch_size=256, max_steps=1_000, residuals_chunk_size=2048, debug=False)
 
-    opt = f"benchmark/vggt_edge/{dataset}/{scene}/sparse"
+    opt = f"benchmarks/vggt_edge/{dataset}/{scene}/sparse"
     os.makedirs(opt, exist_ok=True)
 
     adjuster.to_colmap(
@@ -75,3 +76,5 @@ for scene in scenes:
 
 
 print(f"Total time: {time.time() - s_time:.2f} seconds")
+
+# python test.py mipnerf360 && python test.py terrasky3D && python test.py tt

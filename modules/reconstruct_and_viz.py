@@ -264,5 +264,13 @@ class ReconstructAndVizModule:
         timings_path = os.path.join(output_path, "timings.txt")
         with open(timings_path, "w") as f:
             for key, value in self.timings.items():
-                f.write(f"{key}: {value:.4f} s\n")
+                if "total" not in key:
+                    f.write(f"{key}: {value:.4f} s\n")
+            # total at the end
+            total = 0.0
+            for key, value in self.timings.items():
+                if "total" in key:
+                    total += value
+                    f.write(f"{key}: {value}\n")
+            f.write(f"total: {total}\n")
         return recon
