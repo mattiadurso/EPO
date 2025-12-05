@@ -3,9 +3,10 @@ import torch.nn as nn
 import pypose as pp
 import kornia.geometry.conversions as kgc  # maybe I can remove kornia
 from modules.mlp import PoseRefinementMLP
+from modules.base_module import BaseModule
 
 
-class PoseModule(nn.Module):
+class PoseModule(BaseModule):
     def __init__(
         self,
         image_id_map: dict[str, int],
@@ -32,9 +33,11 @@ class PoseModule(nn.Module):
             grad_t: Optimize translation?
             device: torch device
         """
-        super().__init__()
-        self.device = torch.device(device)
-        self.dtype = dtype
+        super().__init__(
+            image_id_map=image_id_map,
+            device=device,
+            dtype=dtype,
+        )
         if use_mlp:
             print(f"When using MLP pose refinement, q and t gradients are disabled.")
         grad_q = False if use_mlp else grad_q
@@ -137,29 +140,6 @@ class PoseModule(nn.Module):
             patience=patience,
             min_lr=min(min_t_lr, min_q_lr),  # Use the smaller min_lr
         )
-
-    def optimizer_and_scheduler_step(self, loss: torch.Tensor):
-        """Step optimizer and scheduler based on current loss."""
-        self.optimizer.step()
-        if hasattr(self, "scheduler"):
-            self.scheduler.step(loss.detach())
-
-    def map_names_to_indices(self, indices) -> torch.LongTensor:
-        """Robustly maps string names to tensor indices."""
-        # Handle single string input
-        if isinstance(indices, str):
-            indices = [indices]
-
-        elif isinstance(indices, torch.Tensor):
-            return torch.tensor(indices, dtype=torch.long, device=self.device)
-
-        try:
-            indices = [self.image_to_tensor_idx[name] for name in indices]
-        except KeyError as e:
-            raise ValueError(
-                f"Image name {e} not found in PoseModel initialization dict."
-            )
-        return torch.tensor(indices, dtype=torch.long, device=self.device)
 
     def get_rotation_matrix(self, indices) -> torch.Tensor:
         """
@@ -274,7 +254,3 @@ class PoseModule(nn.Module):
         """Init/Update all extrinsic matrices for all images and store them internally."""
         all_names = list(self.image_to_tensor_idx.keys())
         self.poses = self.get_projection_matrix(all_names)
-
-    def forward(self, image_names):
-        """Convenience method to get RT matrices"""
-        return self.get_projection_matrix(image_names)

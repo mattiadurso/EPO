@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
+from modules.base_module import BaseModule
 
 
-class CameraModule(nn.Module):
+class CameraModule(BaseModule):
     def __init__(
         self,
-        cam_id: dict,
+        image_id_map: dict,
         k_models: list[str],
         k_params: torch.Tensor,
         lr: float = 1e-3,
@@ -20,9 +21,9 @@ class CameraModule(nn.Module):
             k_params: Nx4 tensor of camera parameters, fx, fy, cx, cy
             device: torch device
         """
-        super().__init__()
-        self.device = torch.device(device)
-        self.dtype = dtype
+        super().__init__(image_id_map, device=device, dtype=dtype)
+        # self.device = torch.device(device)
+        # self.dtype = dtype
 
         # Define model ID mapping
         self.camera_model_name_to_id = {
@@ -31,8 +32,8 @@ class CameraModule(nn.Module):
         }
 
         # --- ID Mappings ---
-        self.recon_to_tensor_cam_id = cam_id
-        self.tensor_to_recon_cam_id = {v: k for k, v in cam_id.items()}
+        self.recon_to_tensor_cam_id = image_id_map
+        self.tensor_to_recon_cam_id = {v: k for k, v in image_id_map.items()}
         self.keys = list(self.recon_to_tensor_cam_id.keys())
 
         # --- Model Types ---
@@ -44,29 +45,21 @@ class CameraModule(nn.Module):
         )
 
         # --- Parameters ---
-        # Use nn.Parameter so nn.Module tracks it automatically
-        # self.k_params = nn.Parameter(
-        #     k_params.clone().detach().to(self.device, dtype=self.dtype),
-        #     requires_grad=True,
-        # )
         self.k_params = k_params.clone().detach().to(self.device, dtype=self.dtype)
-        self.alphas = nn.Parameter(
+        # alphas for f = f * (1 + alpha)
+        self.params = nn.Parameter(
             torch.zeros((self.k_params.shape[0], 2), device=self.device),
             requires_grad=grad,
         )
 
         self.lr = float(lr)
         if grad:
-            self.init_optimizer(k_lr=self.lr)
+            self.init_optimizer(lr=self.lr)
             self.init_scheduler(
                 lr_reduce_factor=0.75, patience=3, min_lr=self.lr / 20
             )  # this params seem good
 
         self.update_all_matrices()  # Precompute all intrinsic matrices
-
-    def init_optimizer(self, k_lr: float):
-        """Re-initialize optimizer with new learning rate."""
-        self.optimizer = torch.optim.AdamW([self.alphas], lr=k_lr)
 
     def init_scheduler(self, lr_reduce_factor: float, patience: int, min_lr: float):
         """Initialize LR scheduler for the optimizer."""
@@ -87,30 +80,6 @@ class CameraModule(nn.Module):
         if hasattr(self, "scheduler"):
             self.scheduler.step(loss.detach())
 
-    def map_camera_ids_to_indices(self, camera_ids) -> torch.LongTensor:
-        """
-        Robustly maps reconstruction IDs (arbitrary ints) to internal tensor indices (0..N).
-        Handles inputs as list, numpy, or tensor.
-        """
-        # Ensure input is iterable on CPU for dictionary lookup
-        if isinstance(camera_ids, torch.Tensor):
-            ids_cpu = camera_ids.detach().cpu().tolist()
-        elif isinstance(camera_ids, (list, tuple)):
-            ids_cpu = camera_ids
-        else:
-            ids_cpu = [camera_ids]  # Handle single int
-
-        # Perform lookup
-        try:
-            indices = [self.recon_to_tensor_cam_id[cid] for cid in ids_cpu]
-        except KeyError as e:
-            raise ValueError(
-                f"Camera ID {e} found in batch but not in initialization dictionary."
-            )
-
-        # Return as LongTensor on the correct device for indexing
-        return torch.tensor(indices, dtype=torch.long, device=self.device)
-
     def get_all_intrinsic_matrix(self):
         return self.keys, self.get_intrinsic_matrix(self.keys)
 
@@ -119,7 +88,7 @@ class CameraModule(nn.Module):
 
         # 1. Get the internal row indices for the requested cameras
         if isinstance(indices[0], str):
-            indices = self.map_camera_ids_to_indices(indices)
+            indices = self.map_names_to_indices(indices)
 
         batch_size = indices.shape[0]
 
@@ -168,7 +137,7 @@ class CameraModule(nn.Module):
 
         fx, fy = params[:, 0], params[:, 1]
         cx, cy = params[:, 2], params[:, 3]
-        alpha = self.alphas[tensor_indices]
+        alpha = self.params[tensor_indices]
 
         K = torch.zeros((batch_size, 3, 3), dtype=params.dtype, device=self.device)
         K[:, 0, 0] = fx * (1 + alpha[:, 0])
@@ -185,7 +154,7 @@ class CameraModule(nn.Module):
         params = self.k_params[
             tensor_indices
         ]  # Shape (B, 4) - we assume unused cols are ignored
-        alpha = self.alphas[tensor_indices]
+        alpha = self.params[tensor_indices]
 
         f = params[:, 0]
         cx = params[:, 1]
@@ -199,6 +168,30 @@ class CameraModule(nn.Module):
         K[:, 2, 2] = 1.0
         return K
 
+    def get_camera_parameters(self, indices) -> torch.Tensor:
+        """Get camera parameters for given camera IDs."""
+        if isinstance(indices[0], str):
+            indices = self.map_names_to_indices(indices)
+
+        k_model = self.k_models[indices]
+        k_params = self.k_params[indices]
+        params = self.params[indices]
+
+        if k_params.shape[1] == 3 and k_model[0] == "SIMPLE_PINHOLE":
+            k_params[:, 0] = k_params[:, 0] * (1 + params[:, 0])  # fx
+
+        elif k_params.shape[1] == 4 and k_model[0] == "PINHOLE":
+            k_params[:, 0] = k_params[:, 0] * (1 + params[:, 0])  # fx
+            k_params[:, 1] = k_params[:, 1] * (1 + params[:, 1])  # fy
+
+        return k_model, k_params.squeeze()
+
+    def update_all_matrices(self):
+        """Init/Update all intrinsic matrices for all cameras and store them internally."""
+        all_ids = self.keys
+        self.cameras = self.get_intrinsic_matrix(all_ids)
+        self.cameras_inv = torch.linalg.inv(self.cameras)
+
     def __repr__(self):
         s = "CameraModel:\n"
         # Only print first 5 to avoid clutter if there are thousands of cams
@@ -211,31 +204,3 @@ class CameraModule(nn.Module):
             s += f"  Camera {self.tensor_to_recon_cam_id[i]}: Model={model}, Params={params.detach().cpu().tolist()}\n"
             count += 1
         return s
-
-    def parameters(self, recurse=True):  # Changed: match nn.Module signature
-        """Return list of trainable parameters - only self.params is a leaf tensor"""
-        return [self.alphas] if self.alphas.requires_grad else []
-
-    def get_camera_parameters(self, indices) -> torch.Tensor:
-        """Get camera parameters for given camera IDs."""
-        if isinstance(indices[0], str):
-            indices = self.map_camera_ids_to_indices(indices)
-
-        k_model = self.k_models[indices]
-        k_params = self.k_params[indices]
-        alphas = self.alphas[indices]
-
-        if k_params.shape[1] == 3 and k_model[0] == "SIMPLE_PINHOLE":
-            k_params[:, 0] = k_params[:, 0] * (1 + alphas[:, 0])  # fx
-
-        elif k_params.shape[1] == 4 and k_model[0] == "PINHOLE":
-            k_params[:, 0] = k_params[:, 0] * (1 + alphas[:, 0])  # fx
-            k_params[:, 1] = k_params[:, 1] * (1 + alphas[:, 1])  # fy
-
-        return k_model, k_params.squeeze()
-
-    def update_all_matrices(self):
-        """Init/Update all intrinsic matrices for all cameras and store them internally."""
-        all_ids = self.keys
-        self.cameras = self.get_intrinsic_matrix(all_ids)
-        self.cameras_inv = torch.linalg.inv(self.cameras)

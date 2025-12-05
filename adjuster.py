@@ -281,15 +281,13 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         )
 
         # storing
-        self.edges_padded = ParameterModule(
-            self.image_id_map, edges_padded, self.device
-        )
-        self.pad_masks = ParameterModule(self.image_id_map, pad_masks, self.device)
-        self.dt_fields = ParameterModule(self.image_id_map, dt_fields, self.device)
-        self.images_hw = ParameterModule(self.image_id_map, images_shapes, self.device)
+        self.edges_padded = BaseModule(self.image_id_map, edges_padded, self.device)
+        self.pad_masks = BaseModule(self.image_id_map, pad_masks, self.device)
+        self.dt_fields = BaseModule(self.image_id_map, dt_fields, self.device)
+        self.images_hw = BaseModule(self.image_id_map, images_shapes, self.device)
         self.sampled_depth = DepthModule(
             image_id_map=self.image_id_map,
-            depth=sampled_depth,
+            parameters=sampled_depth,
             device=self.device,
             lr=self.z_lr,
             grad=self.grad_z,
@@ -300,8 +298,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             (
                 self.image_id_map[i],
                 self.image_id_map[j],
-                self.intrinsics.map_camera_ids_to_indices(self.images[i]["cam_id"]),
-                self.intrinsics.map_camera_ids_to_indices(self.images[j]["cam_id"]),
+                self.intrinsics.map_names_to_indices(self.images[i]["cam_id"]),
+                self.intrinsics.map_names_to_indices(self.images[j]["cam_id"]),
             )
             for i, j in self.viewgraph
         ]
@@ -310,9 +308,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         images_cams_ids = [
             (
                 self.image_id_map[image_name],
-                self.intrinsics.map_camera_ids_to_indices(
-                    self.images[image_name]["cam_id"]
-                ),
+                self.intrinsics.map_names_to_indices(self.images[image_name]["cam_id"]),
             )
             for image_name in sorted(self.images.keys())
         ]
@@ -362,7 +358,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         max_steps=100,
         batch_size=128,
         residuals_chunk_size=2048,
-        drop_last=True,
+        drop_last=False,
         debug=False,
         gt_path=None,
     ):
@@ -435,7 +431,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.loss_list.append(loss.detach().item())
 
             # store lr for each group
-            self.collect_lrs(step)
+            self.collect_lrs(len(self.loss_list) - 1)
 
             # DEBUG: Evaluate AUC if GT available
             if gt_path is not None and step % self.auc_saving_freq == 0:
@@ -543,7 +539,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         points_3D = torch.cat(points_3D_list, dim=0)
 
         # Store points_3D in Edges3DModule
-        self.edges_3D = Edges3DModule(self.image_id_map, points_3D, self.device)
+        self.edges_3D = BaseModule(
+            image_id_map=self.image_id_map,
+            parameters=points_3D,
+            device=self.device,
+            dtype=self.dtype,
+        )
 
     def _create_batched_inputs(self, sampled_viewgraph):
         """Prepare batched inputs for the batched optimization step given a list of pairs from the viewgraph."""
@@ -597,7 +598,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         drop_last=True,
     ):
         """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss."""
-        # reduce viewgraph if too large, use torch
+        # reduce viewgraph if too large
         if len(sampled_viewgraph) > self.max_viewgraph_pairs:
             indices = torch.randperm(len(sampled_viewgraph))[: self.max_viewgraph_pairs]
             sampled_viewgraph = sampled_viewgraph[indices]
@@ -780,7 +781,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             k_params.append(intrinsics[cam_id]["parameters"])
 
         intrinsics = CameraModule(
-            cam_id=cam_id_to_tensor_id,
+            image_id_map=cam_id_to_tensor_id,
             k_models=k_models,
             k_params=torch.stack(k_params),
             lr=self.k_lr,
@@ -1077,37 +1078,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
         gc.collect()
         torch.cuda.empty_cache()
-
-    ## Optimizer and scheduler
-    def _collect_parameters_to_optimize(self):
-        params_to_optimize = {}
-
-        # Collect parameters to optimize
-        params_to_optimize["k"] = self.intrinsics.parameters()
-
-        params_to_optimize["q"] = self.poses.parameters(q=True)
-
-        params_to_optimize["t"] = self.poses.parameters(t=True)
-
-        params_to_optimize["mlp"] = self.poses.parameters(mlp=True)
-
-        params_to_optimize["z"] = self.sampled_depth.parameters()
-
-        return params_to_optimize
-
-    def _print_params_summary(self, params_to_optimize):
-        total_params = 0
-        print("\nTotal parameters to optimize:")
-        for key in ["t", "q", "mlp", "k", "z"]:
-            space = 14 if key == "mlp" else 16
-            if key not in params_to_optimize:
-                print(f"  {key}: {0:>{space},}")
-                continue
-            set_params = sum(p.numel() for p in params_to_optimize[key])
-            print(f"  {key}: {set_params:>{space},}")
-            total_params += set_params
-        print("-" * 23)
-        print(f"  {'Total':}: {total_params:>12,}\n")
 
 
 if __name__ == "__main__":
