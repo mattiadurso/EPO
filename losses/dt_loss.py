@@ -2,6 +2,7 @@ import torch
 import cv2
 import numpy as np
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 
 
 @torch.no_grad()
@@ -38,8 +39,10 @@ def compute_distance_field_cv2(
     # 4. Convert back to Torch
     field = torch.from_numpy(field_np).to(device=device, dtype=dtype)
 
-    # Normalize to [-1, 1] using tanh
-    # field = torch.tanh(field)
+    # # 5. Gasussian Blur to smooth the field (optional)
+    # field = field.unsqueeze(0).unsqueeze(0)  # Add batch and channel dims
+    # field = TF.gaussian_blur(field, kernel_size=(5, 5), sigma=(1.0, 1.0))
+    # field = field.squeeze(0).squeeze(0)  # Remove batch and channel dims
 
     return field
 

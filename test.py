@@ -4,6 +4,7 @@ import json
 import argparse
 from adjuster import Adjuster
 
+# Parse command-line arguments
 parser = argparse.ArgumentParser(description="Process dataset scenes")
 parser.add_argument("dataset", type=str, default="mipnerf360", help="Dataset name")
 args = parser.parse_args()
@@ -48,9 +49,15 @@ for scene in scenes:
         images_path=images_path,
         depths_path=depths_path,
         q_lr=1e-4,
+        grad_q=False,
         t_lr=1e-3,
+        grad_t=False,
         k_lr=1e-3,
+        grad_k=False,
         z_lr=1e-3,
+        grad_z=False,
+        mlp_pose_lr=1e-3,
+        use_mlp_pose_refinement=True,
         detector="canny",  # or "canny", "bdcn", "sam2"
         detector_params={
             "low_threshold": 0.20,
@@ -63,7 +70,7 @@ for scene in scenes:
         use_amp=False,
     )
 
-    adjuster(batch_size=256, max_steps=1_000, residuals_chunk_size=2048, debug=False)
+    adjuster(batch_size=512, max_steps=1_000, residuals_chunk_size=2048, debug=False)
 
     opt = f"benchmarks/vggt_edge/{dataset}/{scene}/sparse"
     os.makedirs(opt, exist_ok=True)
