@@ -56,6 +56,7 @@ from helpers.reprojection_compiled import (
 )
 from helpers.frustum import build_view_graph_from_frustums
 from modules import *
+from adjuster_modules import *
 
 import sys
 
