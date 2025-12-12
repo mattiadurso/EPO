@@ -78,6 +78,7 @@ def read_results(dataset, target_folder, models, thr=5, fill_auc_nan_with_zeros=
 
 def plot_auc5_with_time(df, dataset, models, thr):
     dataset = "Tanks & Temples" if dataset == "tt" else dataset
+    dataset = "Scannet++ v2" if dataset == "scannetpp" else dataset
 
     # --- 1. Data Preparation ---
     df_auc = df[[col for col in df.columns if f"auc@{thr}" in col]].copy()
@@ -114,7 +115,7 @@ def plot_auc5_with_time(df, dataset, models, thr):
 
     # --- 3. Plotting ---
     fig, ax1 = plt.subplots(
-        figsize=(len(df_combined.index) * len(df_combined.columns) / 2, 4)
+        figsize=(max(len(df_combined.index) * len(df_combined.columns) / 2, 4), 4)
     )
 
     # Plot AUC (Left Axis)
