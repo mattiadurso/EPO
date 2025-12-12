@@ -196,13 +196,13 @@ class MiscModule:
         params_to_optimize = {}
 
         # Collect parameters to optimize
-        params_to_optimize["k"] = self.intrinsics.parameters()
-
         params_to_optimize["q"] = self.poses.parameters(q=True)
 
         params_to_optimize["t"] = self.poses.parameters(t=True)
 
         params_to_optimize["mlp"] = self.poses.parameters(mlp=True)
+
+        params_to_optimize["k"] = self.intrinsics.parameters()
 
         params_to_optimize["z"] = self.sampled_depth.parameters()
 

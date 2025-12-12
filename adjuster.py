@@ -63,6 +63,8 @@ import sys
 sys.path.append("/home/mattia/Desktop/Repos/posebench/benchmarks_3D")
 from benchmark_pose import eval_colmap_model
 
+from modules.stopping_criterion import evaluate_changes
+
 
 class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
     """
@@ -92,6 +94,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         grad_z (bool, optional): Whether to optimize depth scale. Default is False.
         viz (bool, optional): Whether to visualize intermediate results. Default is False.
         gt_path (str, optional): Path to ground truth data for evaluation. Default is None.
+        max_edges_points (int, optional): Maximum number of edge points to use per image. Default is 16384.
+        max_viewgraph_pairs (int, optional): Maximum number of viewgraph pairs to use at each optimization step.
+            It's randomly sampled from the full viewgraph at each iteration. Default is 8192.
     """
 
     def __init__(
@@ -109,8 +114,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         max_workers=-1,
         detector_params={},
         seed=0,
-        max_edges_points=16_384,  # reasonabe number
-        max_viewgraph_pairs=8_192,  # limit on 4090
+        max_edges_points=16_384,  # hard contraint due to memory
+        max_viewgraph_pairs=8_192,  # hard contraint due to memory
         use_amp=True,
         amp_dtype=torch.bfloat16,  # torch.float16
         matcher_type="frustums",  # or "sequential"
@@ -137,6 +142,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             "sam2",
             "bdcn",
             "teed",
+            "diff",
         ], f"Detector {detector} not supported."
 
         self.max_workers = os.cpu_count() if max_workers < 0 else max_workers
@@ -188,6 +194,14 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             from extractors.TEED.teed_wrapper import TeedWrapper
 
             self.edge_extractor = TeedWrapper(
+                device=device,
+            )
+        elif detector == "diff":
+            from extractors.DiffusionEdge.diffusion_edge_wrapper import (
+                DiffusionEdgeDetector,
+            )
+
+            self.edge_extractor = DiffusionEdgeDetector(
                 device=device,
             )
 
@@ -349,6 +363,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.auc_list = {"auc": {th: [] for th in self.auc_th}, "steps": []}
         self.convergence = False
         self.blacklist = set()
+        self.pose_changes = {"q": [], "t": [], "max": [], "steps": []}
+        self.convergence_pose = False
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -358,8 +374,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         max_steps=100,
         batch_size=128,
         residuals_chunk_size=2048,
+        quantile=0.95,
+        window=50,
+        convergence_tol=0.5,
         drop_last=False,
         debug=False,
+        logging_=False,
         gt_path=None,
     ):
         """
@@ -368,6 +388,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             max_steps (int): Maximum number of optimization steps.
             batch_size (int): Maximum number of image pairs per batch. Affects computation marginally if drop_last=True.
             residuals_chunk_size (int): Chunk size for residual computation to save memory.
+            quantile (float): Quantile for evaluating pose changes.
+            window (int): Window size for convergence evaluation.
+            convergence_tol (float): Tolerance for convergence based on pose changes in degrees.
             drop_last (bool): Whether to drop the last batch if smaller than batch_size. Useful for consistent batch sizes.
             debug (bool): Whether to enable debug mode (tracks residuals).
             gt_path
@@ -389,7 +412,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 f"Total points to process per iteration: {total_points:,}.",
                 end="\n\n",
             )
-
+        past_poses = self.poses.get_all_matrices().detach().clone()
         bar = tqdm(range(max_steps), desc="Optimizing the scene")
         # Forward and backward loop
         for step in bar:
@@ -428,37 +451,52 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             # Logging
             # ============================================================
             logging_time_start = time.time()
-            self.loss_list.append(loss.detach().item())
+            if logging_:
+                self.loss_list.append(loss.detach().item())
 
-            # store lr for each group
-            self.collect_lrs(len(self.loss_list) - 1)
+                # store lr for each group
+                self.collect_lrs(len(self.loss_list) - 1)
 
-            # DEBUG: Evaluate AUC if GT available
-            if gt_path is not None and step % self.auc_saving_freq == 0:
+                # DEBUG: Evaluate AUC if GT available
+                if gt_path is not None and step % self.auc_saving_freq == 0:
 
-                opt = "optimized_reconstruction_GD/_current_test"
-                self.to_colmap(opt, save_points=False, verbose=False)
-                AUC_score_max, num_images, df_optim = eval_colmap_model(
-                    opt, gt_path, return_df=False, thrs=self.auc_th
+                    opt = "optimized_reconstruction_GD/_current_test"
+                    self.to_colmap(opt, save_points=False, verbose=False)
+                    AUC_score_max, num_images, df_optim = eval_colmap_model(
+                        opt, gt_path, return_df=False, thrs=self.auc_th
+                    )
+                    # store AUC
+                    for i, th in enumerate(self.auc_th):
+                        self.auc_list["auc"][th].append(AUC_score_max[i].item())
+                    self.auc_list["steps"].append(step)
+
+                bar.set_postfix(
+                    loss=f"{self.loss_list[-1]:.4f}",
+                    auc5=(
+                        f"{self.auc_list['auc'][5][-1]:.4f}"
+                        if len(self.auc_list["auc"][5]) > 0
+                        else 0
+                    ),
+                    # lr=f"{self.lr_list['mlp'][-1][1]:.1e}",
                 )
-                # store AUC
-                for i, th in enumerate(self.auc_th):
-                    self.auc_list["auc"][th].append(AUC_score_max[i].item())
-                self.auc_list["steps"].append(step)
-
-            bar.set_postfix(
-                loss=f"{self.loss_list[-1]:.4f}",
-                auc5=(
-                    f"{self.auc_list['auc'][5][-1]:.4f}"
-                    if len(self.auc_list["auc"][5]) > 0
-                    else 0
-                ),
-                # lr=f"{self.lr_list['mlp'][-1][1]:.1e}",
-            )
-
             self.timings["logging"] += time.time() - logging_time_start
 
-            if self.convergence:
+            # collect pose changes for convergence evaluation
+            current_poses = self.poses.get_all_matrices().detach().clone()
+            err_q, err_t, max_err = evaluate_changes(
+                past_poses,
+                current_poses,
+                quantile=quantile,
+            )
+            self.pose_changes["q"].append(err_q)
+            self.pose_changes["t"].append(err_t)
+            self.pose_changes["max"].append(max_err)
+            self.pose_changes["steps"].append(step)
+            past_poses = current_poses
+
+            self.evaluate_pose_convergence(window=window, tol=convergence_tol)
+
+            if self.convergence_pose and depth_iter_counter > depth_iter_max:
                 print(f"Stopping optimization at step {step}. Convergence reached.")
                 break
 
@@ -467,6 +505,36 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.print_summary()
 
     ### Forward and backward helpers ###
+    def evaluate_pose_convergence(self, window=50, tol=0.5):
+        """
+        Evaluate convergence based on pose changes: max(delta_r, delta_t).
+        Stop when smoothed max change is below tol for 'window' consecutive steps.
+        """
+        # We need at least 2*window - 1 steps to have 'window' smoothed points
+        # to check for stability over 'window' steps.
+        required_len = 2 * window - 1
+
+        if len(self.pose_changes["max"]) < required_len:
+            return
+
+        # Get the last chunk of data needed to compute the last 'window' smoothed values
+        # We need 'window' smoothed values.
+        # The last smoothed value uses pose_changes[-window:]
+        # The first of the 'window' smoothed values uses pose_changes[-(2*window-1) : -(window-1)]
+        # So we need the last 2*window - 1 raw values.
+        recent_changes = self.pose_changes["max"][-required_len:]
+
+        # Compute smoothed max changes for this chunk
+        smoothed_max = np.convolve(
+            recent_changes, np.ones(window) / window, mode="valid"
+        )
+
+        # smoothed_max should have length 'window' now.
+        # Check if ALL of them are below tolerance.
+        if np.all(smoothed_max < tol):
+            self.convergence_pose = True
+            self.convergence_step = len(self.pose_changes["max"])
+
     def optimizers_zero_grad(self):
         """Zero the gradients of all optimizers."""
         if hasattr(self.poses, "optimizer"):
@@ -497,6 +565,20 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
         if hasattr(self.poses, "scheduler_t"):
             self.lr_list["t"].append((step, self.poses.scheduler_t.get_last_lr()[0]))
+
+        if hasattr(self.poses, "scheduler"):
+            # these two are mutually exclusive
+            if self.use_mlp_pose_refinement:
+                self.lr_list["mlp"].append(
+                    (step, self.poses.scheduler.get_last_lr()[0])
+                )
+            else:
+                # get for group with name 't' and 'q'
+                for param_group in self.poses.optimizer.param_groups:
+                    if param_group["name"] == "t":
+                        self.lr_list["t"].append((step, param_group["lr"]))
+                    elif param_group["name"] == "q":
+                        self.lr_list["q"].append((step, param_group["lr"]))
 
         if hasattr(self.intrinsics, "scheduler"):
             self.lr_list["k"].append((step, self.intrinsics.scheduler.get_last_lr()[0]))
@@ -1000,7 +1082,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
         # this to save some computation/memory
         # likely only few images have very large number of edges
-        max_edges_to_retain = min(q90, max_edges)
+        max_edges_to_retain = min(self.max_edges, min(q90, max_edges))
         images_with_more_than_max = sum(1 for n in num_edges if n > max_edges_to_retain)
 
         for image_name in self.images.keys():

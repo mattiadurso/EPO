@@ -52,7 +52,7 @@ class BaseModule(nn.Module):
         Args:
             ids: Single ID (str/int), list, tuple, or tensor of IDs
         """
-        indices = self.map_ids_to_indices(ids) if isinstance(ids[0], str) else ids
+        indices = self.map_names_to_indices(ids) if isinstance(ids[0], str) else ids
         return self.params[indices]
 
     def __repr__(self) -> str:
@@ -71,10 +71,13 @@ class BaseModule(nn.Module):
 
     def init_optimizer(self, lr: float, w_decay: float = 0):
         """Initialize optimizer."""
-        self.optimizer = torch.optim.AdamW([self.params], lr=k_lr, weight_decay=w_decay)
+        self.optimizer = torch.optim.AdamW([self.params], lr=lr, weight_decay=w_decay)
 
     def optimizer_and_scheduler_step(self, loss):
         """Perform optimizer step and update scheduler based on loss."""
         self.optimizer.step()
         if hasattr(self, "scheduler"):
-            self.scheduler.step(loss.detach())
+            if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                self.scheduler.step(loss.detach())
+            else:  # other schedulers do not need loss input
+                self.scheduler.step()

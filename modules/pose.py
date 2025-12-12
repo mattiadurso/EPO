@@ -19,6 +19,8 @@ class PoseModule(BaseModule):
         use_mlp: bool = True,
         mlp_lr: float = 1e-3,
         device: str = "cuda",
+        total_steps: int = 1000,
+        warmup_steps: int = 25,
         dtype: torch.dtype = torch.float32,
     ):
         """
@@ -85,12 +87,28 @@ class PoseModule(BaseModule):
             self.use_mlp = True
             self.mlp = PoseRefinementMLP().to(self.device, dtype=self.dtype)
             self.init_optimizer(mlp_lr=mlp_lr)
-            # self.scheduler_mlp = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            #     self.optimizer_mlp,
-            #     factor=0.75,
-            #     patience=1000,
-            #     min_lr=1e-4,
-            # )
+
+            # --- Configuration ---
+            # 1. The Warmup Phase
+            # Starts at lr * start_factor and linearly increases to lr over 'total_iters'
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                self.optimizer,
+                start_factor=0.01,  # Start at 1% of your defined LR
+                total_iters=warmup_steps,
+            )
+
+            # 2. The Decay Phase
+            # Smoothly decreases from lr to min_lr
+            decay = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=total_steps - warmup_steps,  # Remaining steps
+                eta_min=5e-5,
+            )
+
+            # 3. Combine them
+            self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+                self.optimizer, schedulers=[warmup, decay], milestones=[warmup_steps]
+            )
         else:
             self.use_mlp = False
             # init optimizer lr
@@ -254,3 +272,8 @@ class PoseModule(BaseModule):
         """Init/Update all extrinsic matrices for all images and store them internally."""
         all_names = list(self.image_to_tensor_idx.keys())
         self.poses = self.get_projection_matrix(all_names)
+
+    def get_all_matrices(self):
+        """Get all extrinsic matrices for all images."""
+        all_names = list(self.image_to_tensor_idx.keys())
+        return self.get_projection_matrix(all_names)
