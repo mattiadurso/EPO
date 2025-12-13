@@ -58,8 +58,9 @@ def read_results(dataset, target_folder, models, thr=5, fill_auc_nan_with_zeros=
         df.fillna(0, inplace=True)
 
     df = pd.concat([df, pd.DataFrame(total_timings)], axis=1)
-    if "vggt_edge" in df.columns:
-        df["vggt_edge"] += df["vggt"]  # include base model time
+    for col in df.columns:
+        if col.startswith("vggt_edge"):
+            df[col] += df["vggt"]  # include base model time
 
     df.columns = [
         col.replace("_", "+") if "auc" not in col else col for col in df.columns
