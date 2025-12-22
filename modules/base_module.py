@@ -81,3 +81,7 @@ class BaseModule(nn.Module):
                 self.scheduler.step(loss.detach())
             else:  # other schedulers do not need loss input
                 self.scheduler.step()
+
+    def get_all_parameters(self) -> torch.Tensor:
+        """Return all parameters as a tensor."""
+        return self.params.detach().clone()
