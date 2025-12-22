@@ -63,7 +63,7 @@ import sys
 sys.path.append("/home/mattia/Desktop/Repos/posebench/benchmarks_3D")
 from benchmark_pose import eval_colmap_model
 
-from modules.stopping_criterion import evaluate_changes
+from modules.stopping_criterion import evaluate_pose_changes, evaluate_depth_changes
 
 
 class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
@@ -132,18 +132,11 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         grad_k=False,
         grad_z=False,
         use_mlp_pose_refinement=True,
+        auc_saving_freq=50,
         viz=False,  # it true del non used stuff during computation
         verbose=False,
     ):
         super().__init__()
-
-        assert detector in [
-            "canny",
-            "sam2",
-            "bdcn",
-            "teed",
-            "diff",
-        ], f"Detector {detector} not supported."
 
         self.max_workers = os.cpu_count() if max_workers < 0 else max_workers
         self.images_size = images_size
@@ -159,7 +152,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.amp_dtype = amp_dtype
         self.dtype = torch.float32  # hardcode to float32 for stability
         self.auc_th = [1, 3, 5, 10]
-        self.auc_saving_freq = 3
+        self.auc_saving_freq = auc_saving_freq
         self.viewgraph_path = viewgraph_path
         self.matcher_type = matcher_type
         self.scene_type = scene_type
@@ -204,6 +197,14 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.edge_extractor = DiffusionEdgeDetector(
                 device=device,
             )
+        elif detector == "rcf":
+            from extractors.rcf_torch.rfc_wrapper import RCFWrapper
+
+            self.edge_extractor = RCFWrapper(
+                device=device,
+            )
+        else:
+            raise ValueError(f"Unknown detector: {detector}")
 
         # what to train
         self.q_lr = q_lr
@@ -363,8 +364,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.auc_list = {"auc": {th: [] for th in self.auc_th}, "steps": []}
         self.convergence = False
         self.blacklist = set()
-        self.pose_changes = {"q": [], "t": [], "max": [], "steps": []}
+        self.changes = {"q": [], "t": [], "max": [], "steps": [], "z": []}
         self.convergence_pose = False
+        self.convergence_depth = False
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -372,11 +374,13 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
     def forward(
         self,
         max_steps=100,
-        batch_size=128,
+        batch_size=256,
         residuals_chunk_size=2048,
         quantile=0.95,
-        window=50,
-        convergence_tol=0.5,
+        window_pose=50,
+        window_depth=50,
+        convergence_tol_pose=0.5,  # degrees
+        convergence_tol_depth=0.1,  # relative change %
         drop_last=False,
         debug=False,
         logging_=False,
@@ -396,6 +400,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             gt_path
         """
         time_start = time.time()
+        convergence_tol_depth /= 100.0  # relative change
 
         num_batches = math.ceil(len(self.viewgraph) / batch_size)
         num_batches = num_batches if drop_last else num_batches + 1
@@ -413,8 +418,10 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 end="\n\n",
             )
         past_poses = self.poses.get_all_matrices().detach().clone()
-        bar = tqdm(range(max_steps), desc="Optimizing the scene")
+        past_depths = self.sampled_depth.get_all_parameters().detach().clone()
+
         # Forward and backward loop
+        bar = tqdm(range(max_steps), desc="Optimizing the scene")
         for step in bar:
             t_pre = time.time()
 
@@ -445,8 +452,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             loss.backward()
             self.timings["gradients_computation"] += time.time() - s_time
 
-            self.optimizer_step_and_scheduler_step(step, loss.detach())
-
+            self.optimizer_and_scheduler_step(step, loss.detach())
             # ============================================================
             # Logging
             # ============================================================
@@ -483,21 +489,53 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
             # collect pose changes for convergence evaluation
             current_poses = self.poses.get_all_matrices().detach().clone()
-            err_q, err_t, max_err = evaluate_changes(
+            err_q, err_t, max_err = evaluate_pose_changes(
                 past_poses,
                 current_poses,
                 quantile=quantile,
             )
-            self.pose_changes["q"].append(err_q)
-            self.pose_changes["t"].append(err_t)
-            self.pose_changes["max"].append(max_err)
-            self.pose_changes["steps"].append(step)
+            self.changes["q"].append(err_q)
+            self.changes["t"].append(err_t)
+            self.changes["max"].append(max_err)
+            self.changes["steps"].append(step)
             past_poses = current_poses
 
-            self.evaluate_pose_convergence(window=window, tol=convergence_tol)
+            if not self.convergence_pose:
+                if self.check_convergence(
+                    self.changes["max"], window=window_pose, tol=convergence_tol_pose
+                ):
+                    self.convergence_pose = True
+                    if self.verbose:
+                        print(f"Pose convergence reached at step {step}.")
 
-            if self.convergence_pose and depth_iter_counter > depth_iter_max:
-                print(f"Stopping optimization at step {step}. Convergence reached.")
+                    # If not optimizing depth, mark it as converged immediately
+                    if not self.grad_z:
+                        self.convergence_depth = True
+
+            elif self.convergence_pose:
+                # start evaluating depth convergence
+                current_depths = (
+                    self.sampled_depth.get_all_parameters().detach().clone()
+                )
+                depth_change = evaluate_depth_changes(
+                    past_depths,
+                    current_depths,
+                    self.pad_masks.get_all_parameters(),  # depth has padding init
+                    quantile=quantile,
+                )
+                self.changes["z"].append(depth_change)
+                past_depths = current_depths
+
+                if self.check_convergence(
+                    self.changes["z"][1:],
+                    window=window_depth,
+                    tol=convergence_tol_depth,
+                ):
+                    self.convergence_depth = True
+
+            if self.convergence_pose and self.convergence_depth:
+                if self.verbose:
+                    print(f"Stopping optimization at step {step}. Convergence reached.")
                 break
 
         self.timings["total_optimization"] += time.time() - time_start
@@ -505,7 +543,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.print_summary()
 
     ### Forward and backward helpers ###
-    def evaluate_pose_convergence(self, window=50, tol=0.5):
+    def check_convergence(self, list_of_changes, window=50, tol=0.5):
         """
         Evaluate convergence based on pose changes: max(delta_r, delta_t).
         Stop when smoothed max change is below tol for 'window' consecutive steps.
@@ -514,15 +552,15 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         # to check for stability over 'window' steps.
         required_len = 2 * window - 1
 
-        if len(self.pose_changes["max"]) < required_len:
-            return
+        if len(list_of_changes) < required_len:
+            return False
 
         # Get the last chunk of data needed to compute the last 'window' smoothed values
         # We need 'window' smoothed values.
         # The last smoothed value uses pose_changes[-window:]
         # The first of the 'window' smoothed values uses pose_changes[-(2*window-1) : -(window-1)]
         # So we need the last 2*window - 1 raw values.
-        recent_changes = self.pose_changes["max"][-required_len:]
+        recent_changes = list_of_changes[-required_len:]
 
         # Compute smoothed max changes for this chunk
         smoothed_max = np.convolve(
@@ -531,40 +569,41 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
         # smoothed_max should have length 'window' now.
         # Check if ALL of them are below tolerance.
-        if np.all(smoothed_max < tol):
-            self.convergence_pose = True
-            self.convergence_step = len(self.pose_changes["max"])
+        return np.all(smoothed_max < tol)
 
     def optimizers_zero_grad(self):
         """Zero the gradients of all optimizers."""
         if hasattr(self.poses, "optimizer"):
             self.poses.optimizer.zero_grad()
 
-        if hasattr(self.intrinsics, "optimizer"):
-            self.intrinsics.optimizer.zero_grad()
-
         if hasattr(self.sampled_depth, "optimizer"):
             self.sampled_depth.optimizer.zero_grad()
 
-    def optimizer_step_and_scheduler_step(self, step, loss):
+        # if hasattr(self.intrinsics, "optimizer"):
+        #     self.intrinsics.optimizer.zero_grad()
+
+    def optimizer_and_scheduler_step(self, step, loss):
         """Perform optimizer step and scheduler step for all optimizers."""
         # Ideally each of them should be able to run independently until needed (reaching min lr),
         # but for now we keep them in sync for simplicity.
         s_time = time.time()
-        self.poses.optimizer_and_scheduler_step(loss)
+        if (
+            self.grad_q is True
+            or self.grad_t is True
+            or self.use_mlp_pose_refinement is True
+        ):
+            self.poses.optimizer_and_scheduler_step(loss)
 
-        # self.intrinsics.optimizer_and_scheduler_step(loss)
-        # self.sampled_depth.optimizer_and_scheduler_step(loss)
+        if self.grad_z is True and self.convergence_pose is True:
+            self.sampled_depth.optimizer_and_scheduler_step(loss)
+
+        # if self.grad_k:
+        #     self.intrinsics.optimizer_and_scheduler_step(loss)
 
         self.timings["parameters_update"] += time.time() - s_time
 
     def collect_lrs(self, step):
         """Collect learning rates for all optimizers."""
-        if hasattr(self.poses, "scheduler_q"):
-            self.lr_list["q"].append((step, self.poses.scheduler_q.get_last_lr()[0]))
-
-        if hasattr(self.poses, "scheduler_t"):
-            self.lr_list["t"].append((step, self.poses.scheduler_t.get_last_lr()[0]))
 
         if hasattr(self.poses, "scheduler"):
             # these two are mutually exclusive
@@ -955,7 +994,17 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
     @torch.no_grad()
     def _compute_viewgraph(self, type="frustums"):
         """Compute viewgraph and filter by reprojection error and returns the sorted viewgraph."""
-        if type == "frustums":
+        if self.viewgraph_path is not None:
+            # Load viewgraph from file
+            with open(self.viewgraph_path, "r") as f:
+                lines = f.readlines()
+            viewgraph = []
+            for line in lines:
+                i, j, m = line.strip().split()
+                viewgraph.append((i, j))
+            self.viewgraph = viewgraph
+
+        elif type == "frustums":
             # Estimate view graph from frustums
             viewgraph = build_view_graph_from_frustums(
                 self.recon,
@@ -994,22 +1043,23 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         # Filter viewgraph by reprojection
         # min_points shouldbe set such images have enough overlap, maybe at least 25%
         # 518*345*0.25 = 44_677
-        self.viewgraph, self.valid_points_per_pair = (
-            filter_viewgraph_by_reprojection_batched(
-                viewgraph=viewgraph,
-                images=self.images,
-                intrinsics=self.intrinsics,
-                poses=self.poses,
-                # === parameters =====
-                min_points=min_points,
-                sampling_factor=sampling_factor,
-                reprojection_error=reprojection_error,
-                border=10,
-                # ====================
-                device=self.device,
-                verbose=self.verbose,
+        if self.viewgraph_path is None:
+            self.viewgraph, self.valid_points_per_pair = (
+                filter_viewgraph_by_reprojection_batched(
+                    viewgraph=viewgraph,
+                    images=self.images,
+                    intrinsics=self.intrinsics,
+                    poses=self.poses,
+                    # === parameters =====
+                    min_points=min_points,
+                    sampling_factor=sampling_factor,
+                    reprojection_error=reprojection_error,
+                    border=10,
+                    # ====================
+                    device=self.device,
+                    verbose=self.verbose,
+                )
             )
-        )
 
         self.viewgraph.sort(key=lambda x: (x[0], x[1]))
 

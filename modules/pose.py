@@ -102,7 +102,7 @@ class PoseModule(BaseModule):
             decay = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
                 T_max=total_steps - warmup_steps,  # Remaining steps
-                eta_min=5e-5,
+                eta_min=1e-6,
             )
 
             # 3. Combine them
@@ -158,6 +158,35 @@ class PoseModule(BaseModule):
             patience=patience,
             min_lr=min(min_t_lr, min_q_lr),  # Use the smaller min_lr
         )
+
+    def reduce_lr(self, factor=0.1):
+        """Reduce learning rate by a factor."""
+        if hasattr(self, "optimizer"):
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] *= factor
+
+        if hasattr(self, "scheduler"):
+            # 1. Handle ReduceLROnPlateau (used when use_mlp=False)
+            if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                # Update min_lrs so we don't hit the floor immediately after reducing
+                if isinstance(self.scheduler.min_lrs, list):
+                    self.scheduler.min_lrs = [
+                        lr * factor for lr in self.scheduler.min_lrs
+                    ]
+                else:
+                    self.scheduler.min_lrs *= factor
+
+            # 2. Handle Standard Schedulers (used when use_mlp=True)
+            # We need to update base_lrs so the schedule curve scales down
+            def update_base_lrs(scheduler):
+                if hasattr(scheduler, "base_lrs"):
+                    scheduler.base_lrs = [lr * factor for lr in scheduler.base_lrs]
+
+            if isinstance(self.scheduler, torch.optim.lr_scheduler.SequentialLR):
+                for sub in self.scheduler._schedulers:
+                    update_base_lrs(sub)
+            else:
+                update_base_lrs(self.scheduler)
 
     def get_rotation_matrix(self, indices) -> torch.Tensor:
         """

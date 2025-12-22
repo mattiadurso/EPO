@@ -335,7 +335,13 @@ def load_and_preprocess_depths(
         for future in tqdm(
             as_completed(futures), total=len(futures), desc="Loading depth maps"
         ):
-            image_name, depth_tensor, confidence_tensor = future.result()
+            try:
+                image_name, depth_tensor, confidence_tensor = future.result()
+            except Exception as e:
+                print(f"Error processing depth for {image_name}: {e}")
+                # if confidence map is missing, set to ones
+                image_name, depth_tensor = future.result()
+                confidence_tensor = None
 
             if depth_tensor is not None:
                 images_dict[image_name].update(
