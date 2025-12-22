@@ -85,7 +85,11 @@ class PoseModule(BaseModule):
 
         if use_mlp:
             self.use_mlp = True
-            self.mlp = PoseRefinementMLP().to(self.device, dtype=self.dtype)
+            self.mlp = PoseRefinementMLP(
+                input_dim=12,  # 3x4 pose matrix flattened
+                output_dim=12,  # 3x4 pose matrix flattened
+                hidden_dim=256,  # maybe too much, 128 could be enough
+            ).to(self.device, dtype=self.dtype)
             self.init_optimizer(mlp_lr=mlp_lr)
 
             # --- Configuration ---

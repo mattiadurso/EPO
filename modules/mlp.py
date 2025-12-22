@@ -14,11 +14,8 @@ class PoseRefinementMLP(nn.Module):
     - Output: 3x4 pose matrix with orthonormalized rotation via Gram-Schmidt.
     """
 
-    def __init__(self, hidden_dim=256):
+    def __init__(self, input_dim, output_dim, hidden_dim=256):
         super().__init__()
-        input_dim = 12  # 3x4 pose matrix flattened
-        output_dim = 12  # 3x4 pose matrix flattened
-
         # The 6 layers
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
