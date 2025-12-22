@@ -380,7 +380,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         window_pose=50,
         window_depth=50,
         convergence_tol_pose=0.5,  # degrees
-        convergence_tol_depth=0.1,  # relative change %
+        convergence_tol_depth=0.2,  # relative change %
         drop_last=False,
         debug=False,
         logging_=False,
@@ -541,6 +541,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.timings["total_optimization"] += time.time() - time_start
         if self.verbose:
             self.print_summary()
+        else:
+            print("=" * 60, end="\n\n")
 
     ### Forward and backward helpers ###
     def check_convergence(self, list_of_changes, window=50, tol=0.5):
