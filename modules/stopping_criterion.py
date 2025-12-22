@@ -1,6 +1,7 @@
 import torch
 
 
+### Pose changes ###
 def qvec2rotmat(qvec):
     """
     From COLMAP implementation.
@@ -179,7 +180,7 @@ def evaluate_R_err_fast(R_past, R_present, deg=True):
     return err_rad
 
 
-def evaluate_changes(P_past, P_present, quantile=0.95, deg=True):
+def evaluate_pose_changes(P_past, P_present, quantile=0.95, deg=True):
     """
     Evaluate the rotation and translation errors between two poses.
     Args:
@@ -204,3 +205,42 @@ def evaluate_changes(P_past, P_present, quantile=0.95, deg=True):
     qt = torch.quantile(err_t, quantile).item()
 
     return qq, qt, max(qq, qt)
+
+
+### depth changes ###
+def evaluate_depth_changes(depth_past, depth_present, pad_masks, quantile=0.95):
+    """
+    Evaluate the relative depth changes between two depth maps.
+    Args:
+        depth_past: Past depth map. (N,)
+        depth_present: Present depth map. (N,)
+    Returns:
+        qd: Quantile of relative depth changes.
+    """
+    eps = 1e-15
+
+    # I need to take care of padded parts here
+
+    # Avoid division by zero
+    depth_past = depth_past.clone()
+    depth_present = depth_present.clone()
+    depth_past[depth_past < eps] = eps
+    depth_present[depth_present < eps] = eps
+
+    # SMAPE (Symmetric Mean Absolute Percentage Error)
+    rel_change = torch.abs(depth_present - depth_past) / (
+        (depth_present + depth_past) / 2.0 + eps
+    )  # (N, edges)
+
+    # now I need to reduce rel_change to 1 per image (N,) by keeping the quantile of valid points, valid points might differ from image to image
+    qz_list = []
+    for i in range(rel_change.shape[0]):
+        valid_rel_change = rel_change[i][pad_masks[i]]
+        if valid_rel_change.numel() == 0:
+            qz_list.append(torch.tensor(0.0, device=rel_change.device))
+        else:
+            qz = torch.quantile(valid_rel_change, quantile)
+            qz_list.append(qz)
+
+    qz_list = torch.stack(qz_list, dim=0)  # (N,)
+    return torch.quantile(qz_list, quantile).item()
