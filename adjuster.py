@@ -377,8 +377,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         batch_size=256,
         residuals_chunk_size=2048,
         quantile=0.95,
-        window_pose=50,
-        window_depth=50,
+        window_pose=25,
+        window_depth=25,
         convergence_tol_pose=0.5,  # degrees
         convergence_tol_depth=0.2,  # relative change %
         drop_last=False,
