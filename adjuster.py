@@ -373,7 +373,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
     def forward(
         self,
-        max_steps=100,
+        max_steps=1_000,
         batch_size=256,
         residuals_chunk_size=2048,
         quantile=0.95,
