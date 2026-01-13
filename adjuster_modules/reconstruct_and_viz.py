@@ -1,6 +1,9 @@
 import os
+import json
 import torch
 import random
+import pycolmap
+import rerun as rr
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
@@ -242,13 +245,15 @@ class ReconstructAndVizModule:
     def to_colmap(
         self,
         output_path="optimized_reconstruction_GD",
-        save_points=False,
+        save_points=True,
         verbose=False,
         max_points_per_image=100_000,
         final_dbscan_filtering=False,
         dbscan_eps=0.05,
         dbscan_min_samples=5,
+        gt_path=None,
     ):
+        os.system(f"rm -rf {output_path}/*")
         recon = build_reconstruction(
             self,
             output_path=output_path,
@@ -258,7 +263,18 @@ class ReconstructAndVizModule:
             final_dbscan_filtering=final_dbscan_filtering,
             dbscan_eps=dbscan_eps,
             dbscan_min_samples=dbscan_min_samples,
+            bin=True,
         )
+
+        if gt_path is not None:
+            # align
+            os.system(
+                f"colmap model_aligner \
+                    --input_path {output_path} \
+                    --output_path {output_path} \
+                    --ref_model_path {gt_path} \
+                    --alignment_max_error 1 > /dev/null 2>&1"
+            )
 
         # save loading time and optimization time in timings.txt in same folder as output_path
         timings_path = os.path.join(output_path, "timings.txt")
@@ -273,4 +289,99 @@ class ReconstructAndVizModule:
                     total += value
                     f.write(f"{key}: {value}\n")
             f.write(f"total: {total}\n")
+
+        # save training data such metrics series too as dict
+        training_logs = {
+            "steps_total": self.max_num_iterations,
+            "steps_actual": self.completed_iterations,
+            "list_loss": self.loss_list,
+            "list_lr": self.lr_list,
+            "auc_saving_freq": self.auc_saving_freq,
+            "list_auc": self.auc_list,
+            "list_changes": self.changes,
+            "convergence_pose": self.convergence_pose,
+            "convergence_depth": self.convergence_depth,
+            "timings": self.timings,
+            "max_edges": self.max_edges,
+            "len_viewgraph": len(self.viewgraph),
+            "window_pose": self.window_pose,
+            "window_depth": self.window_depth,
+            "convergence_tol_pose": self.convergence_tol_pose,
+            "convergence_tol_depth": self.convergence_tol_depth,
+        }
+        # sort keys alphabetically
+        training_logs = dict(sorted(training_logs.items()))
+        training_logs_path = os.path.join(output_path, "training_logs.json")
+        with open(training_logs_path, "w") as f:
+            json.dump(training_logs, f, indent=4)
+
         return recon
+
+    def get_frustum_strips(self, scale=0.15, w=1.0, h=1.0):
+        # Normalize aspect to fit in scale
+        max_dim = max(w, h)
+        w_sc = (w / max_dim) * scale * 0.5
+        h_sc = (h / max_dim) * scale * 0.5
+        z = scale
+
+        # Corners in Camera coords (Right, Down, Forward) -> (+X, +Y, +Z)
+        tr = [w_sc, h_sc, z]
+        br = [w_sc, -h_sc, z]
+        bl = [-w_sc, -h_sc, z]
+        tl = [-w_sc, h_sc, z]
+        o = [0, 0, 0]
+
+        return [
+            [tr, br, bl, tl, tr],  # Image plane
+            [o, tr],
+            [o, br],
+            [o, bl],
+            [o, tl],  # Ray to corners
+        ]
+
+    def log_reconstruction_rerun(
+        self, path, entity, static=False, points3D=False, camera_color=[0, 255, 0]
+    ):
+        recon = pycolmap.Reconstruction(path)
+        for img_id, img in recon.images.items():
+            # COLMAP stores world-to-cam (R, t)
+            # Rerun needs cam-to-world for the transform
+            R_gt = torch.from_numpy(img.cam_from_world.rotation.matrix())
+            t_gt = torch.from_numpy(img.cam_from_world.translation)
+
+            # C = -R^T * t
+            cam_center = -R_gt.T @ t_gt
+            cam_rot = R_gt.T  # Rotation from camera to world
+
+            rr.log(
+                f"world/{entity}/{img.name}",
+                rr.Transform3D(
+                    translation=cam_center.numpy(),
+                    mat3x3=cam_rot.numpy(),
+                ),
+                static=static,
+            )
+
+            # Frustum visualization
+            cam = recon.cameras[img.camera_id]
+            strips = self.get_frustum_strips(scale=0.15, w=cam.width, h=cam.height)
+            rr.log(
+                f"world/{entity}/{img.name}/cam",
+                rr.LineStrips3D(strips, colors=camera_color, radii=0.002),
+                static=static,
+            )
+
+        # Log GT Point Cloud
+        if len(recon.points3D) > 0 and points3D:
+            print(f"Logging {len(recon.points3D)} GT points...")
+            pts = []
+            colors = []
+            for p in recon.points3D.values():
+                pts.append(p.xyz)
+                colors.append(p.color)
+
+            rr.log(
+                f"world/{entity}/points",
+                rr.Points3D(np.array(pts), colors=np.array(colors), radii=0.01),
+                static=static,
+            )

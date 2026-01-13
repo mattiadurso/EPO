@@ -100,6 +100,7 @@ def build_reconstruction(
     final_dbscan_filtering=False,
     dbscan_eps=0.05,
     dbscan_min_samples=5,
+    bin=False,
 ):
     """
     Create a pycolmap.Reconstruction from images and intrinsics dictionaries.
@@ -349,7 +350,10 @@ def build_reconstruction(
 
     if output_path is not None:
         os.makedirs(output_path, exist_ok=True)
-        reconstruction.write_text(output_path)
+        if bin:
+            reconstruction.write_binary(output_path)
+        else:
+            reconstruction.write_text(output_path)
         if verbose:
             print(f"Reconstruction saved to: {output_path}")
 

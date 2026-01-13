@@ -15,6 +15,7 @@ from itertools import combinations
 import glob
 from PIL import Image
 from tqdm import tqdm
+import rerun as rr
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -96,7 +97,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         gt_path (str, optional): Path to ground truth data for evaluation. Default is None.
         max_edges_points (int, optional): Maximum number of edge points to use per image. Default is 16384.
         max_viewgraph_pairs (int, optional): Maximum number of viewgraph pairs to use at each optimization step.
-            It's randomly sampled from the full viewgraph at each iteration. Default is 8192.
+            It's randomly sampled from the full viewgraph at each iteration. Default is 8192. If pairs are greater than this, it's basically mini batch processing.
     """
 
     def __init__(
@@ -133,6 +134,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         grad_z=False,
         use_mlp_pose_refinement=True,
         auc_saving_freq=50,
+        max_num_iterations=2000,
         viz=False,  # it true del non used stuff during computation
         verbose=False,
     ):
@@ -151,7 +153,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.use_amp = use_amp
         self.amp_dtype = amp_dtype
         self.dtype = torch.float32  # hardcode to float32 for stability
-        self.auc_th = [1, 3, 5, 10]
+        self.auc_th = [1, 3, 5]
+        self.completed_iterations = 0
+        self.max_num_iterations = max_num_iterations
         self.auc_saving_freq = auc_saving_freq
         self.viewgraph_path = viewgraph_path
         self.matcher_type = matcher_type
@@ -306,6 +310,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             device=self.device,
             lr=self.z_lr,
             grad=self.grad_z,
+            max_num_iterations=self.max_num_iterations,
         )
 
         # Prepare viewgraph with indices for faster access during optimization
@@ -373,18 +378,19 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
     def forward(
         self,
-        max_steps=1_000,
         batch_size=256,
         residuals_chunk_size=2048,
         quantile=0.95,
         window_pose=25,
-        window_depth=25,
+        window_depth=50,
         convergence_tol_pose=0.5,  # degrees
         convergence_tol_depth=0.2,  # relative change %
         drop_last=False,
         debug=False,
         logging_=False,
         gt_path=None,
+        ba_path=None,
+        use_rerun=False,
     ):
         """
         Main optimization loop.
@@ -399,12 +405,49 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             debug (bool): Whether to enable debug mode (tracks residuals).
             gt_path
         """
+        # assuming to to do not changes these or move to init
+        self.window_pose = window_pose
+        self.window_depth = window_depth
+        self.convergence_tol_pose = convergence_tol_pose
+        self.convergence_tol_depth = convergence_tol_depth
+
+        if use_rerun:
+            rr.init("Feature-Less Optimization", spawn=True)
+            rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
+
+            # Log Ground Truth if available
+            if gt_path is not None:
+                try:
+                    print(f"Loading GT from {gt_path} for visualization...")
+                    self.log_reconstruction_rerun(
+                        gt_path,
+                        entity="gt",
+                        static=True,
+                        points3D=True,
+                        camera_color=[0, 255, 0],
+                    )
+                except Exception as e:
+                    print(f"Warning: Failed to load GT for Rerun visualization: {e}")
+            if ba_path is not None:
+                try:
+                    print(f"Loading BA result from {ba_path} for visualization...")
+                    self.log_reconstruction_rerun(
+                        ba_path,
+                        entity="ba",
+                        static=True,
+                        points3D=False,
+                        camera_color=[0, 0, 255],
+                    )
+                except Exception as e:
+                    print(
+                        f"Warning: Failed to load BA result for Rerun visualization: {e}"
+                    )
+
         time_start = time.time()
         convergence_tol_depth /= 100.0  # relative change
 
         num_batches = math.ceil(len(self.viewgraph) / batch_size)
         num_batches = num_batches if drop_last else num_batches + 1
-        max_steps = max_steps if max_steps > 0 else 1_000
         if self.verbose:
             print(
                 f"Processing {len(self.viewgraph):,} pairs with batch size {batch_size:,} ({num_batches} batches per iteration).",
@@ -417,11 +460,17 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 f"Total points to process per iteration: {total_points:,}.",
                 end="\n\n",
             )
+
         past_poses = self.poses.get_all_matrices().detach().clone()
         past_depths = self.sampled_depth.get_all_parameters().detach().clone()
 
         # Forward and backward loop
-        bar = tqdm(range(max_steps), desc="Optimizing the scene")
+        bar = tqdm(
+            range(self.completed_iterations, self.max_num_iterations),
+            total=self.max_num_iterations,
+            initial=self.completed_iterations,
+            desc="Optimizing the scene",
+        )
         for step in bar:
             t_pre = time.time()
 
@@ -452,11 +501,38 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             loss.backward()
             self.timings["gradients_computation"] += time.time() - s_time
 
-            self.optimizer_and_scheduler_step(step, loss.detach())
+            self.optimizer_and_scheduler_step(loss.detach())
+
+            if use_rerun:
+                # Handle Rerun API variations
+                if hasattr(rr, "set_time_sequence"):
+                    rr.set_time_sequence("step", step)
+
+                temp_path = "optimized_reconstruction_GD/_current_test"
+                self.to_colmap(
+                    temp_path,
+                    verbose=False,
+                    max_points_per_image=100_000 // len(adjuster.images),
+                    save_points=False,
+                    final_dbscan_filtering=False,
+                    dbscan_eps=0.1,
+                    dbscan_min_samples=5,
+                    gt_path=gt_path,  # to align
+                )
+
+                self.log_reconstruction_rerun(
+                    temp_path,
+                    entity="opt",
+                    static=False,
+                    points3D=False,
+                    camera_color=[255, 0, 0],  # red
+                )
+
             # ============================================================
             # Logging
             # ============================================================
             logging_time_start = time.time()
+
             if logging_:
                 self.loss_list.append(loss.detach().item())
 
@@ -483,8 +559,17 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                         if len(self.auc_list["auc"][5]) > 0
                         else 0
                     ),
-                    # lr=f"{self.lr_list['mlp'][-1][1]:.1e}",
                 )
+
+            # rerun tracking
+            if use_rerun:
+                if gt_path is not None and len(self.auc_list["auc"][1]) > 0:
+                    for th in self.auc_th:
+                        rr.log(
+                            f"metrics/AUC@{th}",
+                            rr.Scalars(self.auc_list["auc"][th][-1]),
+                        )
+
             self.timings["logging"] += time.time() - logging_time_start
 
             # collect pose changes for convergence evaluation
@@ -501,9 +586,10 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             past_poses = current_poses
 
             if not self.convergence_pose:
-                if self.check_convergence(
+                convergence_pose = self.check_convergence(
                     self.changes["max"], window=window_pose, tol=convergence_tol_pose
-                ):
+                )
+                if convergence_pose:
                     self.convergence_pose = True
                     if self.verbose:
                         print(f"Pose convergence reached at step {step}.")
@@ -536,9 +622,18 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             if self.convergence_pose and self.convergence_depth:
                 if self.verbose:
                     print(f"Stopping optimization at step {step}. Convergence reached.")
-                break
+
+                if use_rerun:
+                    rr_folder = os.path.join(opt, "rerun")
+                    os.makedirs(rr_folder, exist_ok=True)
+                    rr.save(os.path.join(rr_folder, "data.rrd"))
+
+                break  # early stop
+
+            self.completed_iterations += 1
 
         self.timings["total_optimization"] += time.time() - time_start
+
         if self.verbose:
             self.print_summary()
         else:
@@ -581,10 +676,10 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         if hasattr(self.sampled_depth, "optimizer"):
             self.sampled_depth.optimizer.zero_grad()
 
-        # if hasattr(self.intrinsics, "optimizer"):
-        #     self.intrinsics.optimizer.zero_grad()
+        if hasattr(self.intrinsics, "optimizer"):
+            self.intrinsics.optimizer.zero_grad()
 
-    def optimizer_and_scheduler_step(self, step, loss):
+    def optimizer_and_scheduler_step(self, loss):
         """Perform optimizer step and scheduler step for all optimizers."""
         # Ideally each of them should be able to run independently until needed (reaching min lr),
         # but for now we keep them in sync for simplicity.
@@ -599,8 +694,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         if self.grad_z is True and self.convergence_pose is True:
             self.sampled_depth.optimizer_and_scheduler_step(loss)
 
-        # if self.grad_k:
-        #     self.intrinsics.optimizer_and_scheduler_step(loss)
+        if self.grad_k:
+            self.intrinsics.optimizer_and_scheduler_step(loss)
 
         self.timings["parameters_update"] += time.time() - s_time
 
@@ -911,6 +1006,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             device=self.device,
             dtype=self.dtype,
             grad=self.grad_k,
+            max_num_iterations=self.max_num_iterations,
         )
 
         # Read poses from images
@@ -937,6 +1033,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
         poses = PoseModule(
             images_id_map,
+            hw=self.images[image_name]["hw"],
             R=torch.stack(R_tensor),
             t=torch.stack(t_tensor),
             q_lr=self.q_lr,
@@ -945,6 +1042,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             grad_t=self.grad_t,
             mlp_lr=self.mlp_pose_lr,
             use_mlp=self.use_mlp_pose_refinement,
+            max_num_iterations=self.max_num_iterations,
             device=self.device,
             dtype=self.dtype,
         )
@@ -1218,7 +1316,7 @@ if __name__ == "__main__":
     import json
 
     dataset = "terrasky3D"  # terrasky3D, mipnerf360,
-    scene = "vienna_state_opera"  # vienna_state_opera, bicycle, bonsai, statue
+    scene = "graz_townhall"  # vienna_state_opera, bicycle, bonsai, statue, 7831862f02
 
     # Load dataset paths and parameters from JSON
     with open("benchmarks/paths.json") as f:
@@ -1244,23 +1342,48 @@ if __name__ == "__main__":
         reconstruction_path=reconstruction_path,
         images_path=images_path,
         depths_path=depths_path,
-        # unreliable_area_masks_path=unreliable_area_masks_path,
-        single_camera_per_folder=True,
-        detector="canny",  # or "canny", "bdcn", "sam2"
-        # # outdoor
-        matcher_type="frustums",  # or "exhaustive", "sequential"
-        detector_params={
-            "low_threshold": 0.20,
-            "high_threshold": 0.25,
-            "kernel_size": 7,
-            "sigma": 2,
-        },
+        k_lr=1e-3,
+        grad_k=False,
+        z_lr=3e-3,
+        grad_z=True,
+        mlp_pose_lr=3e-3,
+        use_mlp_pose_refinement=True,
+        matcher_type="exhaustive",  # or "exhaustive", "sequential", "frustums"
         viz=True,
+        use_amp=False,
+        max_edges_points=12_288,
+        max_viewgraph_pairs=4_096,
+        single_camera_per_folder=True,
+        verbose=True,
+        auc_saving_freq=5,
+        max_num_iterations=2000,
     )
 
     adjuster(
         batch_size=256,
-        max_steps=-1,
-        debug=True,  # tracks the residuals, slightly increases timing
+        residuals_chunk_size=2048,
+        window_pose=25,
+        window_depth=50,
         gt_path=gt_path,
+        ba_path=reconstruction_path.replace("vggt", "vggt_ba"),
+        use_rerun=True,
+        logging_=True,
+    )
+
+    # Saving
+    opt = "optimized_reconstruction_GD/_current_test"
+    # opt = f"optimized_reconstruction_GD/{scene}"
+    os.makedirs(opt, exist_ok=True)
+
+    save_points = True  # recall to set mean track len = 0 in colmap gui
+
+    adjuster.to_colmap(
+        opt,
+        verbose=False,
+        max_points_per_image=100_000 // len(adjuster.images),
+        save_points=save_points,
+        final_dbscan_filtering=False,
+        dbscan_eps=0.1,
+        dbscan_min_samples=5,
+        # gt_path=gt_path,
     )

@@ -1,0 +1,123 @@
+{
+    "metadata": {
+        "datasets": [
+            "TerraSky3D",
+            "Scannet++",
+            "MipNerf360"
+        ]
+    },
+    "experiments": [
+        {
+            "method": "VGGT",
+            "color": "#1f77b4",
+            "auc_scores": [
+                56.80,
+                55.62,
+                78.99
+            ],
+            "time_scores": [
+                30.95,
+                37.12,
+                36.51
+            ]
+        },
+        {
+            "method": "VGGT + BA",
+            "color": "#F88B2B",
+            "auc_scores": [
+                71.09,
+                70.04,
+                88.4
+            ],
+            "time_scores": [
+                226.05,
+                171.61,
+                105.96
+            ]
+        },
+        {
+            "method": "VGGT + BA (Ref)",
+            "color": "#d62728",
+            "auc_scores": [
+                75.54,
+                70.86,
+                90.81
+            ],
+            "time_scores": [
+                337.7,
+                303.5,
+                215.7
+            ]
+        },
+        {
+            "method": "VGGT + Edges (Direct)",
+            "color": "#808080",
+            "auc_scores": [
+                69.23,
+                60.16,
+                80.54
+            ],
+            "time_scores": [
+                53.42,
+                68.5,
+                81.45
+            ]
+        },
+        {
+            "method": "VGGT + Edges (MLP)",
+            "color": "#2ca02c",
+            "auc_scores": [
+                68.47,
+                68.76,
+                84.33
+            ],
+            "time_scores": [
+                74.41,
+                79.87,
+                75.31
+            ]
+        },
+        {
+            "method": "VGGT + Edges (MLP, Parametric Depth)",
+            "color": "#17becf",
+            "auc_scores": [
+                72.13,
+                72.75,
+                86.12
+            ],
+            "time_scores": [
+                138.53,
+                84.86,
+                75.80
+            ]
+        },
+        {
+            "method": "VGGT + Edges (MLP, Parametric Depth, K)",
+            "color": "#9467bd",
+            "auc_scores": [
+                75.27,
+                74.49,
+                88.64
+            ],
+            "time_scores": [
+                142.58,
+                120.68,
+                91.52
+            ]
+        },
+        {
+            "method": "VGGT + Edges (MLP, Parametric Depth, K, T_offset)",
+            "color": "#8c564b",
+            "auc_scores": [
+                77.98,
+                73.74,
+                89.77
+            ],
+            "time_scores": [
+                218.65,
+                116.22,
+                115.55
+            ]
+        }
+    ]
+}
