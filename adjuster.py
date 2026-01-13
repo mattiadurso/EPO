@@ -532,12 +532,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             # Logging
             # ============================================================
             logging_time_start = time.time()
-
-            if logging_:
-                self.loss_list.append(loss.detach().item())
-
-                # store lr for each group
-                self.collect_lrs(len(self.loss_list) - 1)
+            self.loss_list.append(loss.detach().item())
+            self.collect_lrs(len(self.loss_list) - 1)
 
                 # DEBUG: Evaluate AUC if GT available
                 if gt_path is not None and step % self.auc_saving_freq == 0:
