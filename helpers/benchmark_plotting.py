@@ -10,7 +10,7 @@ sys.path.append("/home/mattia/Desktop/Repos/posebench/benchmarks_3D")
 from benchmark_pose import eval_colmap_model_all_scenes, eval_colmap_model
 
 
-def read_results(dataset, target_folder, models, thr=5, fill_auc_nan_with_zeros=False):
+def read_results(dataset, target_folder, models, thr=5, round_to=2):
     base_target = f"/home/mattia/Desktop/datasets/{dataset}"
     base_repo = "/home/mattia/Desktop/Repos/batchsfm/benchmarks"
     scenes = os.listdir(base_target)
@@ -25,6 +25,7 @@ def read_results(dataset, target_folder, models, thr=5, fill_auc_nan_with_zeros=
             input_folder="sparse",
             return_df=True,
             thrs=[thr],
+            round_to=round_to,
             verbose=False,
         )
 
@@ -54,8 +55,6 @@ def read_results(dataset, target_folder, models, thr=5, fill_auc_nan_with_zeros=
                     total_timings[f"{model}"][scene] = None
 
     df = pd.concat([dfs[key][f"auc@{thr}_{key}"] for key in keys], axis=1)
-    if fill_auc_nan_with_zeros:
-        df.fillna(0, inplace=True)
 
     df = pd.concat([df, pd.DataFrame(total_timings)], axis=1)
     for col in df.columns:
@@ -67,7 +66,7 @@ def read_results(dataset, target_folder, models, thr=5, fill_auc_nan_with_zeros=
     ]
     # df.dropna(inplace=True)
     df.loc["mean"] = df.mean()
-    df = df.round(2)
+    df = df.round(round_to)
 
     # clean up cell prints
     clear_output()
@@ -77,7 +76,7 @@ def read_results(dataset, target_folder, models, thr=5, fill_auc_nan_with_zeros=
     return df
 
 
-def plot_auc5_with_time(df, dataset, models, thr):
+def plot_auc5_with_time(df, dataset, models, thr, ignore_time=False):
     dataset = "Tanks & Temples" if dataset == "tt" else dataset
     dataset = "Scannet++ v2" if dataset == "scannetpp" else dataset
 
@@ -88,31 +87,47 @@ def plot_auc5_with_time(df, dataset, models, thr):
     clean_cols = [col.replace(f"auc@{thr}_", "") for col in df_auc.columns]
     df_auc.columns = clean_cols
 
-    # Create the Time row, time replace _ with +
-    time_dict = {}
-    for model in models:
-        model_col = model.replace("_", "+")
-        # Safely get the mean, defaulting to 0.0 if column doesn't exist
-        time_dict[model] = df.get(model_col, pd.Series([0.0])).mean()
-
-    time_values = [time_dict.get(col, 0) for col in clean_cols]
-    df_time_row = pd.DataFrame([time_values], columns=clean_cols, index=["Tot Time"])
-
     # Combine into one DataFrame
-    df_combined = pd.concat([df_auc, df_time_row])
+    df_combined = df_auc.copy()
 
-    # --- 1b. Define vggt_time for ratio calculation ---
-    # Get the 'vggt' time, using 1.0 as a safe default to prevent division by zero
-    vggt_time = time_dict.get("vggt", 1.0)
-    if vggt_time == 0:
-        vggt_time = 1.0  # Ensure it is not zero if it was found but is zero
+    if not ignore_time:
+        # Read the Time row directly from the 'mean' row of the dataframe
+        time_dict = {}
+        if "mean" in df.index:
+            for col in clean_cols:
+                # Map column name back to time column name (usually + instead of _)
+                time_col = col.replace("_", "+")
+                # Get the value from the mean row
+                time_dict[col] = (
+                    df.loc["mean", time_col] if time_col in df.columns else 0.0
+                )
+        else:
+            # Fallback if 'mean' row is missing (though prompt implies it exists)
+            time_dict = {col: 0.0 for col in clean_cols}
+
+        time_values = [time_dict.get(col, 0) for col in clean_cols]
+        # Create single row DF
+        df_time_row = pd.DataFrame(
+            [time_values], columns=clean_cols, index=["Tot Time"]
+        )
+
+        # Combine AUC and Time
+        df_combined = pd.concat([df_auc, df_time_row])
+
+        # --- 1b. Define vggt_time for ratio calculation ---
+        # Get the 'vggt' time
+        vggt_time = time_dict.get("vggt", 1.0)
+        if vggt_time == 0:
+            vggt_time = 1.0  # Ensure it is not zero if it was found but is zero
 
     # --- 2. Masking for Dual Axis ---
     df_p1 = df_combined.copy()
-    df_p1.loc["Tot Time"] = np.nan  # Hide Time on Left Axis
 
-    df_p2 = df_combined.copy()
-    df_p2.iloc[:-1] = np.nan  # Hide AUC on Right Axis
+    if not ignore_time:
+        df_p1.loc["Tot Time"] = np.nan  # Hide Time on Left Axis
+
+        df_p2 = df_combined.copy()
+        df_p2.iloc[:-1] = np.nan  # Hide AUC on Right Axis
 
     # --- 3. Plotting ---
     fig, ax1 = plt.subplots(
@@ -122,18 +137,20 @@ def plot_auc5_with_time(df, dataset, models, thr):
     # Plot AUC (Left Axis)
     df_p1.plot(kind="bar", ax=ax1, width=0.8)
 
-    # Plot Time (Right Axis)
-    ax2 = ax1.twinx()
-    df_p2.plot(kind="bar", ax=ax2, width=0.8, legend=False)
+    # Adjust Left Y-Axis to fit text (Add 15% margin)
+    max_auc = df_p1.max().max()
+    if not np.isnan(max_auc):
+        ax1.set_ylim(0, max_auc * 1.15)
 
     # --- 4. Styling & Separator ---
     ax1.set_ylabel(f"AUC@{thr}")
-    ax2.set_ylabel("Total Time (s)")
+
     ax1.set_title(f"AUC@{thr} & Time - {dataset[:1].upper()+dataset[1:]} Dataset")
 
-    # Black Dashed Line between AUC rows and Time row
-    sep_x = len(df_auc) - 0.5
-    ax1.axvline(x=sep_x, color="black", linestyle="--", linewidth=1.5, alpha=0.7)
+    if not ignore_time:
+        # Black Dashed Line between AUC rows and Time row
+        sep_x = len(df_auc) - 0.5
+        ax1.axvline(x=sep_x, color="black", linestyle="--", linewidth=1.5, alpha=0.7)
 
     # --- ROTATION CHANGE HERE ---
     # Rotate 45 degrees and align right so the text ends at the tick mark
@@ -141,28 +158,39 @@ def plot_auc5_with_time(df, dataset, models, thr):
 
     # --- 5. Add Ratio Text on Top of Time Bars (The requested change) ---
 
-    # The bars on ax2 are from df_p2, which only has values in the 'Tot Time' row.
-    # We only care about bars after the separator line (i.e., the 'Tot Time' group).
-    for rect in ax2.patches:
-        current_time = rect.get_height()
-        # Check if the bar is part of the 'Tot Time' group (x-position after separator)
-        # and has a non-zero height (we only annotate visible bars)
-        if rect.get_x() > sep_x and current_time > 0:
+    # Plot Time (Right Axis)
+    if not ignore_time:
+        ax2 = ax1.twinx()
+        df_p2.plot(kind="bar", ax=ax2, width=0.8, legend=False)
+        ax2.set_ylabel("Total Time (s)")
 
-            # Calculate Ratio
-            ratio = current_time / vggt_time
-            ratio_text = f"{ratio:.2f}x"
+        # Adjust Right Y-Axis to fit text (Add 15% margin)
+        max_time = df_p2.max().max()
+        if not np.isnan(max_time):
+            ax2.set_ylim(0, max_time * 1.15)
 
-            # Add text annotation
-            # rect.get_x() + rect.get_width() / 2 is the center of the bar
-            ax2.text(
-                rect.get_x() + rect.get_width() / 2,
-                current_time,
-                ratio_text,
-                ha="center",
-                va="bottom",  # Align text just above the bar
-                fontsize=8,
-            )
+        # The bars on ax2 are from df_p2, which only has values in the 'Tot Time' row.
+        # We only care about bars after the separator line (i.e., the 'Tot Time' group).
+        for rect in ax2.patches:
+            current_time = rect.get_height()
+            # Check if the bar is part of the 'Tot Time' group (x-position after separator)
+            # and has a non-zero height (we only annotate visible bars)
+            if rect.get_x() > sep_x and current_time > 0:
+
+                # Calculate Ratio
+                ratio = current_time / vggt_time
+                ratio_text = f"{ratio:.2f}x"
+
+                # Add text annotation
+                # rect.get_x() + rect.get_width() / 2 is the center of the bar
+                ax2.text(
+                    rect.get_x() + rect.get_width() / 2,
+                    current_time,
+                    ratio_text,
+                    ha="center",
+                    va="bottom",  # Align text just above the bar
+                    fontsize=8,
+                )
 
     # --- 6. Add AUC Score on Top of Mean Bars ---
     # Get the index position of "mean" row
