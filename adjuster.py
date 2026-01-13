@@ -535,19 +535,20 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.loss_list.append(loss.detach().item())
             self.collect_lrs(len(self.loss_list) - 1)
 
-                # DEBUG: Evaluate AUC if GT available
-                if gt_path is not None and step % self.auc_saving_freq == 0:
+            # DEBUG: Evaluate AUC if GT available
+            if gt_path is not None and step % self.auc_saving_freq == 0:
 
-                    opt = "optimized_reconstruction_GD/_current_test"
-                    self.to_colmap(opt, save_points=False, verbose=False)
-                    AUC_score_max, num_images, df_optim = eval_colmap_model(
-                        opt, gt_path, return_df=False, thrs=self.auc_th
-                    )
-                    # store AUC
-                    for i, th in enumerate(self.auc_th):
-                        self.auc_list["auc"][th].append(AUC_score_max[i].item())
-                    self.auc_list["steps"].append(step)
+                opt = "optimized_reconstruction_GD/_current_test"
+                self.to_colmap(opt, save_points=False, verbose=False)
+                AUC_score_max, num_images, df_optim = eval_colmap_model(
+                    opt, gt_path, return_df=False, thrs=self.auc_th
+                )
+                # store AUC
+                for i, th in enumerate(self.auc_th):
+                    self.auc_list["auc"][th].append(AUC_score_max[i].item())
+                self.auc_list["steps"].append(step)
 
+            if logging_:
                 bar.set_postfix(
                     loss=f"{self.loss_list[-1]:.4f}",
                     auc5=(
