@@ -10,6 +10,7 @@ class PoseModule(BaseModule):
     def __init__(
         self,
         image_id_map: dict[str, int],
+        hw: tuple[int, int],
         R: torch.Tensor,
         t: torch.Tensor,
         t_lr: float = 1e-3,
@@ -19,7 +20,7 @@ class PoseModule(BaseModule):
         use_mlp: bool = True,
         mlp_lr: float = 1e-3,
         device: str = "cuda",
-        total_steps: int = 1000,
+        max_num_iterations: int = 2000,
         warmup_steps: int = 25,
         dtype: torch.dtype = torch.float32,
     ):
@@ -40,6 +41,9 @@ class PoseModule(BaseModule):
             device=device,
             dtype=dtype,
         )
+        self.hw = hw  # (H, W)
+        self.max_num_iterations = max_num_iterations
+
         if use_mlp:
             print(f"When using MLP pose refinement, q and t gradients are disabled.")
         grad_q = False if use_mlp else grad_q
@@ -74,8 +78,11 @@ class PoseModule(BaseModule):
         # --- Translation Prep ---
         t_init = t.reshape(num_cams, 3).to(self.device, dtype=self.dtype)
 
-        # I might/should find an effective way to scale translations
-        # self.t_scale = ...
+        self.t_mean = t_init.mean(dim=0, keepdim=True)
+        dist = torch.norm(t_init - self.t_mean, dim=1)
+        self.t_scale = torch.mean(dist)
+
+        t_init = (t_init - self.t_mean) / self.t_scale
 
         # Store as Raw Parameter
         self.t_param = nn.Parameter(
@@ -90,6 +97,12 @@ class PoseModule(BaseModule):
                 output_dim=12,  # 3x4 pose matrix flattened
                 hidden_dim=256,  # maybe too much, 128 could be enough
             ).to(self.device, dtype=self.dtype)
+
+            self.t_offset = nn.Parameter(
+                torch.zeros_like(self.t_param).to(self.device, dtype=self.dtype),
+                requires_grad=True,
+            )
+
             self.init_optimizer(mlp_lr=mlp_lr)
 
             # --- Configuration ---
@@ -105,7 +118,7 @@ class PoseModule(BaseModule):
             # Smoothly decreases from lr to min_lr
             decay = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
-                T_max=total_steps - warmup_steps,  # Remaining steps
+                T_max=self.max_num_iterations - warmup_steps,  # Remaining steps
                 eta_min=1e-6,
             )
 
@@ -135,7 +148,24 @@ class PoseModule(BaseModule):
     ):
         """Re-initialize optimizer with new learning rate."""
         if self.use_mlp:
-            self.optimizer = torch.optim.AdamW(self.mlp.parameters(), lr=mlp_lr)
+            # self.optimizer = torch.optim.AdamW(self.mlp.parameters(), lr=mlp_lr)
+            self.optimizer = torch.optim.AdamW(
+                [
+                    {
+                        "params": self.mlp.parameters(),
+                        "lr": mlp_lr,
+                        "name": "mlp",
+                        "weight_decay": 0.01,  # default
+                    },
+                    {
+                        "params": [self.t_offset],
+                        "lr": mlp_lr,
+                        "name": "t_offset",
+                        "weight_decay": 0.1,  # (more aggressive) L2 penalty
+                    },
+                ]
+            )
+
         else:
             # Single optimizer with separate parameter groups for different LRs
             self.optimizer = torch.optim.AdamW(
@@ -210,6 +240,11 @@ class PoseModule(BaseModule):
         # Apply scaling to the learnable parameter
         return self.t_param[indices]
 
+    def get_translation_offset(self, indices) -> torch.Tensor:
+        """Returns (B, 3) Translation vectors"""
+        # Apply scaling to the learnable parameter
+        return self.t_offset[indices]
+
     def get_projection_matrix(self, indices) -> torch.Tensor:
         """
         Constructs 4x4 SE3 Matrix [R|t].
@@ -222,7 +257,8 @@ class PoseModule(BaseModule):
         # Retrieve components
         R = self.get_rotation_matrix(indices)  # (B, 3, 3)
         t = self.get_translation(indices)  # (B, 3)
-        R, t = self.apply_mlp(R, t)
+        R, t = self.apply_mlp(R, t, indices)
+        t = self.t_scale * t + self.t_mean  # Rescale to physical units
 
         # Build 4x4 Matrix
         P = torch.eye(4, device=self.device, dtype=R.dtype).repeat(batch_size, 1, 1)
@@ -231,7 +267,7 @@ class PoseModule(BaseModule):
 
         return P
 
-    def apply_mlp(self, R, t) -> torch.Tensor:
+    def apply_mlp(self, R, t, indices) -> torch.Tensor:
         """Apply MLP refinement to given poses."""
         if not self.use_mlp:
             return R, t
@@ -246,7 +282,7 @@ class PoseModule(BaseModule):
             )  # adding mlp residual and orthonormalization
 
         R = P_3x4_refined[:, :3, :3]
-        t = P_3x4_refined[:, :3, 3]
+        t = P_3x4_refined[:, :3, 3] + self.get_translation_offset(indices)
 
         return R, t
 
@@ -263,6 +299,7 @@ class PoseModule(BaseModule):
             # s += f"  Image '{name}': R={q_val:.3e}, t={t_val:.3e}\n"
             # print arrays with 3 decimal places signed, align them considering the sign too
             s += f"  Image '{name}': q=[{q_val[0]:+.3e}, {q_val[1]:+.3e}, {q_val[2]:+.3e}, {q_val[3]:+.3e}], t=[{t_val[0]:+.3e}, {t_val[1]:+.3e}, {t_val[2]:+.3e}]\n"
+
         if len(self.t_param) > limit:
             s += f"  ... {len(self.t_param) - limit} more."
         return s
@@ -293,11 +330,12 @@ class PoseModule(BaseModule):
 
         # Ensure MLP is applied before returning values
         if self.use_mlp:
-            R, t = self.apply_mlp(R, t)
+            R, t = self.apply_mlp(R, t, indices)
 
         # Convert R to quaternion
         q = kgc.rotation_matrix_to_quaternion(R)
         q = torch.roll(q, shifts=-1, dims=1)  # (x, y, z, w) to (w, x, y, z)
+        t = self.t_scale * t + self.t_mean  # Rescale to physical units
 
         return q.squeeze(), t.squeeze()
 
