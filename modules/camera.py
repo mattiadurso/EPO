@@ -11,6 +11,7 @@ class CameraModule(BaseModule):
         k_params: torch.Tensor,
         lr: float = 1e-3,
         grad: bool = True,
+        max_num_iterations: int = 1000,
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
     ):
@@ -22,8 +23,7 @@ class CameraModule(BaseModule):
             device: torch device
         """
         super().__init__(image_id_map, device=device, dtype=dtype)
-        # self.device = torch.device(device)
-        # self.dtype = dtype
+        self.max_num_iterations = max_num_iterations
 
         # Define model ID mapping
         self.camera_model_name_to_id = {
@@ -55,30 +55,20 @@ class CameraModule(BaseModule):
         self.lr = float(lr)
         if grad:
             self.init_optimizer(lr=self.lr)
-            self.init_scheduler(
-                lr_reduce_factor=0.75, patience=3, min_lr=self.lr / 20
-            )  # this params seem good
+
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=self.max_num_iterations,  # Remaining steps
+                eta_min=1e-6,
+            )
 
         self.update_all_matrices()  # Precompute all intrinsic matrices
-
-    def init_scheduler(self, lr_reduce_factor: float, patience: int, min_lr: float):
-        """Initialize LR scheduler for the optimizer."""
-
-        if not hasattr(self, "optimizer"):
-            raise ValueError("Optimizer must be initialized before scheduler.")
-
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            factor=lr_reduce_factor,
-            patience=patience,
-            min_lr=min_lr,
-        )
 
     def optimizer_and_scheduler_step(self, loss):
         """Perform optimizer step and update scheduler based on loss."""
         self.optimizer.step()
         if hasattr(self, "scheduler"):
-            self.scheduler.step(loss.detach())
+            self.scheduler.step()
 
     def get_all_intrinsic_matrix(self):
         return self.keys, self.get_intrinsic_matrix(self.keys)
