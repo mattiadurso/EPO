@@ -382,15 +382,19 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         residuals_chunk_size=2048,
         quantile=0.95,
         window_pose=25,
-        window_depth=50,
+        window_depth=25,
         convergence_tol_pose=0.5,  # degrees
-        convergence_tol_depth=0.2,  # relative change %
+        convergence_tol_depth=0.1,  # relative change %
         drop_last=False,
         debug=False,
         logging_=False,
         gt_path=None,
         ba_path=None,
         use_rerun=False,
+        spawn_rerun=True,
+        rerun_save_path=".",
+        scene_name="data",
+        opt="optimized_reconstruction_GD/_current_test",
     ):
         """
         Main optimization loop.
@@ -412,7 +416,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.convergence_tol_depth = convergence_tol_depth
 
         if use_rerun:
-            rr.init("Feature-Less Optimization", spawn=True)
+            rr.init("Feature-Less Optimization", spawn=spawn_rerun)
             rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
 
             # Log Ground Truth if available
@@ -444,7 +448,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                     )
 
         time_start = time.time()
-        convergence_tol_depth /= 100.0  # relative change
 
         num_batches = math.ceil(len(self.viewgraph) / batch_size)
         num_batches = num_batches if drop_last else num_batches + 1
@@ -508,9 +511,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 if hasattr(rr, "set_time_sequence"):
                     rr.set_time_sequence("step", step)
 
-                temp_path = "optimized_reconstruction_GD/_current_test"
                 self.to_colmap(
-                    temp_path,
+                    opt,
                     verbose=False,
                     max_points_per_image=100_000 // len(adjuster.images),
                     save_points=False,
@@ -521,7 +523,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 )
 
                 self.log_reconstruction_rerun(
-                    temp_path,
+                    opt,
                     entity="opt",
                     static=False,
                     points3D=False,
@@ -538,7 +540,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             # DEBUG: Evaluate AUC if GT available
             if gt_path is not None and step % self.auc_saving_freq == 0:
 
-                opt = "optimized_reconstruction_GD/_current_test"
                 self.to_colmap(opt, save_points=False, verbose=False)
                 AUC_score_max, num_images, df_optim = eval_colmap_model(
                     opt, gt_path, return_df=False, thrs=self.auc_th
@@ -610,7 +611,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 past_depths = current_depths
 
                 if self.check_convergence(
-                    self.changes["z"][1:],
+                    self.changes["max"],
                     window=window_depth,
                     tol=convergence_tol_depth,
                 ):
@@ -621,9 +622,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                     print(f"Stopping optimization at step {step}. Convergence reached.")
 
                 if use_rerun:
-                    rr_folder = os.path.join(opt, "rerun")
+                    rr_folder = os.path.join(rerun_save_path, "rerun")
                     os.makedirs(rr_folder, exist_ok=True)
-                    rr.save(os.path.join(rr_folder, "data.rrd"))
+                    rr.save(os.path.join(rr_folder, f"{scene_name}.rrd"))
 
                 break  # early stop
 
@@ -655,6 +656,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         # The first of the 'window' smoothed values uses pose_changes[-(2*window-1) : -(window-1)]
         # So we need the last 2*window - 1 raw values.
         recent_changes = list_of_changes[-required_len:]
+
+        # Sanitize input: convert Tensors to float
+        recent_changes = [x.item() if torch.is_tensor(x) else x for x in recent_changes]
 
         # Compute smoothed max changes for this chunk
         smoothed_max = np.convolve(
