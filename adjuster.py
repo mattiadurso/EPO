@@ -387,7 +387,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         convergence_tol_depth=0.1,  # relative change %
         drop_last=False,
         debug=False,
-        logging_=False,
         gt_path=None,
         ba_path=None,
         use_rerun=False,
@@ -539,17 +538,10 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
             # DEBUG: Evaluate AUC if GT available
             if gt_path is not None and step % self.auc_saving_freq == 0:
-
                 self.to_colmap(opt, save_points=False, verbose=False)
-                AUC_score_max, num_images, df_optim = eval_colmap_model(
-                    opt, gt_path, return_df=False, thrs=self.auc_th
-                )
-                # store AUC
-                for i, th in enumerate(self.auc_th):
-                    self.auc_list["auc"][th].append(AUC_score_max[i].item())
-                self.auc_list["steps"].append(step)
+                self.compute_auc(opt, gt_path, step)
 
-            if logging_:
+            if self.verbose:
                 bar.set_postfix(
                     loss=f"{self.loss_list[-1]:.4f}",
                     auc5=(
@@ -626,6 +618,10 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                     os.makedirs(rr_folder, exist_ok=True)
                     rr.save(os.path.join(rr_folder, f"{scene_name}.rrd"))
 
+                if gt_path is not None:
+                    self.to_colmap(opt, save_points=False, verbose=False)
+                    self.compute_auc(opt, gt_path, step)
+
                 break  # early stop
 
             self.completed_iterations += 1
@@ -668,6 +664,15 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         # smoothed_max should have length 'window' now.
         # Check if ALL of them are below tolerance.
         return np.all(smoothed_max < tol)
+
+    def compute_auc(self, opt, gt_path, step):
+        AUC_score_max, num_images, _ = eval_colmap_model(
+            opt, gt_path, return_df=False, thrs=self.auc_th
+        )
+        # store AUC
+        for i, th in enumerate(self.auc_th):
+            self.auc_list["auc"][th].append(AUC_score_max[i].item())
+        self.auc_list["steps"].append(step)
 
     def optimizers_zero_grad(self):
         """Zero the gradients of all optimizers."""
