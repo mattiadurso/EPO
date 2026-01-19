@@ -99,10 +99,9 @@ class DepthModule(BaseModule):
         """Return depth parameters - ensures gradient flow"""
         indices = self.map_names_to_indices(ids) if isinstance(ids[0], str) else ids
         # Need to return depth, not inverse depth
-        z = self.depth[indices].pow(-1)
-        a = self.params[indices][:, :, 0]
-        b = self.params[indices][:, :, 1]
-        return z * a + b
+        z = self.depth[indices]
+        b = self.params[indices]
+        return z + b
 
     def get_all_parameters(self):
         return self.get_parameters(list(self.image_to_tensor_idx.keys()))

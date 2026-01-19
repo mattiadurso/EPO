@@ -388,6 +388,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         window_depth=25,
         convergence_tol_pose=0.5,  # degrees
         convergence_tol_depth=0.1,  # relative change %
+        early_stop=True,
         drop_last=False,
         debug=False,
         gt_path=None,
@@ -453,23 +454,21 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
         time_start = time.time()
 
-        num_batches = math.ceil(len(self.viewgraph) / batch_size)
-        num_batches = num_batches if drop_last else num_batches + 1
         if self.verbose:
+            num_batches = math.ceil(len(self.viewgraph) / batch_size)
+            num_batches = num_batches if drop_last else num_batches + 1
+            total_points = self.max_edges * len(self.viewgraph)
             print(
                 f"Processing {len(self.viewgraph):,} pairs with batch size {batch_size:,} ({num_batches} batches per iteration).",
                 f"Using {self.images[list(self.images.keys())[0]]['edges_padded'].numel()//2:,} edges per image.",  # // due to x and y
-            )
-
-            total_points = self.max_edges * len(self.viewgraph)
-
-            print(
+                "\n",
                 f"Total points to process per iteration: {total_points:,}.",
                 end="\n\n",
             )
 
-        past_poses = self.poses.get_all_matrices().detach().clone()
-        past_depths = self.sampled_depth.get_all_parameters().detach().clone()
+        if early_stop:  # store past poses for convergence evaluation
+            past_poses = self.poses.get_all_matrices().detach().clone()
+            past_depths = self.sampled_depth.get_all_parameters().detach().clone()
 
         # Forward and backward loop
         bar = tqdm(
@@ -568,76 +567,89 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
             self.timings["logging"] += time.time() - logging_time_start
 
-            # collect pose changes for convergence evaluation
-            current_poses = self.poses.get_all_matrices().detach().clone()
-            err_q, err_t, max_err = evaluate_pose_changes(
-                past_poses,
-                current_poses,
-                quantile=quantile,
-            )
-            self.changes["q"].append(err_q)
-            self.changes["t"].append(err_t)
-            self.changes["max"].append(max_err)
-            self.changes["steps"].append(step)
-            past_poses = current_poses
-
-            if not self.convergence_pose:
-                convergence_pose = self.check_convergence(
-                    self.changes["max"], window=window_pose, tol=convergence_tol_pose
-                )
-                if convergence_pose:
-                    self.convergence_pose = True
-                    if self.verbose:
-                        print(f"Pose convergence reached at step {step}.")
-
-                    # If not optimizing depth, mark it as converged immediately
-                    if not self.grad_z:
-                        self.convergence_depth = True
-
-            elif self.convergence_pose:
-                # start evaluating depth convergence
-                current_depths = (
-                    self.sampled_depth.get_all_parameters().detach().clone()
-                )
-                depth_change = evaluate_depth_changes(
-                    past_depths,
-                    current_depths,
-                    self.pad_masks.get_all_parameters(),  # depth has padding init
+            # ============================================================
+            # Early stopping
+            # ============================================================
+            if early_stop:  # otherwise no need to monitor convergence
+                # collect pose changes for convergence evaluation
+                current_poses = self.poses.get_all_matrices().detach().clone()
+                err_q, err_t, max_err = evaluate_pose_changes(
+                    past_poses,
+                    current_poses,
                     quantile=quantile,
                 )
-                self.changes["z"].append(depth_change)
-                past_depths = current_depths
+                self.changes["q"].append(err_q)
+                self.changes["t"].append(err_t)
+                self.changes["max"].append(max_err)
+                self.changes["steps"].append(step)
+                past_poses = current_poses
 
-                if self.check_convergence(
-                    self.changes["max"],
-                    window=window_depth,
-                    tol=convergence_tol_depth,
-                ):
-                    self.convergence_depth = True
+                if not self.convergence_pose:
+                    convergence_pose = self.check_convergence(
+                        self.changes["max"],
+                        window=window_pose,
+                        tol=convergence_tol_pose,
+                    )
+                    if convergence_pose:
+                        self.convergence_pose = True
+                        if self.verbose:
+                            print(f"Pose convergence reached at step {step}.")
+                            self.timings["pose_convergence_time"] = (
+                                time.time() - time_start
+                            )
 
-            if self.convergence_pose and self.convergence_depth:
-                if self.verbose:
-                    print(f"Stopping optimization at step {step}. Convergence reached.")
+                        # If not optimizing depth, mark it as converged immediately
+                        if not self.grad_z:
+                            self.convergence_depth = True
+                            self.timings["depth_convergence_time"] = (
+                                time.time() - time_start
+                            )
 
-                if use_rerun:
-                    rr_folder = os.path.join(rerun_save_path, "rerun")
-                    os.makedirs(rr_folder, exist_ok=True)
-                    rr.save(os.path.join(rr_folder, f"{scene_name}.rrd"))
+                elif self.convergence_pose:
+                    # start evaluating depth convergence
+                    current_depths = (
+                        self.sampled_depth.get_all_parameters().detach().clone()
+                    )
+                    depth_change = evaluate_depth_changes(
+                        past_depths,
+                        current_depths,
+                        self.pad_masks.get_all_parameters(),  # depth has padding init
+                        quantile=quantile,
+                    )
+                    self.changes["z"].append(depth_change)
+                    past_depths = current_depths
 
-                if gt_path is not None:
-                    self.to_colmap(opt, save_points=False, verbose=False)
-                    self.compute_auc(opt, gt_path, step)
+                    if self.check_convergence(
+                        self.changes["max"],
+                        window=window_depth,
+                        tol=convergence_tol_depth,
+                    ):
+                        self.convergence_depth = True
+                        self.timings["depth_convergence_time"] = (
+                            time.time() - time_start
+                        )
 
-                break  # early stop
+                if self.convergence_pose and self.convergence_depth:
+                    if self.verbose:
+                        print(
+                            f"Stopping optimization at step {step}. Convergence reached."
+                        )
+                    break
 
             self.completed_iterations += 1
 
         self.timings["total_optimization"] += time.time() - time_start
 
-        if self.verbose:
-            self.print_summary()
-        else:
-            print("=" * 60, end="\n\n")
+        if use_rerun:
+            rr_folder = os.path.join(rerun_save_path, "rerun")
+            os.makedirs(rr_folder, exist_ok=True)
+            rr.save(os.path.join(rr_folder, f"{scene_name}.rrd"))
+
+        if gt_path is not None:
+            self.to_colmap(opt, save_points=False, verbose=False)
+            self.compute_auc(opt, gt_path, step)
+
+        self.print_summary() if self.verbose else print("=" * 60, end="\n\n")
 
     ### Forward and backward helpers ###
     def check_convergence(self, list_of_changes, window=50, tol=0.5):
