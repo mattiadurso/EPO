@@ -340,7 +340,13 @@ class ReconstructAndVizModule:
         ]
 
     def log_reconstruction_rerun(
-        self, path, entity, static=False, points3D=False, camera_color=[0, 255, 0]
+        self,
+        path,
+        entity,
+        static_cameras=False,
+        points3D=False,
+        static_points=False,
+        camera_color=[0, 255, 0],
     ):
         recon = pycolmap.Reconstruction(path)
         for img_id, img in recon.images.items():
@@ -359,7 +365,7 @@ class ReconstructAndVizModule:
                     translation=cam_center.numpy(),
                     mat3x3=cam_rot.numpy(),
                 ),
-                static=static,
+                static=static_cameras,
             )
 
             # Frustum visualization
@@ -368,7 +374,7 @@ class ReconstructAndVizModule:
             rr.log(
                 f"world/{entity}/{img.name}/cam",
                 rr.LineStrips3D(strips, colors=camera_color, radii=0.002),
-                static=static,
+                static=static_cameras,
             )
 
         # Log GT Point Cloud
@@ -383,5 +389,5 @@ class ReconstructAndVizModule:
             rr.log(
                 f"world/{entity}/points",
                 rr.Points3D(np.array(pts), colors=np.array(colors), radii=0.01),
-                static=static,
+                static=static_points,
             )

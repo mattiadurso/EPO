@@ -16,7 +16,7 @@ with open("benchmarks/paths.json") as f:
     paths_cfg = json.load(f)
 
 if args.dataset == "all":
-    datasets = ["scannetpp", "mipnerf360", "terrasky3D"]
+    datasets = ["mipnerf360", "terrasky3D", "scannetpp"]
 else:
     datasets = [args.dataset]
 
@@ -81,6 +81,7 @@ for dataset in datasets:
             max_num_iterations=2_000,
         )
 
+        # run the optimization
         adjuster(
             batch_size=256,
             residuals_chunk_size=2048,
