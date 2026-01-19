@@ -149,13 +149,24 @@ class MiscModule:
         print("=" * w)
 
     def fix_seed(self):
+        # 1. Standard Python/Numpy seeds
         random.seed(self.seed)
         np.random.seed(self.seed)
+
+        # 2. PyTorch seeds
         torch.manual_seed(self.seed)
-        torch.cuda.manual_seed_all(self.seed)
-        # torch.use_deterministic_algorithms(True)
+        torch.cuda.manual_seed(self.seed)
+        torch.cuda.manual_seed_all(self.seed)  # For multi-GPU
+
+        # 3. Force deterministic algorithms (Crucial!)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        # This will throw errors if an op is non-deterministic
+        # torch.use_deterministic_algorithms(True)
+
+        # 4. Disable TF32 (Crucial for precision stability!)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
     def __repr__(self):
         repr_str = f"Adjuster(\n"

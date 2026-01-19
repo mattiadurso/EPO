@@ -139,7 +139,7 @@ def build_reconstruction(
     ):  # Fixed: iterate over unique camera IDs found in images
         # Get camera parameters as numpy array
         model, params = adjuster.intrinsics.get_camera_parameters(cam_id)
-        params = params.detach().cpu().numpy()
+        params = params.detach().cpu().float().numpy()
 
         # Get scale for this camera
         scale = camera_scales.get(cam_id, 1.0)

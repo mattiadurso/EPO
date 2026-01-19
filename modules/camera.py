@@ -71,6 +71,7 @@ class CameraModule(BaseModule):
             self.scheduler.step()
 
     def get_all_intrinsic_matrix(self):
+        """Get all intrinsic matrices."""
         return self.keys, self.get_intrinsic_matrix(self.keys)
 
     def get_intrinsic_matrix(self, indices) -> torch.Tensor:

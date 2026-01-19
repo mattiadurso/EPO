@@ -17,12 +17,9 @@ from PIL import Image
 from tqdm import tqdm
 import rerun as rr
 
-torch.backends.cudnn.benchmark = True
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
 os.environ["MKL_THREADING_LAYER"] = "GNU"
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 # Ignore the cuDNN warning
 warnings.filterwarnings(
@@ -137,8 +134,17 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         max_num_iterations=2000,
         viz=False,  # it true del non used stuff during computation
         verbose=False,
+        dtype=torch.float32,
     ):
         super().__init__()
+        assert dtype in [
+            torch.float32,
+            # torch.bfloat16,
+        ], "Only float32 and bfloat16 are supported for now due to their large dynamic range."
+
+        # fix seed
+        self.seed = seed
+        self.fix_seed()
 
         self.max_workers = os.cpu_count() if max_workers < 0 else max_workers
         self.images_size = images_size
@@ -152,7 +158,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.convergence = False
         self.use_amp = use_amp
         self.amp_dtype = amp_dtype
-        self.dtype = torch.float32  # hardcode to float32 for stability
+        self.dtype = dtype
         self.auc_th = [1, 3, 5]
         self.completed_iterations = 0
         self.max_num_iterations = max_num_iterations
@@ -221,10 +227,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.grad_k = grad_k
         self.grad_z = grad_z
         self.use_mlp_pose_refinement = use_mlp_pose_refinement
-
-        # fix seed
-        self.seed = seed
-        self.fix_seed()
 
         # Loading
         self.timings = {}
@@ -306,11 +308,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.images_hw = BaseModule(self.image_id_map, images_shapes, self.device)
         self.sampled_depth = DepthModule(
             image_id_map=self.image_id_map,
-            parameters=sampled_depth,
+            depth=sampled_depth,
             device=self.device,
             lr=self.z_lr,
             grad=self.grad_z,
             max_num_iterations=self.max_num_iterations,
+            dtype=self.dtype,
         )
 
         # Prepare viewgraph with indices for faster access during optimization
@@ -425,8 +428,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                     self.log_reconstruction_rerun(
                         gt_path,
                         entity="gt",
-                        static=True,
+                        static_cameras=True,
                         points3D=True,
+                        static_points=True,
                         camera_color=[0, 255, 0],
                     )
                 except Exception as e:
@@ -437,8 +441,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                     self.log_reconstruction_rerun(
                         ba_path,
                         entity="ba",
-                        static=True,
+                        static_cameras=True,
                         points3D=False,
+                        static_points=True,
                         camera_color=[0, 0, 255],
                     )
                 except Exception as e:
@@ -524,8 +529,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 self.log_reconstruction_rerun(
                     opt,
                     entity="opt",
-                    static=False,
+                    static_cameras=False,
                     points3D=False,
+                    static_points=False,
                     camera_color=[255, 0, 0],  # red
                 )
 
@@ -1190,7 +1196,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 valid_depth_mask = (confidence > confidence_threshold) & (
                     ~torch.isnan(confidence)
                 )
-                valid_edges_map = edges_map * valid_depth_mask.float()
+                valid_edges_map = edges_map * valid_depth_mask.to(self.dtype)
 
                 # Extract edges from valid edges map
                 valid_edges = (
@@ -1233,7 +1239,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         avg_edges = sum(num_edges) / len(num_edges)
         median_edges = sorted(num_edges)[len(num_edges) // 2]
         q90 = (
-            torch.quantile(torch.tensor(num_edges, dtype=self.dtype), 0.9).long().item()
+            torch.quantile(torch.tensor(num_edges, dtype=torch.float32), 0.9)
+            .long()
+            .item()
         )
 
         # this to save some computation/memory
@@ -1256,7 +1264,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             if n_edges < max_edges_to_retain:
                 pad_size = max_edges_to_retain - n_edges
                 pad = torch.zeros((pad_size, 2), device=edges.device)
-                edges = torch.cat([edges, pad], dim=0)
+                edges = torch.cat([edges, pad], dim=0).to(self.dtype)
 
                 pad_mask = torch.zeros(
                     (max_edges_to_retain,), device=edges.device, dtype=self.dtype
