@@ -18,7 +18,7 @@ class DepthModule(BaseModule):
     def __init__(
         self,
         image_id_map: dict,
-        parameters: torch.Tensor,
+        depth: torch.Tensor,
         lr: float = 5e-3,
         grad: bool = True,
         max_num_iterations: int = 1000,
@@ -38,19 +38,12 @@ class DepthModule(BaseModule):
         self.tensor_idx_to_image = {v: k for k, v in image_id_map.items()}
 
         # storing as inverse depth for better numerical stability
-        depth = parameters.pow(-1)
-
-        # self.params = nn.Parameter(
-        #     depth.clone().detach().to(device=self.device, dtype=self.dtype),
-        #     requires_grad=grad,
-        # )
         self.depth = depth
-
-        alphas = torch.ones_like(depth)
-        betas = torch.zeros_like(depth)
-        params = torch.stack([alphas, betas], dim=-1)
         self.params = nn.Parameter(
-            params.clone().detach().to(device=self.device, dtype=self.dtype),
+            torch.zeros_like(self.depth)
+            .clone()
+            .detach()
+            .to(device=self.device, dtype=torch.float32),
             requires_grad=grad,
         )
 

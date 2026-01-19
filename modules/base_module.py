@@ -69,9 +69,13 @@ class BaseModule(nn.Module):
         """Return list of trainable parameters - only self.params is a leaf tensor"""
         return [self.params] if self.params.requires_grad else []
 
-    def init_optimizer(self, lr: float, w_decay: float = 0):
+    def init_optimizer(self, lr: float, w_decay: float = 0, eps: float = 1e-10):
         """Initialize optimizer."""
-        self.optimizer = torch.optim.AdamW([self.params], lr=lr, weight_decay=w_decay)
+        args = {"lr": lr, "weight_decay": w_decay, "eps": eps}
+        self.optimizer = torch.optim.AdamW(
+            [self.params],
+            **args,
+        )
 
     def optimizer_and_scheduler_step(self, loss):
         """Perform optimizer step and update scheduler based on loss."""
