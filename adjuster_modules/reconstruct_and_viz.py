@@ -57,7 +57,7 @@ class ReconstructAndVizModule:
             tqdm(viewgraph, desc="Computing residuals")
         ):
             sampled_vg = [(img_i, img_j)]
-            batch, pad_masks, dt_fields = self._create_batched_inputs(sampled_vg)
+            batch, pad_masks, dt_fields = self.create_batched_inputs(sampled_vg)
             # Project edges and compute residuals
             edges_reprojected, _ = project_world_to_2D(**batch)
             residuals = sample_distance_field(dt_fields, edges_reprojected).squeeze(1)
