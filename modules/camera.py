@@ -49,7 +49,9 @@ class CameraModule(BaseModule):
         self.k_params = k_params.clone().detach().to(self.device, dtype=self.dtype)
         # alphas for f = f * (1 + alpha)
         self.params = nn.Parameter(
-            torch.zeros((self.k_params.shape[0], 2), device=self.device),
+            torch.zeros(
+                (self.k_params.shape[0], 2), device=self.device, dtype=self.dtype
+            ),
             requires_grad=grad,
         )
 
