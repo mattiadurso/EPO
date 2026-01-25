@@ -267,8 +267,7 @@ class PoseModule(BaseModule):
             R, t = self.apply_mlp(R, t, indices)
 
         # Convert R to quaternion
-        q = kgc.rotation_matrix_to_quaternion(R)
-        q = torch.roll(q, shifts=-1, dims=1)  # (x, y, z, w) to (w, x, y, z)
+        q = pp.mat2SO3(R).tensor()  # Returns (x,y,z,w) directly
         t = self.t_scale * t + self.t_mean  # Rescale to physical units
 
         return q.squeeze(), t.squeeze()
