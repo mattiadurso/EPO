@@ -507,6 +507,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
             # Unproject point to world coordinates
             self.unproject_edges_to_3D()
+
             self.timings["step_pre_computation"] += time.time() - t_pre
 
             # Compute residuals
@@ -533,7 +534,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 self.to_colmap(
                     opt,
                     verbose=False,
-                    max_points_per_image=100_000 // len(adjuster.images),
+                    max_points_per_image=100_000 // self.num_images,
                     save_points=False,
                     final_dbscan_filtering=False,
                     dbscan_eps=0.1,
@@ -557,7 +558,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.loss_list.append(loss.detach().item())
             self.collect_lrs(len(self.loss_list) - 1)
 
-            # DEBUG: Evaluate AUC if GT available
+            # Evaluate AUC if GT available
             if gt_path is not None and step % self.auc_saving_freq == 0:
                 self.to_colmap(opt, save_points=False, verbose=False)
                 self.compute_auc(opt, gt_path, step)
@@ -651,7 +652,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.to_colmap(opt, save_points=False, verbose=False)
             self.compute_auc(opt, gt_path, step)
 
-        self.print_summary() if self.verbose else print("=" * 60, end="\n\n")
+        self.print_summary() if self.verbose else print("=" * 70, end="\n\n")
 
     ### Forward and backward helpers ###
     def check_convergence(self, list_of_changes, window=25, tol=0.5):
@@ -696,14 +697,15 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
     def optimizers_zero_grad(self):
         """Zero the gradients of all optimizers."""
+
+        if hasattr(self.intrinsics, "optimizer"):
+            self.intrinsics.optimizer.zero_grad()
+
         if hasattr(self.poses, "optimizer"):
             self.poses.optimizer.zero_grad()
 
         if hasattr(self.sampled_depth, "optimizer"):
             self.sampled_depth.optimizer.zero_grad()
-
-        if hasattr(self.intrinsics, "optimizer"):
-            self.intrinsics.optimizer.zero_grad()
 
     def optimizer_and_scheduler_step(self, loss):
         """Perform optimizer step and scheduler step for all optimizers."""
@@ -960,6 +962,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         loss = pair_losses.mean()
 
         self.timings["loss_computation"] += time.time() - s_time
+
         return loss
 
     ### Helper functions for loading and preprocessing data ###
@@ -1415,7 +1418,7 @@ if __name__ == "__main__":
             adjuster.to_colmap(
                 opt,
                 verbose=False,
-                max_points_per_image=100_000 // len(adjuster.images),
+                max_points_per_image=100_000 // adjuster.num_images,
                 save_points=save_points,
                 final_dbscan_filtering=False,
                 dbscan_eps=0.1,
