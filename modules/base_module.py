@@ -12,7 +12,6 @@ class BaseModule(nn.Module):
     ):
         super(BaseModule, self).__init__()
 
-        self.image_id_map = image_id_map
         self.device = torch.device(device)
         self.dtype = dtype
 
@@ -20,7 +19,7 @@ class BaseModule(nn.Module):
         self.image_to_tensor_idx = image_id_map
         self.tensor_idx_to_image = {v: k for k, v in image_id_map.items()}
 
-        # Initialize layers or parameters here
+        # Initialize layers or parameters here | Not sure why it is needed, but it is
         self.params = parameters.to(self.device) if parameters is not None else None
 
     def forward(self, x):
@@ -69,7 +68,7 @@ class BaseModule(nn.Module):
         """Return list of trainable parameters - only self.params is a leaf tensor"""
         return [self.params] if self.params.requires_grad else []
 
-    def init_optimizer(self, lr: float, w_decay: float = 0, eps: float = 1e-10):
+    def init_optimizer(self, lr: float, w_decay: float = 1e-2, eps: float = 1e-10):
         """Initialize optimizer."""
         args = {"lr": lr, "weight_decay": w_decay, "eps": eps}
         self.optimizer = torch.optim.AdamW(
@@ -77,15 +76,29 @@ class BaseModule(nn.Module):
             **args,
         )
 
+    def init_scheduler(self, warmup_steps: int, max_num_iterations: int):
+        """Initialize learning rate scheduler."""
+
+        # Linearly increase learning rate
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            self.optimizer,
+            start_factor=1 / 100,  # Start at 1% of your defined LR
+            total_iters=warmup_steps,
+        )
+
+        # Smoothly decreases from lr to min_lr
+        decay = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=max_num_iterations - warmup_steps,  # Remaining steps
+            eta_min=1e-6,  # this was 1e-6
+        )
+
+        # 3. Combine them
+        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
+            self.optimizer, schedulers=[warmup, decay], milestones=[warmup_steps]
+        )
+
     def optimizer_and_scheduler_step(self, loss):
         """Perform optimizer step and update scheduler based on loss."""
         self.optimizer.step()
-        if hasattr(self, "scheduler"):
-            if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                self.scheduler.step(loss.detach())
-            else:  # other schedulers do not need loss input
-                self.scheduler.step()
-
-    def get_all_parameters(self) -> torch.Tensor:
-        """Return all parameters as a tensor."""
-        return self.params.detach().clone()
+        self.scheduler.step()

@@ -10,7 +10,7 @@ sys.path.append("/home/mattia/Desktop/Repos/posebench/benchmarks_3D")
 from benchmark_pose import eval_colmap_model_all_scenes, eval_colmap_model
 
 
-def read_results(dataset, target_folder, models, thr=5, round_to=2):
+def read_results(dataset, target_folder, models, thr=5, round_to=1, remove=[]):
     base_target = f"/home/mattia/Desktop/datasets/{dataset}"
     base_repo = "/home/mattia/Desktop/Repos/batchsfm/benchmarks"
     scenes = os.listdir(base_target)
@@ -64,7 +64,10 @@ def read_results(dataset, target_folder, models, thr=5, round_to=2):
     df.columns = [
         col.replace("_", "+") if "auc" not in col else col for col in df.columns
     ]
-    # df.dropna(inplace=True)
+
+    for rem in remove:
+        df.drop(rem, inplace=True, errors="ignore")
+
     df.loc["mean"] = df.mean()
     df = df.round(round_to)
 

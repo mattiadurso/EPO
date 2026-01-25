@@ -11,6 +11,7 @@ class CameraModule(BaseModule):
         k_params: torch.Tensor,
         lr: float = 1e-3,
         grad: bool = True,
+        warmup_steps: int = 25,
         max_num_iterations: int = 1000,
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
@@ -21,20 +22,20 @@ class CameraModule(BaseModule):
             k_models: list of strings, camera model names per camera
             k_params: Nx4 tensor of camera parameters, fx, fy, cx, cy
             device: torch device
+        Note:
+            To make this module more readable, some variables and methods share between
+            pose, camera and depth modules are in base_module.
         """
         super().__init__(image_id_map, device=device, dtype=dtype)
         self.max_num_iterations = max_num_iterations
+        self.lr = float(lr)
+        self.keys = list(self.image_to_tensor_idx.keys())
 
         # Define model ID mapping
         self.camera_model_name_to_id = {
             "PINHOLE": 0,
             "SIMPLE_PINHOLE": 1,
         }
-
-        # --- ID Mappings ---
-        self.recon_to_tensor_cam_id = image_id_map
-        self.tensor_to_recon_cam_id = {v: k for k, v in image_id_map.items()}
-        self.keys = list(self.recon_to_tensor_cam_id.keys())
 
         # --- Model Types ---
         self.k_models = k_models
@@ -52,17 +53,11 @@ class CameraModule(BaseModule):
             requires_grad=grad,
         )
 
-        self.lr = float(lr)
         if grad:
             self.init_optimizer(lr=self.lr)
+            self.init_scheduler(warmup_steps, max_num_iterations)
 
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer,
-                T_max=self.max_num_iterations,  # Remaining steps
-                eta_min=1e-6,
-            )
-
-        self.update_all_matrices()  # Precompute all intrinsic matrices
+        self.update_all_matrices()  # Pre-compute all intrinsic matrices
 
     def optimizer_and_scheduler_step(self, loss):
         """Perform optimizer step and update scheduler based on loss."""
@@ -192,6 +187,6 @@ class CameraModule(BaseModule):
             if count >= limit:
                 s += f"  ... and {len(self.k_models) - limit} more.\n"
                 break
-            s += f"  Camera {self.tensor_to_recon_cam_id[i]}: Model={model}, Params={params.detach().cpu().tolist()}\n"
+            s += f"  Camera {self.tensor_idx_to_image[i]}: Model={model}, Params={params.detach().cpu().tolist()}\n"
             count += 1
         return s

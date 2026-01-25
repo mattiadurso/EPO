@@ -110,25 +110,29 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         detector="canny",
         device="cuda",
         max_workers=-1,
-        detector_params={},
+        detector_params={
+            "low_threshold": 0.20,
+            "high_threshold": 0.25,
+            "kernel_size": 7,
+            "sigma": 2,
+        },
         seed=0,
-        max_edges_points=16_384,  # hard contraint due to memory
-        max_viewgraph_pairs=8_192,  # hard contraint due to memory
-        use_amp=True,
-        amp_dtype=torch.bfloat16,  # torch.float16
-        matcher_type="frustums",  # or "sequential"
+        max_edges_points=16_384,  # hard contraint due to memory on 24GB
+        max_viewgraph_pairs=8_192,  # hard contraint due to memory on 24GB
+        matcher_type="exhaustive",  # or "sequential"
         sequential_matcher_window=5,  # only for sequential matcher
         scene_type="outdoor",  # or "indoor", "object_centric" (not used yet)
         use_depth_confidence=False,
         q_lr=1e-4,
         t_lr=1e-3,
-        k_lr=5e-4,
-        z_lr=1e-4,
-        mlp_pose_lr=1e-3,
+        k_lr=1e-3,
+        z_lr=3e-3,
+        mlp_pose_lr=3e-3,
         grad_q=False,
         grad_t=False,
-        grad_k=False,
-        grad_z=False,
+        grad_t_offset=True,
+        grad_k=True,
+        grad_z=True,
         use_mlp_pose_refinement=True,
         auc_saving_freq=50,
         max_num_iterations=2000,
@@ -156,8 +160,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.single_camera_per_folder = single_camera_per_folder
         self.sequential_matcher_window = sequential_matcher_window
         self.convergence = False
-        self.use_amp = use_amp
-        self.amp_dtype = amp_dtype
         self.dtype = dtype
         self.auc_th = [1, 3, 5]
         self.completed_iterations = 0
@@ -183,12 +185,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 kernel_size=detector_params.get("kernel_size", 7),
                 sigma=detector_params.get("sigma", 2.0),
                 device=device,
+                verbose=verbose,
             )
         elif detector == "sam2":
             from extractors.SAM2.sam2_wrapper import SAM2EdgePointExtractor
 
             self.edge_extractor = SAM2EdgePointExtractor(device=device, size="large")
-
         elif detector == "bdcn":
             from extractors.BDCN.bdcn_wrapper import BDCNEdgeDetector
 
@@ -224,6 +226,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.mlp_pose_lr = mlp_pose_lr
         self.grad_q = grad_q
         self.grad_t = grad_t
+        self.grad_t_offset = grad_t_offset
         self.grad_k = grad_k
         self.grad_z = grad_z
         self.use_mlp_pose_refinement = use_mlp_pose_refinement
@@ -271,7 +274,16 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         s_time = time.time()
         # compute viewgraph
         self._compute_viewgraph(type=self.matcher_type)
+        self.adj_list = {}
+        for i, j in self.viewgraph:
+            self.adj_list.setdefault(i, []).append(j)
+            self.adj_list.setdefault(j, []).append(i)
         self.timings["compute_viewgraph"] = time.time() - s_time
+        if self.verbose:
+            values = [len(v) for v in self.adj_list.values()]
+            print(
+                f"Average degree: {np.mean(values):.2f}, min connection {min(values)}, less than 5 neighbors: {(np.array(values)<5).sum()} images"
+            )
 
         ## Prepare batched parameters modules that do not need to be optimized
         self.image_id_map = {}
@@ -347,9 +359,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             params_to_optimize = self._collect_parameters_to_optimize()
             self._print_params_summary(params_to_optimize)
 
-        # if self.use_amp:
-        #     self.scaler = torch.amp.GradScaler()
-
         self.timings["total_loading"] = time.time() - time_start
         self.timings["total_optimization"] = 0
         self.timings["step_pre_computation"] = 0
@@ -359,6 +368,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.timings["gradients_computation"] = 0
         self.timings["parameters_update"] = 0
         self.timings["logging"] = 0
+        self.timings["early_stop_check"] = 0
 
         # # At this point I might get rid of rgb images to save memory as not needed for edge loss
         if not viz:
@@ -402,16 +412,26 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         """
         Main optimization loop.
         Args:
-            max_steps (int): Maximum number of optimization steps.
-            batch_size (int): Maximum number of image pairs per batch. Affects computation marginally if drop_last=True.
-            residuals_chunk_size (int): Chunk size for residual computation to save memory.
-            quantile (float): Quantile for evaluating pose changes.
-            window (int): Window size for convergence evaluation.
-            convergence_tol (float): Tolerance for convergence based on pose changes in degrees.
-            drop_last (bool): Whether to drop the last batch if smaller than batch_size. Useful for consistent batch sizes.
-            debug (bool): Whether to enable debug mode (tracks residuals).
-            gt_path
+            batch_size (int, optional): Number of viewgraph pairs to process per batch. Default is 256.
+            residuals_chunk_size (int, optional): Chunk size for residual computation. Default is 2048.
+            quantile (float, optional): Quantile for evaluating pose changes. Default is 0.95.
+            window_pose (int, optional): Window size for pose convergence evaluation. Default is 25.
+            window_depth (int, optional): Window size for depth convergence evaluation. Default is 25.
+            convergence_tol_pose (float, optional): Tolerance for pose convergence. Default is 0.5.
+            convergence_tol_depth (float, optional): Tolerance for depth convergence. Default is 0.1. Not used when early_stop is False.
+            early_stop (bool, optional): Whether to stop early if depth convergence is reached. Default is True.
+            drop_last (bool, optional): Whether to drop the last batch if smaller than batch_size. Default is False.
+            debug (bool, optional): Whether to enable debug mode. Default is False.
+            gt_path (str, optional): Path to the ground truth data. Default is None.
+            ba_path (str, optional): Path to the bundle adjustment data. Default is None.
+            use_rerun (bool, optional): Whether to use Rerun for visualization. Default is False.
+            spawn_rerun (bool, optional): Whether to spawn a new Rerun instance. Default is True.
+            rerun_save_path (str, optional): Path to save Rerun logs. Default is ".".
+            scene_name (str, optional): Name of the scene. Default is "data".
+            opt (str, optional): Path to the optimization output. Default is "optimized_reconstruction_GD/_current_test".
+
         """
+        time_start = time.time()
         # assuming to to do not changes these or move to init
         self.window_pose = window_pose
         self.window_depth = window_depth
@@ -452,8 +472,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                         f"Warning: Failed to load BA result for Rerun visualization: {e}"
                     )
 
-        time_start = time.time()
-
         if self.verbose:
             num_batches = math.ceil(len(self.viewgraph) / batch_size)
             num_batches = num_batches if drop_last else num_batches + 1
@@ -466,9 +484,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 end="\n\n",
             )
 
-        if early_stop:  # store past poses for convergence evaluation
-            past_poses = self.poses.get_all_matrices().detach().clone()
-            past_depths = self.sampled_depth.get_all_parameters().detach().clone()
+        # store past poses for convergence evaluation
+        past_poses = self.poses.get_all_matrices().detach().clone()
+        self.timings["logging"] += time.time() - time_start
 
         # Forward and backward loop
         bar = tqdm(
@@ -488,7 +506,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.intrinsics.update_all_matrices()
 
             # Unproject point to world coordinates
-            self._unproject_edges_to_3D()
+            self.unproject_edges_to_3D()
             self.timings["step_pre_computation"] += time.time() - t_pre
 
             # Compute residuals
@@ -500,9 +518,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             )
 
             # Compute loss
-            loss = self._compute_batched_loss(
-                residuals, sampled_viewgraphs, debug=debug
-            )
+            loss = self.compute_batched_loss(residuals, sampled_viewgraphs, debug=debug)
             s_time = time.time()
             loss.backward()
             self.timings["gradients_computation"] += time.time() - s_time
@@ -566,75 +582,61 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                         )
 
             self.timings["logging"] += time.time() - logging_time_start
-
             # ============================================================
             # Early stopping
             # ============================================================
-            if early_stop:  # otherwise no need to monitor convergence
-                # collect pose changes for convergence evaluation
-                current_poses = self.poses.get_all_matrices().detach().clone()
-                err_q, err_t, max_err = evaluate_pose_changes(
-                    past_poses,
-                    current_poses,
-                    quantile=quantile,
+            early_stop_start = time.time()
+
+            # collect pose changes for convergence evaluation
+            current_poses = self.poses.get_all_matrices().detach().clone()
+            err_q, err_t, max_err = evaluate_pose_changes(
+                past_poses,
+                current_poses,
+                quantile=quantile,
+            )
+            self.changes["q"].append(err_q)
+            self.changes["t"].append(err_t)
+            self.changes["max"].append(max_err)
+            self.changes["steps"].append(step)
+            past_poses = current_poses
+
+            if not self.convergence_pose:
+                convergence_pose = self.check_convergence(
+                    self.changes["max"],
+                    window=window_pose,
+                    tol=convergence_tol_pose,
                 )
-                self.changes["q"].append(err_q)
-                self.changes["t"].append(err_t)
-                self.changes["max"].append(max_err)
-                self.changes["steps"].append(step)
-                past_poses = current_poses
+                if convergence_pose:
+                    self.convergence_pose = True
+                    self.timings["pose_convergence_time"] = time.time() - time_start
+                    if self.verbose:
+                        print(f"Pose convergence reached at step {step}.")
 
-                if not self.convergence_pose:
-                    convergence_pose = self.check_convergence(
-                        self.changes["max"],
-                        window=window_pose,
-                        tol=convergence_tol_pose,
-                    )
-                    if convergence_pose:
-                        self.convergence_pose = True
-                        if self.verbose:
-                            print(f"Pose convergence reached at step {step}.")
-                            self.timings["pose_convergence_time"] = (
-                                time.time() - time_start
-                            )
-
-                        # If not optimizing depth, mark it as converged immediately
-                        if not self.grad_z:
-                            self.convergence_depth = True
-                            self.timings["depth_convergence_time"] = (
-                                time.time() - time_start
-                            )
-
-                elif self.convergence_pose:
-                    # start evaluating depth convergence
-                    current_depths = (
-                        self.sampled_depth.get_all_parameters().detach().clone()
-                    )
-                    depth_change = evaluate_depth_changes(
-                        past_depths,
-                        current_depths,
-                        self.pad_masks.get_all_parameters(),  # depth has padding init
-                        quantile=quantile,
-                    )
-                    self.changes["z"].append(depth_change)
-                    past_depths = current_depths
-
-                    if self.check_convergence(
-                        self.changes["max"],
-                        window=window_depth,
-                        tol=convergence_tol_depth,
-                    ):
+                    # If not optimizing depth, mark it as converged immediately
+                    if not self.grad_z:
                         self.convergence_depth = True
                         self.timings["depth_convergence_time"] = (
                             time.time() - time_start
                         )
 
-                if self.convergence_pose and self.convergence_depth:
-                    if self.verbose:
-                        print(
-                            f"Stopping optimization at step {step}. Convergence reached."
-                        )
-                    break
+            elif self.convergence_pose:
+                if (
+                    self.check_convergence(
+                        self.changes["max"],
+                        window=window_depth,
+                        tol=convergence_tol_depth,
+                    )
+                    and early_stop
+                ):  # else keep optimizing depth until max_iterations
+                    self.convergence_depth = True
+                    self.timings["depth_convergence_time"] = time.time() - time_start
+
+            self.timings["early_stop_check"] += time.time() - early_stop_start
+
+            if self.convergence_pose and self.convergence_depth:
+                if self.verbose:
+                    print(f"Stopping optimization at step {step}. Convergence reached.")
+                break
 
             self.completed_iterations += 1
 
@@ -652,7 +654,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.print_summary() if self.verbose else print("=" * 60, end="\n\n")
 
     ### Forward and backward helpers ###
-    def check_convergence(self, list_of_changes, window=50, tol=0.5):
+    def check_convergence(self, list_of_changes, window=25, tol=0.5):
         """
         Evaluate convergence based on pose changes: max(delta_r, delta_t).
         Stop when smoothed max change is below tol for 'window' consecutive steps.
@@ -718,6 +720,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         if self.grad_z is True and self.convergence_pose is True:
             self.sampled_depth.optimizer_and_scheduler_step(loss)
 
+        # independent from phase
         if self.grad_k:
             self.intrinsics.optimizer_and_scheduler_step(loss)
 
@@ -747,10 +750,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.lr_list["z"].append(
                 (step, self.sampled_depth.scheduler.get_last_lr()[0])
             )
-        if hasattr(self.poses, "optimizer_mlp"):
-            self.lr_list["mlp"].append((step, self.poses.mlp_lr))
 
-    def _unproject_edges_to_3D(self, batch_size=None):
+    def unproject_edges_to_3D(self, batch_size=None):
         """Unproject 2D edges to 3D points for all images as a batch."""
         image_names_id = self.images_cams_ids[:, 0]
         cam_ids = self.images_cams_ids[:, 1]
@@ -788,35 +789,35 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             dtype=self.dtype,
         )
 
-    def _create_batched_inputs(self, sampled_viewgraph):
+    def create_batched_inputs(self, sampled_viewgraph):
         """Prepare batched inputs for the batched optimization step given a list of pairs from the viewgraph."""
         # mantain str index for visualization/debugging
-        if isinstance(sampled_viewgraph[0][0], str):
-            cam_ids = []
-            images_names_ij = []
-            images_names_ji = []
-            for (
-                i,
-                j,
-            ) in sampled_viewgraph:  # with i,j being left (0) and right (1) images
-                # I already have unprojected points to 3D, so I only have to check that
-                # those points reproject within the image boundaries.
+        # if isinstance(sampled_viewgraph[0][0], str):
+        #     cam_ids = []
+        #     images_names_ij = []
+        #     images_names_ji = []
+        #     for (
+        #         i,
+        #         j,
+        #     ) in sampled_viewgraph:  # with i,j being left (0) and right (1) images
+        #         # I already have unprojected points to 3D, so I only have to check that
+        #         # those points reproject within the image boundaries.
 
-                # these are are the ids for points 3D and their corresponding pad
-                images_names_ij.append(i)
-                images_names_ij.append(j)
+        #         # these are are the ids for points 3D and their corresponding pad
+        #         images_names_ij.append(i)
+        #         images_names_ij.append(j)
 
-                # these are the ids for right images where to reproject
-                cam_ids.append(self.images[j]["cam_id"])
-                cam_ids.append(self.images[i]["cam_id"])
-                images_names_ji.append(j)
-                images_names_ji.append(i)
+        #         # these are the ids for right images where to reproject
+        #         cam_ids.append(self.images[j]["cam_id"])
+        #         cam_ids.append(self.images[i]["cam_id"])
+        #         images_names_ji.append(j)
+        #         images_names_ji.append(i)
 
-        else:
-            # sampeld_viewgraph is tensor of shape (num_pairs, 4) with (img1_id, img2_id, cam1_id, cam2_id)
-            images_names_ij = sampled_viewgraph[:, :2].reshape(-1)
-            images_names_ji = sampled_viewgraph[:, :2].flip(1).reshape(-1)
-            cam_ids = sampled_viewgraph[:, 2:].flip(1).reshape(-1)
+        # else:
+        # sampeld_viewgraph is tensor of shape (num_pairs, 4) with (img1_id, img2_id, cam1_id, cam2_id)
+        images_names_ij = sampled_viewgraph[:, :2].reshape(-1)
+        images_names_ji = sampled_viewgraph[:, :2].flip(1).reshape(-1)
+        cam_ids = sampled_viewgraph[:, 2:].flip(1).reshape(-1)
 
         batch = {}
         # 3D points in world coordinates and padd for left images
@@ -867,53 +868,48 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         for sampled_viewgraph in sampled_viewgraphs:
             # prepare batched inputs
             s_time = time.time()
-            batch, pad_masks, dt_fields = self._create_batched_inputs(sampled_viewgraph)
+            batch, pad_masks, dt_fields = self.create_batched_inputs(sampled_viewgraph)
             self.timings["prepare_batched_inputs"] += time.time() - s_time
 
             # actual inference
             s_time = time.time()
-            # actual inference
-            with torch.amp.autocast(
-                device_type=self.device,
-                dtype=self.amp_dtype,
-                enabled=self.use_amp,
-            ):
-                # projection and sampling
-                residuals, inside_mask = project_and_sample_logic(
-                    batch["xyz_world"],
-                    batch["K1"],
-                    batch["P1"],
-                    batch["img1_shape"],
-                    dt_fields,
-                    border=0,
-                )
 
-                # chunked computation of loss over residuals
-                valid_mask = pad_masks & inside_mask
+            # projection and sampling
+            residuals, inside_mask = project_and_sample_logic(
+                batch["xyz_world"],
+                batch["K1"],
+                batch["P1"],
+                batch["img1_shape"],
+                dt_fields,
+                border=0,
+            )
 
-                B, N = residuals.shape
-                total_sum = torch.zeros(B, device=self.device, dtype=self.dtype)
-                total_count = torch.zeros(B, device=self.device, dtype=torch.long)
+            # chunked computation of loss over residuals
+            valid_mask = pad_masks & inside_mask
 
-                for i in range(0, N, residuals_chunk_size):
-                    r_chunk = residuals[:, i : i + residuals_chunk_size]
-                    m_chunk = valid_mask[:, i : i + residuals_chunk_size]
+            B, N = residuals.shape
+            total_sum = torch.zeros(B, device=self.device, dtype=self.dtype)
+            total_count = torch.zeros(B, device=self.device, dtype=torch.long)
 
-                    # Pass the clean residual chunk and the merged validity mask
-                    s_chunk, c_chunk = compute_chunk_loss_logic(r_chunk, m_chunk)
+            for i in range(0, N, residuals_chunk_size):
+                r_chunk = residuals[:, i : i + residuals_chunk_size]
+                m_chunk = valid_mask[:, i : i + residuals_chunk_size]
 
-                    total_sum += s_chunk
-                    total_count += c_chunk
+                # Pass the clean residual chunk and the merged validity mask
+                s_chunk, c_chunk = compute_chunk_loss_logic(r_chunk, m_chunk)
 
-                zero = torch.tensor(0.0, device=self.device, dtype=self.dtype)
-                mean_losses = torch.where(
-                    total_count > 0,
-                    total_sum / total_count.to(self.dtype).clamp(min=1.0),
-                    zero,
-                )
+                total_sum += s_chunk
+                total_count += c_chunk
 
-                # collect this batch's results
-                residuals_list.append(mean_losses)
+            zero = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+            mean_losses = torch.where(
+                total_count > 0,
+                total_sum / total_count.to(self.dtype).clamp(min=1.0),
+                zero,
+            )
+
+            # collect this batch's results
+            residuals_list.append(mean_losses)
 
             self.timings["forward_pass"] += time.time() - s_time
 
@@ -922,7 +918,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
         return residuals, sampled_viewgraphs
 
-    def _compute_batched_loss(
+    def compute_batched_loss(
         self, residuals, sampled_viewgraphs=None, debug=False, delta=1.0
     ):
         """Vectorized batched loss computation."""
@@ -1064,6 +1060,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             t_lr=self.t_lr,
             grad_q=self.grad_q,
             grad_t=self.grad_t,
+            grad_t_offset=self.grad_t_offset,
             mlp_lr=self.mlp_pose_lr,
             use_mlp=self.use_mlp_pose_refinement,
             max_num_iterations=self.max_num_iterations,
@@ -1116,7 +1113,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                     )
 
     @torch.no_grad()
-    def _compute_viewgraph(self, type="frustums"):
+    def _compute_viewgraph(self, type="exhaustive"):
         """Compute viewgraph and filter by reprojection error and returns the sorted viewgraph."""
         if self.viewgraph_path is not None:
             # Load viewgraph from file
@@ -1157,8 +1154,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             # Build exhaustive viewgraph (all pairs)
             image_names = sorted(list(self.images.keys()))
             viewgraph = list(combinations(image_names, 2))
-            min_points = 750
-            sampling_factor = 5
+            min_points = 750  # ~12.5% (1/8) of 518*290
+            sampling_factor = 5  # after sampling
             reprojection_error = 3.0
 
         else:
@@ -1348,68 +1345,80 @@ if __name__ == "__main__":
     with open("benchmarks/paths.json") as f:
         paths_cfg = json.load(f)
 
-    dataset_cfg = paths_cfg[dataset]
+    for dataset in ["terrasky3D", "scannetpp"]:
+        scenes = sorted(os.listdir(paths_cfg[dataset]["images_path"]))
 
-    images_path = os.path.join(
-        dataset_cfg["images_path"], scene, dataset_cfg["images_folder"]
-    )
-    base_path = dataset_cfg["base_path"]
-    reconstruction_path = os.path.join(
-        base_path, scene, dataset_cfg["reconstruction_folder"]
-    )
-    depths_path = os.path.join(
-        base_path,
-        scene,
-        dataset_cfg.get("depths_folder", dataset_cfg.get("depth_folder", "")),
-    )
-    gt_path = os.path.join(dataset_cfg["gt_path"], scene, dataset_cfg["gt_folder"])
+        for scene in scenes:
+            if (
+                os.path.exists(f"rerun/{scene}.rrd")
+                or scene[0] == "."
+                or scene.endswith(".py")
+            ):
+                continue
 
-    adjuster = Adjuster(
-        reconstruction_path=reconstruction_path,
-        images_path=images_path,
-        depths_path=depths_path,
-        k_lr=1e-3,
-        grad_k=False,
-        z_lr=3e-3,
-        grad_z=True,
-        mlp_pose_lr=3e-3,
-        use_mlp_pose_refinement=True,
-        matcher_type="exhaustive",  # or "exhaustive", "sequential", "frustums"
-        viz=True,
-        use_amp=False,
-        max_edges_points=12_288,
-        max_viewgraph_pairs=4_096,
-        single_camera_per_folder=True,
-        verbose=True,
-        auc_saving_freq=5,
-        max_num_iterations=2000,
-    )
+            dataset_cfg = paths_cfg[dataset]
 
-    adjuster(
-        batch_size=256,
-        residuals_chunk_size=2048,
-        window_pose=25,
-        window_depth=50,
-        gt_path=gt_path,
-        ba_path=reconstruction_path.replace("vggt", "vggt_ba"),
-        use_rerun=True,
-        logging_=True,
-    )
+            images_path = os.path.join(
+                dataset_cfg["images_path"], scene, dataset_cfg["images_folder"]
+            )
+            base_path = dataset_cfg["base_path"]
+            reconstruction_path = os.path.join(
+                base_path, scene, dataset_cfg["reconstruction_folder"]
+            )
+            depths_path = os.path.join(
+                base_path,
+                scene,
+                dataset_cfg.get("depths_folder", dataset_cfg.get("depth_folder", "")),
+            )
+            gt_path = os.path.join(
+                dataset_cfg["gt_path"], scene, dataset_cfg["gt_folder"]
+            )
 
-    # Saving
-    opt = "optimized_reconstruction_GD/_current_test"
-    # opt = f"optimized_reconstruction_GD/{scene}"
-    os.makedirs(opt, exist_ok=True)
+            adjuster = Adjuster(
+                reconstruction_path=reconstruction_path,
+                images_path=images_path,
+                depths_path=depths_path,
+                k_lr=1e-3,
+                grad_k=False,
+                z_lr=3e-3,
+                grad_z=True,
+                mlp_pose_lr=3e-3,
+                use_mlp_pose_refinement=True,
+                matcher_type="exhaustive",
+                viz=True,
+                use_amp=False,
+                max_edges_points=12_288,
+                max_viewgraph_pairs=4_096,
+                single_camera_per_folder=True,
+                verbose=True,
+                auc_saving_freq=5,
+                max_num_iterations=2000,
+            )
 
-    save_points = True  # recall to set mean track len = 0 in colmap gui
+            adjuster(
+                batch_size=256,
+                residuals_chunk_size=2048,
+                window_pose=25,
+                window_depth=50,
+                gt_path=gt_path,
+                ba_path=reconstruction_path.replace("vggt", "vggt_ba"),
+                use_rerun=True,
+                spawn_rerun=False,
+                rerun_save_path=".",
+                scene_name=scene,
+            )
 
-    adjuster.to_colmap(
-        opt,
-        verbose=False,
-        max_points_per_image=100_000 // len(adjuster.images),
-        save_points=save_points,
-        final_dbscan_filtering=False,
-        dbscan_eps=0.1,
-        dbscan_min_samples=5,
-        # gt_path=gt_path,
-    )
+            # Saving
+            save_points = True  # recall to set mean track len = 0 in colmap gui
+            opt = "optimized_reconstruction_GD/_current_test"
+
+            adjuster.to_colmap(
+                opt,
+                verbose=False,
+                max_points_per_image=100_000 // len(adjuster.images),
+                save_points=save_points,
+                final_dbscan_filtering=False,
+                dbscan_eps=0.1,
+                dbscan_min_samples=5,
+                gt_path=gt_path,
+            )
