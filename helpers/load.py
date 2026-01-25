@@ -381,7 +381,7 @@ def process_camera(camera, load_with_pad=False, images_size=518):
     height = camera.height
 
     if model == "SIMPLE_PINHOLE":  # or model == "SIMPLE_RADIAL":
-        f = params[0]
+        f = torch.tensor(params[0])
         cx, cy = params[1], params[2]
 
     elif model == "PINHOLE":  # or model == "RADIAL":
@@ -404,7 +404,8 @@ def process_camera(camera, load_with_pad=False, images_size=518):
     cx = (cx + pad_x) * scale
     cy = (cy + pad_y) * scale
 
-    params = torch.cat([f, torch.tensor([cx, cy])], dim=0)
+    # print(f"DEBUG: f={f}, cx={cx}, cy={cy}")
+    params = torch.cat([f.flatten(), torch.tensor([cx, cy])], dim=0)
     return cam_id, model, params
 
 

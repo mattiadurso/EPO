@@ -11,6 +11,11 @@ class MiscModule:
         self.name = "Miscellaneous Module"
 
     def print_summary(self, w=None):
+        """
+        Print a summary of the timings and loss.
+        Note:
+            Total optimization might differer from parts sum by 0.2-0.3 seconds.
+        """
         # Column widths
         key_width = 30
         val_width = 10
@@ -33,9 +38,9 @@ class MiscModule:
         # Header row
         print(
             f"{'Stage':<{key_width}}"
-            f"{'Time (s)':>{val_width}}"
-            f"{'%':>{perc_width+1}}"
-            f"{'Per Iter':>{avg_width}}"
+            f"{'Time (s)':>{val_width+2}}"
+            f"{'%':>{perc_width-1}}"
+            f"{'AVG/Iter (s)':>{avg_width+4}}"
         )
         print("-" * w)
 
@@ -43,14 +48,15 @@ class MiscModule:
 
         ordered_keys = [
             "total_loading",
+            "total_optimization",
             "step_pre_computation",
             "prepare_batched_inputs",
             "forward_pass",
             "loss_computation",
-            "gradient_computation",
-            "parameter_update",
+            "gradients_computation",
+            "parameters_update",
             "logging",
-            "total_optimization",
+            "early_stop_check",
         ]
 
         per_iter_keys = {
@@ -58,9 +64,10 @@ class MiscModule:
             "prepare_batched_inputs",
             "forward_pass",
             "loss_computation",
-            "gradient_computation",
-            "parameter_update",
+            "gradients_computation",
+            "parameters_update",
             "logging",
+            "early_stop_check",
         }
 
         for key in ordered_keys:
@@ -72,6 +79,9 @@ class MiscModule:
             if value == 0 and key not in per_iter_keys:
                 continue
 
+            # Determine display key (indent non-total keys)
+            display_key = key if "total" in key else "    " + key
+
             if key in per_iter_keys and num_iters > 0:
                 # Show total time, percentage, AND per-iteration average
                 perc = (
@@ -81,24 +91,23 @@ class MiscModule:
                 )
                 value_avg = value / num_iters
                 row_str = (
-                    f"{key:<{key_width}}"
+                    f"{display_key:<{key_width}}"
                     f"{value:>{val_width}.2f}"
                     f"{perc:>{perc_width}.1f}%"
                     f"{value_avg:>{avg_width}.4f}"
                 )
             elif key == "total_optimization" and num_iters > 0:
-                # Show total optimization time with per-iteration average
+                # Show total optimization time without per-iteration average
                 perc = (
                     (value / self.timings["total"]) * 100
                     if self.timings["total"] > 0
                     else 0
                 )
-                value_avg = value / num_iters
                 row_str = (
-                    f"{key:<{key_width}}"
+                    f"{display_key:<{key_width}}"
                     f"{value:>{val_width}.2f}"
                     f"{perc:>{perc_width}.1f}%"
-                    f"{value_avg:>{avg_width}.4f}"
+                    f"{'':>{avg_width}}"
                 )
             else:
                 # Show total time and percentage
@@ -108,7 +117,7 @@ class MiscModule:
                     else 0
                 )
                 row_str = (
-                    f"{key:<{key_width}}"
+                    f"{display_key:<{key_width}}"
                     f"{value:>{val_width}.2f}"
                     f"{perc:>{perc_width}.1f}%"
                     f"{'':>{avg_width}}"
@@ -117,10 +126,12 @@ class MiscModule:
             print(row_str)
 
         print("-" * w)
+        total_avg = num_iters / self.timings["total_optimization"]
         print(
             f"{'Total':<{key_width}}"
             f"{self.timings['total']:>{val_width}.2f}"
-            f"{'':>{perc_width + avg_width + 3}}"
+            f"{'':>{perc_width}}"
+            f"{total_avg:>{avg_width-1}.2f} it/s"
         )
 
         # Loss summary
