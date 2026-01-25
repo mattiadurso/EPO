@@ -98,19 +98,19 @@ class PoseRefinementMLP(nn.Module):
             refined_pose: (Batch_Size, 3, 4) tensor, orthonormalized.
         """
         # flatten x
-        B = x.shape[0]
-        x = x.view(B, -1)
+        B, H, W = x.shape
+        x0 = x.view(B, -1)
 
-        # Forward pass with residual connections
-        x0 = self.act(self.fc1(x))
-        x1 = self.act(self.fc2(x0))
-        x2 = self.act(self.fc3(x1) + x0)  # Residual connection
+        x1 = self.act(self.fc1(x0))
+        x2 = self.act(self.fc2(x1))
+        x3 = self.act(self.fc3(x2) + x1)  # Residual connection
 
-        x3 = self.act(self.fc4(x2))
-        x4 = self.act(self.fc5(x3))
-        x5 = self.fc6(x4) + x  # Residual connection
+        x4 = self.act(self.fc4(x3))
+        x5 = self.act(self.fc5(x4))
 
-        return self.gram_schmidt(x5.view(B, 3, 4))
+        x6 = self.fc6(x5) + x0  # P = MLP(P) + P
+
+        return self.gram_schmidt(x6.view(B, H, W))
 
     def predict_residuals(self, x):
         """

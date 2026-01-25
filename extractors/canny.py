@@ -16,6 +16,7 @@ class CannyEdgeDetector(nn.Module):
         kernel_size: int = 7,
         sigma: float = 2.0,
         device: str = "cuda",
+        verbose: bool = False,
     ):
         """
         Args:
@@ -43,12 +44,12 @@ class CannyEdgeDetector(nn.Module):
         """
         super().__init__()
 
-        # print params
-        print(
-            f"CannyEdgeDetector initialized with low_threshold={low_threshold}, "
-            + f"high_threshold={high_threshold}, hysteresis={hysteresis}, "
-            + f"kernel_size={kernel_size}, sigma={sigma}, device={device}"
-        )
+        if verbose:
+            print(
+                f"CannyEdgeDetector initialized with low_threshold={low_threshold}, "
+                + f"high_threshold={high_threshold}, hysteresis={hysteresis}, "
+                + f"kernel_size={kernel_size}, sigma={sigma}, device={device}"
+            )
 
         self.device = torch.device(device)
 
