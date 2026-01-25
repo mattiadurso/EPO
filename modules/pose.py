@@ -138,7 +138,7 @@ class PoseModule(BaseModule):
                         "params": [self.t_offset],
                         "lr": mlp_lr,
                         "name": "t_offset",
-                        "weight_decay": 0.1,  # (more aggressive) L2 penalty
+                        "weight_decay": 0.1,  # more aggressive decay
                         "eps": 1e-10,
                     },
                 ]
