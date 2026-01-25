@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import pypose as pp
-import kornia.geometry.conversions as kgc  # maybe I can remove kornia
+
+# import kornia.geometry.conversions as kgc  # maybe I can remove kornia
 from modules.mlp import PoseRefinementMLP
 from modules.base_module import BaseModule
 
@@ -67,11 +68,13 @@ class PoseModule(BaseModule):
         num_cams = len(image_id_map)
 
         # --- Rotation Prep (Matrix -> Quat) ---
-        # Kornia returns (w, x, y, z)
-        q_init = kgc.rotation_matrix_to_quaternion(R)
+        # # Kornia returns (w, x, y, z)
+        # q_init = kgc.rotation_matrix_to_quaternion(R)
 
-        # PyPose expects (x, y, z, w) (scalar last). We roll -1 to move w from index 0 to index 3
-        q_init = torch.roll(q_init, shifts=-1, dims=1)
+        # # PyPose expects (x, y, z, w) (scalar last). We roll -1 to move w from index 0 to index 3
+        # q_init = torch.roll(q_init, shifts=-1, dims=1)
+
+        q_init = pp.mat2SO3(R).tensor()  # Returns (x,y,z,w) directly
 
         # Store as Raw Parameter (requires normalization on usage)
         self.q_param = nn.Parameter(
@@ -83,7 +86,7 @@ class PoseModule(BaseModule):
         t_init = t.reshape(num_cams, 3).to(self.device, dtype=self.dtype)
         self.t_mean = t_init.mean(dim=0, keepdim=True)
         dist = torch.norm(t_init - self.t_mean, dim=1)
-        self.t_scale = torch.mean(dist)
+        self.t_scale = torch.clamp(torch.mean(dist), min=1e-10)
         t_init = (t_init - self.t_mean) / self.t_scale
 
         # Store as Raw Parameter
@@ -156,35 +159,6 @@ class PoseModule(BaseModule):
                 ],
             )
 
-    # def reduce_lr(self, factor=0.1):
-    #     """Reduce learning rate by a factor."""
-    #     if hasattr(self, "optimizer"):
-    #         for param_group in self.optimizer.param_groups:
-    #             param_group["lr"] *= factor
-
-    #     if hasattr(self, "scheduler"):
-    #         # 1. Handle ReduceLROnPlateau (used when use_mlp=False)
-    #         if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-    #             # Update min_lrs so we don't hit the floor immediately after reducing
-    #             if isinstance(self.scheduler.min_lrs, list):
-    #                 self.scheduler.min_lrs = [
-    #                     lr * factor for lr in self.scheduler.min_lrs
-    #                 ]
-    #             else:
-    #                 self.scheduler.min_lrs *= factor
-
-    #         # 2. Handle Standard Schedulers (used when use_mlp=True)
-    #         # We need to update base_lrs so the schedule curve scales down
-    #         def update_base_lrs(scheduler):
-    #             if hasattr(scheduler, "base_lrs"):
-    #                 scheduler.base_lrs = [lr * factor for lr in scheduler.base_lrs]
-
-    #         if isinstance(self.scheduler, torch.optim.lr_scheduler.SequentialLR):
-    #             for sub in self.scheduler._schedulers:
-    #                 update_base_lrs(sub)
-    #         else:
-    #             update_base_lrs(self.scheduler)
-
     def get_rotation_matrix(self, indices) -> torch.Tensor:
         """
         Returns (B, 3, 3) Rotation Matrix for the requested images.
@@ -193,7 +167,7 @@ class PoseModule(BaseModule):
         q_batch = self.q_param[indices]
 
         # 1. Normalize all quaternions (important for stability)
-        q_norm = q_batch / torch.norm(q_batch, dim=1, keepdim=True)
+        q_norm = q_batch / (torch.norm(q_batch, dim=1, keepdim=True) + 1e-10)
 
         # 3. Convert to Matrix via PyPose
         return pp.SO3(q_norm).matrix()
@@ -221,7 +195,7 @@ class PoseModule(BaseModule):
         R = self.get_rotation_matrix(indices)  # (B, 3, 3)
         t = self.get_translation(indices)  # (B, 3)
         R, t = self.apply_mlp(R, t, indices)
-        t = self.t_scale * t + self.t_mean  # Rescale to physical units
+        t = t * self.t_scale + self.t_mean  # Rescale to physical units
 
         # Build 4x4 Matrix
         P = torch.eye(4, device=self.device, dtype=R.dtype).repeat(batch_size, 1, 1)
