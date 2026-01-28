@@ -309,6 +309,9 @@ class ReconstructAndVizModule:
             "convergence_tol_pose": self.convergence_tol_pose,
             "convergence_tol_depth": self.convergence_tol_depth,
         }
+        if hasattr(self, "mre"):
+            training_logs["mean_reproj_error"] = self.mre.mean().item()
+            training_logs["median_reproj_error"] = np.median(self.mre).item()
         # sort keys alphabetically
         training_logs = dict(sorted(training_logs.items()))
         training_logs_path = os.path.join(output_path, "training_logs.json")

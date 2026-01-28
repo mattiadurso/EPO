@@ -3,6 +3,7 @@ import torch
 import pycolmap
 import numpy as np
 import rerun as rr
+import rerun.blueprint as rrb
 
 
 def get_frustum_strips(scale=0.15, w=1.0, h=1.0):
@@ -61,7 +62,7 @@ def log_reconstruction_rerun(
         strips = get_frustum_strips(scale=0.15, w=cam.width, h=cam.height)
         rr.log(
             f"world/{entity}/{img.name}/cam",
-            rr.LineStrips3D(strips, colors=camera_color, radii=0.002),
+            rr.LineStrips3D(strips, colors=camera_color, radii=0.005),
             static=static_cameras,
         )
 
@@ -84,10 +85,9 @@ def log_reconstruction_rerun(
 if __name__ == "__main__":
 
     dataset = "mipnerf360"
-    scene = "flowers"
-    sparse = "sparse" if "terrasky3D" in dataset else "sparse_150"
+    scene = "bicycle"
 
-    gt_path = f"/home/mattia/Desktop/datasets/{dataset}/{scene}/{sparse}"
+    gt_path = f"/home/mattia/Desktop/datasets/{dataset}/{scene}/sparse_150"
     scene_path = f"optimized_reconstruction_GD/{scene}"
     ba_path = f"benchmarks/vggt_ba/{dataset}/{scene}/sparse"
     ba_ref_path = f"benchmarks/vggt_ba_ref/{dataset}/{scene}/sparse"
@@ -99,11 +99,21 @@ if __name__ == "__main__":
         )
 
     rr.init("Feature-Less Optimization", spawn=True)
+    # 2. Define the Blueprint: Background color + No Grid
+    rr.send_blueprint(
+        rrb.Spatial3DView(
+            origin="world",
+            # Set background to your specific off-white
+            background=rrb.Background(kind="SolidColor", color=[251, 251, 255]),
+            # This turns off the grid plane visualizer
+            line_grid=rrb.LineGrid3D(visible=False),
+        ),
+    )
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
 
     # logs
-    log_reconstruction_rerun(gt_path, "gt", camera_color=[0, 255, 0], points3D=True)
+    log_reconstruction_rerun(gt_path, "gt", camera_color=[28, 186, 81], points3D=True)
 
-    log_reconstruction_rerun(scene_path, "opt", camera_color=[255, 0, 0])
-    log_reconstruction_rerun(ba_path, "ba", camera_color=[0, 0, 255])
-    log_reconstruction_rerun(ba_ref_path, "ba_ref", camera_color=[144, 213, 255])
+    log_reconstruction_rerun(scene_path, "opt", camera_color=[150, 3, 26])
+    log_reconstruction_rerun(ba_path, "ba", camera_color=[71, 168, 216])
+    log_reconstruction_rerun(ba_ref_path, "ba_ref", camera_color=[9, 73, 110])

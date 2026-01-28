@@ -78,9 +78,10 @@ class DepthModule(BaseModule):
 #         depth: torch.Tensor,
 #         lr: float = 5e-3,
 #         grad: bool = True,
+#         warmup_steps: int = 25,
+#         max_num_iterations: int = 1000,
 #         device="cuda",
 #         dtype=torch.float32,
-#         max_num_iterations: int = 1000,
 #     ):
 #         """Depth module to hold depth parameters"""
 #         super().__init__(
@@ -88,6 +89,7 @@ class DepthModule(BaseModule):
 #             device=device,
 #             dtype=dtype,
 #         )
+#         self.lr = float(lr)
 
 #         # ID Mappings
 #         self.image_to_tensor_idx = image_id_map
@@ -100,63 +102,10 @@ class DepthModule(BaseModule):
 #             depth.clone().detach().to(device=self.device, dtype=self.dtype),
 #             requires_grad=grad,
 #         )
-#         # self.depth = depth
 
-#         # alphas = torch.ones_like(depth)
-#         # betas = torch.zeros_like(depth)
-#         # params = torch.stack([alphas, betas], dim=-1)
-#         # self.params = nn.Parameter(
-#         #     params.clone().detach().to(device=self.device, dtype=self.dtype),
-#         #     requires_grad=grad,
-#         # )
-
-#         self.lr = float(lr)
-#         # self.lr_min = self.lr / 20
-
-#         # if grad:
-#         #     self.init_optimizer(lr=self.lr)
-#         #     self.init_scheduler(lr_reduce_factor=0.75, patience=3, min_lr=self.lr_min)
-
-#         self.optimizer = torch.optim.AdamW(
-#             [self.params],
-#             lr=self.lr,
-#             weight_decay=1e-2,
-#         )
-
-#         # --- Configuration ---
-#         warmup_steps = 25
-#         # 1. The Warmup Phase
-#         # Starts at lr * start_factor and linearly increases to lr over 'total_iters'
-#         warmup = torch.optim.lr_scheduler.LinearLR(
-#             self.optimizer,
-#             start_factor=0.01,  # Start at 1% of your defined LR
-#             total_iters=25,
-#         )
-
-#         # 2. The Decay Phase
-#         # Smoothly decreases from lr to min_lr
-#         decay = torch.optim.lr_scheduler.CosineAnnealingLR(
-#             self.optimizer,
-#             T_max=max_num_iterations - warmup_steps,  # Remaining steps
-#             eta_min=1e-6,
-#         )
-
-#         # 3. Combine them
-#         self.scheduler = torch.optim.lr_scheduler.SequentialLR(
-#             self.optimizer, schedulers=[warmup, decay], milestones=[warmup_steps]
-#         )
-
-#     def init_scheduler(self, lr_reduce_factor: float, patience: int, min_lr: float):
-#         """Initialize LR scheduler for the optimizer."""
-#         if not hasattr(self, "optimizer"):
-#             raise ValueError("Optimizer must be initialized before scheduler.")
-
-#         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-#             self.optimizer,
-#             factor=lr_reduce_factor,
-#             patience=patience,
-#             min_lr=min_lr,
-#         )
+#         if grad:
+#             self.init_optimizer(lr=self.lr)
+#             self.init_scheduler(warmup_steps, max_num_iterations)
 
 #     def get_parameters(self, ids):
 #         """Return depth parameters - ensures gradient flow"""

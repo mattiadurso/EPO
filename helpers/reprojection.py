@@ -359,9 +359,10 @@ def filter_viewgraph_by_reprojection_batched(
 
     num_pairs = len(viewgraph)
 
-    for batch_start in tqdm(
-        range(0, num_pairs, batch_size), desc="Filtering viewgraph"
-    ):
+    # for batch_start in tqdm(
+    #     range(0, num_pairs, batch_size), desc="Filtering viewgraph"
+    # ):
+    for batch_start in range(0, num_pairs, batch_size):
         batch_end = min(batch_start + batch_size, num_pairs)
         batch_pairs = viewgraph[batch_start:batch_end]
         current_batch_size = len(batch_pairs)
