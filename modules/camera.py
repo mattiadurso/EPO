@@ -3,6 +3,7 @@ import torch.nn as nn
 from modules.base_module import BaseModule
 
 
+# paramtric f
 class CameraModule(BaseModule):
     def __init__(
         self,
@@ -192,3 +193,198 @@ class CameraModule(BaseModule):
             s += f"  Camera {self.tensor_idx_to_image[i]}: Model={model}, Params={params.detach().cpu().tolist()}\n"
             count += 1
         return s
+
+
+# # explicit f
+# class CameraModule(BaseModule):
+#     def __init__(
+#         self,
+#         image_id_map: dict,
+#         k_models: list[str],
+#         k_params: torch.Tensor,
+#         lr: float = 1e-3,
+#         grad: bool = True,
+#         warmup_steps: int = 25,
+#         max_num_iterations: int = 1000,
+#         device: str = "cuda",
+#         dtype: torch.dtype = torch.float32,
+#     ):
+#         """Class storing camera intrinsics for multiple cameras and poses.
+#         Args:
+#             cam_id: dict mapping reconstruction camera ids (real world) to tensor indices (0..N)
+#             k_models: list of strings, camera model names per camera
+#             k_params: Nx4 tensor of camera parameters, fx, fy, cx, cy
+#             device: torch device
+#         Note:
+#             To make this module more readable, some variables and methods share between
+#             pose, camera and depth modules are in base_module.
+#         """
+#         super().__init__(image_id_map, device=device, dtype=dtype)
+#         self.max_num_iterations = max_num_iterations
+#         self.lr = float(lr)
+#         self.keys = list(self.image_to_tensor_idx.keys())
+
+#         # Define model ID mapping
+#         self.camera_model_name_to_id = {
+#             "PINHOLE": 0,
+#             "SIMPLE_PINHOLE": 1,
+#         }
+
+#         # --- Model Types ---
+#         self.k_models = k_models
+#         # Store model types as a Tensor for fast masking during forward pass
+#         model_ids_list = [self.camera_model_name_to_id[m] for m in k_models]
+#         self.register_buffer(
+#             "k_models_ids", torch.tensor(model_ids_list, device=self.device)
+#         )
+
+#         # --- Parameters ---
+#         k_params = k_params.clone().to(device=self.device, dtype=self.dtype)
+
+#         # Only transform focal lengths to log-space, keep cx, cy as-is
+#         k_params_transformed = k_params.clone()
+#         k_params_transformed[:, 0] = torch.log(k_params[:, 0] / 518)  # fx
+#         k_params_transformed[:, 1] = torch.log(
+#             k_params[:, 1] / 518
+#         )  # fy (or unused for SIMPLE_PINHOLE)
+#         # cx, cy remain unchanged at indices 2, 3 (or 1, 2 for SIMPLE_PINHOLE)
+
+#         self.k_params = k_params_transformed.clone().detach()
+
+#         self.params = nn.Parameter(
+#             k_params_transformed,
+#             requires_grad=grad,
+#         )
+
+#         if grad:
+#             self.init_optimizer(lr=self.lr)
+#             self.init_scheduler(warmup_steps, max_num_iterations)
+
+#         self.update_all_matrices()  # Pre-compute all intrinsic matrices
+
+#     def optimizer_and_scheduler_step(self, loss):
+#         """Perform optimizer step and update scheduler based on loss."""
+#         self.optimizer.step()
+#         if hasattr(self, "scheduler"):
+#             self.scheduler.step()
+
+#     def get_all_intrinsic_matrix(self):
+#         """Get all intrinsic matrices."""
+#         return self.keys, self.get_intrinsic_matrix(self.keys)
+
+#     def get_intrinsic_matrix(self, indices) -> torch.Tensor:
+#         """Construct K matrix from parameters on-the-fly. Handles mixed models."""
+
+#         # 1. Get the internal row indices for the requested cameras
+#         if isinstance(indices[0], str):
+#             indices = self.map_names_to_indices(indices)
+
+#         batch_size = indices.shape[0]
+
+#         # 2. Retrieve the model type for these specific cameras
+#         # Use standard indexing, k_models_ids is a buffer
+#         models_in_batch = self.k_models_ids[indices]
+
+#         # 3. Check if we can take a fast path (all cameras are the same type)
+#         if (models_in_batch == 0).all():
+#             return self._build_pinhole(indices, batch_size)
+
+#         elif (models_in_batch == 1).all():
+#             return self._build_simple_pinhole(indices, batch_size)
+
+#         # 4. Mixed Case: Vectorized Masking
+#         else:
+#             K = torch.zeros(
+#                 (batch_size, 3, 3), dtype=self.k_params.dtype, device=self.device
+#             )
+
+#             # Create masks
+#             mask_pinhole = models_in_batch == 0
+#             mask_simple = models_in_batch == 1
+
+#             # Process PINHOLE cameras
+#             if mask_pinhole.any():
+#                 # Filter indices relevant to pinhole
+#                 idx_pinhole = indices[mask_pinhole]
+#                 # Calculate and assign to the masked slice of K
+#                 K[mask_pinhole] = self._build_pinhole(idx_pinhole, idx_pinhole.shape[0])
+
+#             # Process SIMPLE_PINHOLE cameras
+#             if mask_simple.any():
+#                 idx_simple = indices[mask_simple]
+#                 K[mask_simple] = self._build_simple_pinhole(
+#                     idx_simple, idx_simple.shape[0]
+#                 )
+
+#             return K
+
+#     def _build_pinhole(
+#         self, tensor_indices: torch.Tensor, batch_size: int
+#     ) -> torch.Tensor:
+#         """Internal helper: Pinhole (fx, fy, cx, cy)"""
+#         params = self.params[tensor_indices]  # Shape (B, 4)
+
+#         fx, fy = params[:, 0], params[:, 1]
+#         cx, cy = params[:, 2], params[:, 3]
+
+#         K = torch.zeros((batch_size, 3, 3), dtype=params.dtype, device=self.device)
+#         K[:, 0, 0] = torch.exp(fx) * 518
+#         K[:, 1, 1] = torch.exp(fy) * 518
+#         K[:, 0, 2] = cx
+#         K[:, 1, 2] = cy
+#         K[:, 2, 2] = 1.0
+#         return K
+
+#     def _build_simple_pinhole(
+#         self, tensor_indices: torch.Tensor, batch_size: int
+#     ) -> torch.Tensor:
+#         """Internal helper: Simple Pinhole (f, cx, cy)"""
+#         params = self.params[tensor_indices]  # Shape (B, 4)
+
+#         f = params[:, 0]
+#         cx = params[:, 1]
+#         cy = params[:, 2]
+
+#         K = torch.zeros((batch_size, 3, 3), dtype=params.dtype, device=self.device)
+#         K[:, 0, 0] = torch.exp(f) * 518
+#         K[:, 1, 1] = torch.exp(f) * 518
+#         K[:, 0, 2] = cx
+#         K[:, 1, 2] = cy
+#         K[:, 2, 2] = 1.0
+#         return K
+
+#     def get_camera_parameters(self, indices) -> torch.Tensor:
+#         """Get camera parameters for given camera IDs."""
+#         if isinstance(indices[0], str):
+#             indices = self.map_names_to_indices(indices)
+
+#         k_model = self.k_models[indices]
+#         k_params = self.params[indices].clone()  # Clone to avoid modifying params
+
+#         if k_model[0] == "SIMPLE_PINHOLE":
+#             k_params[:, 0] = torch.exp(k_params[:, 0]) * 518  # f
+
+#         elif k_model[0] == "PINHOLE":
+#             k_params[:, 0] = torch.exp(k_params[:, 0]) * 518  # fx
+#             k_params[:, 1] = torch.exp(k_params[:, 1]) * 518  # fy
+
+#         return k_model, k_params.squeeze()
+
+#     def update_all_matrices(self):
+#         """Init/Update all intrinsic matrices for all cameras and store them internally."""
+#         all_ids = self.keys
+#         self.cameras = self.get_intrinsic_matrix(all_ids)
+#         self.cameras_inv = torch.linalg.inv(self.cameras)
+
+#     def __repr__(self):
+#         s = "CameraModel:\n"
+#         # Only print first 5 to avoid clutter if there are thousands of cams
+#         limit = 5
+#         count = 0
+#         for i, (model, params) in enumerate(zip(self.k_models, self.k_params)):
+#             if count >= limit:
+#                 s += f"  ... and {len(self.k_models) - limit} more.\n"
+#                 break
+#             s += f"  Camera {self.tensor_idx_to_image[i]}: Model={model}, Params={params.detach().cpu().tolist()}\n"
+#             count += 1
+#         return s

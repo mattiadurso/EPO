@@ -245,6 +245,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         )  # image name includes subfolder if any
         # loads image, coords, scale, hw into self.images[image_name]
         self._load_and_preprocess_images()
+        self.num_images = len(self.images)
         self.timings["load_images"] = time.time() - s_time
 
         ## Load poses and intrinsics
@@ -274,6 +275,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         s_time = time.time()
         # compute viewgraph
         self._compute_viewgraph(type=self.matcher_type)
+        self.len_viewgraph = len(self.viewgraph)
         self.adj_list = {}
         for i, j in self.viewgraph:
             self.adj_list.setdefault(i, []).append(j)
@@ -431,12 +433,13 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             opt (str, optional): Path to the optimization output. Default is "optimized_reconstruction_GD/_current_test".
 
         """
-        time_start = time.time()
         # assuming to to do not changes these or move to init
         self.window_pose = window_pose
         self.window_depth = window_depth
         self.convergence_tol_pose = convergence_tol_pose
         self.convergence_tol_depth = convergence_tol_depth
+        self.convergence_depth = not early_stop
+        time_start = time.time()
 
         if use_rerun:
             rr.init("Feature-Less Optimization", spawn=spawn_rerun)
@@ -473,11 +476,11 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                     )
 
         if self.verbose:
-            num_batches = math.ceil(len(self.viewgraph) / batch_size)
+            num_batches = math.ceil(self.len_viewgraph / batch_size)
             num_batches = num_batches if drop_last else num_batches + 1
-            total_points = self.max_edges * len(self.viewgraph)
+            total_points = self.max_edges * self.len_viewgraph
             print(
-                f"Processing {len(self.viewgraph):,} pairs with batch size {batch_size:,} ({num_batches} batches per iteration).",
+                f"Processing {self.len_viewgraph:,} pairs with batch size {batch_size:,} ({num_batches} batches per iteration).",
                 f"Using {self.images[list(self.images.keys())[0]]['edges_padded'].numel()//2:,} edges per image.",  # // due to x and y
                 "\n",
                 f"Total points to process per iteration: {total_points:,}.",
@@ -620,15 +623,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                             time.time() - time_start
                         )
 
-            elif self.convergence_pose:
-                if (
-                    self.check_convergence(
-                        self.changes["max"],
-                        window=window_depth,
-                        tol=convergence_tol_depth,
-                    )
-                    and early_stop
-                ):  # else keep optimizing depth until max_iterations
+            elif self.convergence_pose and early_stop:
+                if self.check_convergence(
+                    self.changes["max"],
+                    window=window_depth,
+                    tol=convergence_tol_depth,
+                ):
                     self.convergence_depth = True
                     self.timings["depth_convergence_time"] = time.time() - time_start
 
@@ -652,6 +652,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.to_colmap(opt, save_points=False, verbose=False)
             self.compute_auc(opt, gt_path, step)
 
+        self.compute_mre()
         self.print_summary() if self.verbose else print("=" * 70, end="\n\n")
 
     ### Forward and backward helpers ###
@@ -784,12 +785,15 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         points_3D = torch.cat(points_3D_list, dim=0)
 
         # Store points_3D in Edges3DModule
-        self.edges_3D = BaseModule(
-            image_id_map=self.image_id_map,
-            parameters=points_3D,
-            device=self.device,
-            dtype=self.dtype,
-        )
+        if not hasattr(self, "edges_3D"):
+            self.edges_3D = BaseModule(
+                image_id_map=self.image_id_map,
+                parameters=points_3D,
+                device=self.device,
+                dtype=self.dtype,
+            )
+        else:
+            self.edges_3D.params = points_3D
 
     def create_batched_inputs(self, sampled_viewgraph):
         """Prepare batched inputs for the batched optimization step given a list of pairs from the viewgraph."""
@@ -1189,7 +1193,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
     ### Edges
     def _extract_edges(self, confidence_threshold=0.2):
-        for image_name in tqdm(self.images.keys(), desc=f"Extracting edges"):
+        # for image_name in tqdm(self.images.keys(), desc=f"Extracting edges"):
+        for image_name in self.images.keys():
             # Extract edge map
             img_tensor = self.images[image_name]["image"].unsqueeze(0)
             edges_map = (
@@ -1307,7 +1312,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
     @torch.no_grad()
     def _compute_distance_fields(self):
         dt_fields_shapes = []
-        for image_name in tqdm(self.images.keys(), desc="Computing distance fields"):
+        # for image_name in tqdm(self.images.keys(), desc="Computing distance fields"):
+        for image_name in self.images.keys():
             edges_map = self.images[image_name]["edges_map"]
             dt_field = compute_distance_field_cv2(
                 edges_map,
@@ -1336,6 +1342,40 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
         gc.collect()
         torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def compute_mre(self):
+        """Measuring how far each image_i's edges are projected to the closest edges in image_j"""
+        # Update geometric modules
+        self.poses.update_all_matrices()
+        self.intrinsics.update_all_matrices()
+
+        # Unproject point to world coordinates
+        self.unproject_edges_to_3D()
+
+        # Compute residuals
+        residuals, sampled_viewgraphs = self.compute_forward_step(
+            self.viewgraph_ids,
+            batch_size=10_000,
+            drop_last=False,
+            residuals_chunk_size=10_000,
+        )
+
+        sampled_viewgraphs = sampled_viewgraphs[0][:, :2].tolist()
+
+        for _ in range(len(sampled_viewgraphs)):
+            i, j = sampled_viewgraphs[_]
+            sampled_viewgraphs[_] = [
+                self.poses.tensor_idx_to_image[i],
+                self.poses.tensor_idx_to_image[j],
+                residuals[_].item(),
+            ]
+        sampled_viewgraphs = np.array(sampled_viewgraphs)
+        sampled_viewgraphs[:, 2] = sampled_viewgraphs[:, 2].astype(np.float32)
+
+        self.mre = sampled_viewgraphs[:, 2].astype(np.float32)
+
+        return sampled_viewgraphs
 
 
 if __name__ == "__main__":

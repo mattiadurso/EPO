@@ -6,14 +6,11 @@ import os
 import glob
 import subprocess
 
-import sys
 
-sys.path.append("/home/mattia/Desktop/Repos/posebench/benchmarks_3D")
-from benchmark_pose import eval_colmap_model_all_scenes, eval_colmap_model
+ds = "mipnerf360"  # terrasky3D, mipnerf360, scannetpp
+paths = sorted(glob.glob(f"benchmarks/vggt_ba/{ds}/*/sparse"))
 
-ds = "scannetpp"  # terrasky3D, mipnerf360, scannetpp
-paths = sorted(glob.glob(f"benchmarks/vggt_ba_ref/{ds}/*/sparse"))
-
+# paths = [p for p in paths if "treehill" not in p]
 
 for path in paths:
     # if not ("graz_church" in path or "graz_university" in path):
@@ -32,11 +29,6 @@ for path in paths:
         for line in raw_output.strip().split("\n")
     }
 
-    # out = eval_colmap_model(
-    #     path, "/home/mattia/Desktop/datasets/mipnerf360/bicycle/sparse_150"
-    # )
-    # print(out)
-
     # Run Bundle Adjustment to convergence, pycolmap is bounded to 100 iterations
     cmd = [
         "colmap",
@@ -51,11 +43,6 @@ for path in paths:
         "1",
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
-
-    # out = eval_colmap_model(
-    #     f"{path}_ba", "/home/mattia/Desktop/datasets/mipnerf360/bicycle/sparse_150"
-    # )
-    # print(out)
 
     # Now your output is in a variable
     ba_output = result.stderr

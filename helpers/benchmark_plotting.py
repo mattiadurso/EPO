@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -10,9 +11,14 @@ sys.path.append("/home/mattia/Desktop/Repos/posebench/benchmarks_3D")
 from benchmark_pose import eval_colmap_model_all_scenes, eval_colmap_model
 
 
-def read_results(dataset, target_folder, models, thr=5, round_to=1, remove=[]):
+def read_results(
+    dataset, target_folder, models, thr=5, round_to=1, remove=[], full=False
+):
     base_target = f"/home/mattia/Desktop/datasets/{dataset}"
     base_repo = "/home/mattia/Desktop/Repos/batchsfm/benchmarks"
+    base_repo = (
+        "/home/mattia/Desktop/Repos/batchsfm/benchmarks_full" if full else base_repo
+    )
     scenes = os.listdir(base_target)
 
     # Read results
@@ -41,7 +47,8 @@ def read_results(dataset, target_folder, models, thr=5, round_to=1, remove=[]):
         if model not in total_timings:
             total_timings[f"{model}"] = {}
         for scene in scenes:
-            recon_path = f"benchmarks/{model}/{dataset}/{scene}"
+            benchmarks = "benchmarks_full/" if full else "benchmarks/"
+            recon_path = f"{benchmarks}{model}/{dataset}/{scene}"
             if not os.path.exists(recon_path):
                 continue
             if scene not in total_timings[f"{model}"]:
@@ -231,3 +238,240 @@ def plot_auc5_with_time(df, dataset, models, thr, ignore_time=False):
     # Save the figure instead of showing it
     # plt.savefig("auc5_with_time_plot.png")
     plt.show()
+
+
+def read_results_nvs(
+    nvs_results_path="/home/mattia/HDD_Fast/gaussian-splatting-results/data",
+    exclude_metrics=("SSIM",),
+    column_order=None,
+):
+    """
+    Args:
+        round_to (int): Decimal places for rounding.
+        exclude_metrics (tuple): Metrics to exclude from results.
+        column_order (list): List of method names to set column order.
+                           If None, uses default sorting (GT first, then alphabetical).
+    """
+    # nvs_results_path = "/home/mattia/Desktop/Repos/gaussian-splatting/data"
+    data = []
+
+    if not os.path.exists(nvs_results_path):
+        return pd.DataFrame()
+
+    methods = os.listdir(nvs_results_path)
+
+    for method in methods:
+        method_path = os.path.join(nvs_results_path, method)
+        if not os.path.isdir(method_path):
+            continue
+
+        for scene in os.listdir(method_path):
+            res_json = os.path.join(method_path, scene, "3dgs/results.json")
+            if os.path.exists(res_json):
+                with open(res_json, "r") as f:
+                    res = json.load(f)
+
+                # Capitalize scene name here
+                formatted_scene = scene.replace("_", " ").title()
+
+                metrics = res.get("ours_30000", {})
+                entry = {"method": method, "scene": formatted_scene, **metrics}
+                data.append(entry)
+
+    df = pd.DataFrame(data)
+    if exclude_metrics:
+        df.drop(columns=list(exclude_metrics), errors="ignore", inplace=True)
+
+    # Pivot and swap levels to (Method, Metric)
+    metric_cols = [c for c in df.columns if c not in ["method", "scene"]]
+    df = df.pivot(index="scene", columns="method", values=metric_cols)
+    df.columns = df.columns.swaplevel(0, 1)
+
+    # Custom Sort: Use provided order or default (GT first, then alphabetical)
+    if column_order is None:
+
+        def sort_key(col_tuple):
+            method, metric = col_tuple
+            return (0 if method == "GT" else 1, method, metric)
+
+        df = df[sorted(df.columns, key=sort_key)]
+    else:
+        # Reorder columns based on provided column_order
+        def sort_key(col_tuple):
+            method, metric = col_tuple
+            try:
+                method_idx = column_order.index(method)
+            except ValueError:
+                method_idx = len(column_order)
+            return (method_idx, metric)
+
+        df = df[sorted(df.columns, key=sort_key)]
+
+    df.sort_index(axis=0, inplace=True)
+
+    # Append Mean row
+    df_final = pd.concat([df, pd.DataFrame(df.mean(), columns=["Mean"]).T])
+    df_final.index.name = "Scene"
+
+    return df_final
+
+
+import pandas as pd
+import numpy as np
+
+
+def latexfy(
+    df, caption="Comparison of Results", label="tab:results", time_round=1, auc_round=1
+):
+    """
+    Generates a LaTeX table from the dataframe output of read_results.
+
+    Args:
+        df (pd.DataFrame): Output from read_results.
+        caption (str): Table caption.
+        label (str): Table label.
+        time_round (int): Number of decimal places for Time columns (default 1).
+        auc_round (int): Number of decimal places for AUC columns (default 3).
+
+    Returns:
+        str: A string containing the formatted LaTeX table.
+    """
+
+    # 1. Identify Model Pairs (AUC col + Time col)
+    auc_cols = [c for c in df.columns if "auc" in c]
+
+    try:
+        thr = auc_cols[0].split("_")[0].split("@")[1]
+    except IndexError:
+        thr = "?"
+
+    model_pairs = []
+
+    for auc_col in auc_cols:
+        prefix = f"auc@{thr}_"
+        if not auc_col.startswith(prefix):
+            continue
+
+        raw_model_suffix = auc_col[len(prefix) :]
+        time_col = raw_model_suffix.replace("_", "+")
+
+        if time_col in df.columns:
+            display_name = time_col.upper()
+            model_pairs.append({"name": display_name, "auc": auc_col, "time": time_col})
+
+    # 2. Setup LaTeX Header
+    n_models = len(model_pairs)
+    col_setup = "l " + "cc " * n_models
+
+    latex = []
+    latex.append(r"\begin{table}[htbp]")
+    latex.append(r"    \centering")
+    # latex.append(r"    % \setlength{\tabcolsep}{4pt}")
+    latex.append(r"    \resizebox{\linewidth}{!}{")
+    latex.append(f"        \\begin{{tabular}}{{{col_setup}}}")
+    latex.append(r"            \toprule")
+
+    # Row 1: Model Names
+    header_names = ["            "]
+    for m in model_pairs:
+        header_names.append(f"& \\multicolumn{{2}}{{c}}{{\\textbf{{{m['name']}}}}}")
+    latex.append(" ".join(header_names) + " \\\\")
+
+    # Row 2: CMidrules
+    cmids = []
+    for i in range(n_models):
+        start = 2 + (i * 2)
+        end = start + 1
+        cmids.append(f"\\cmidrule(lr){{{start}-{end}}}")
+    latex.append("            " + " ".join(cmids))
+
+    # Row 3: Metrics
+    metrics_row = [r"            \textbf{Scene}"]
+    for _ in model_pairs:
+        metrics_row.append(f"& AUC@{thr} $\\uparrow$ & Time $\\downarrow$")
+    latex.append(" ".join(metrics_row) + " \\\\")
+    latex.append(r"            \midrule")
+
+    # 3. Data Rows
+    indices = [i for i in df.index if str(i).lower() != "mean"]
+
+    for idx in indices:
+        # Format scene name: remove underscores and capitalize
+        formatted_idx = str(idx).replace("_", " ").title()
+        row_str = [f"            {formatted_idx}"]
+
+        # --- Logic Change: Calculate 'Best' only among NON-VGGT models ---
+        comparison_pairs = [m for m in model_pairs if m["name"] != "VGGT"]
+
+        row_auc_values = [df.loc[idx, m["auc"]] for m in comparison_pairs]
+        row_time_values = [df.loc[idx, m["time"]] for m in comparison_pairs]
+
+        valid_auc = [v for v in row_auc_values if pd.notnull(v)]
+        valid_time = [v for v in row_time_values if pd.notnull(v)]
+
+        best_auc = max(valid_auc) if valid_auc else -1
+        best_time = min(valid_time) if valid_time else float("inf")
+        # -----------------------------------------------------------------
+
+        for m in model_pairs:
+            val_auc = df.loc[idx, m["auc"]]
+            val_time = df.loc[idx, m["time"]]
+
+            # Helper to format and optionally bold
+            def format_cell(val, best_val, precision, is_vggt):
+                if pd.isnull(val):
+                    return "-"
+                txt = f"{val:.{precision}f}"
+                # Only bold if it matches the best value AND is not VGGT
+                if not is_vggt and val == best_val:
+                    return f"\\textbf{{{txt}}}"
+                return txt
+
+            is_vggt = m["name"] == "VGGT"
+
+            str_auc = format_cell(val_auc, best_auc, auc_round, is_vggt)
+            str_time = format_cell(val_time, best_time, time_round, is_vggt)
+
+            row_str.append(f"& {str_auc} & {str_time}")
+
+        latex.append(" ".join(row_str) + " \\\\")
+
+    # 4. Mean Row
+    if "mean" in df.index:
+        latex.append(r"            \midrule")
+        row_str = [r"            \textbf{Mean}"]
+
+        for m in model_pairs:
+            val_auc = df.loc["mean", m["auc"]]
+            val_time = df.loc["mean", m["time"]]
+
+            # Logic: Bold all means EXCEPT VGGT (based on your previous example style)
+            is_vggt = m["name"] == "VGGT"
+
+            if pd.notnull(val_auc):
+                txt_auc = f"{val_auc:.{auc_round}f}"
+                if not is_vggt:
+                    txt_auc = f"\\textbf{{{txt_auc}}}"
+            else:
+                txt_auc = "-"
+
+            if pd.notnull(val_time):
+                txt_time = f"{val_time:.{time_round}f}"
+                if not is_vggt:
+                    txt_time = f"\\textbf{{{txt_time}}}"
+            else:
+                txt_time = "-"
+
+            row_str.append(f"& {txt_auc} & {txt_time}")
+
+        latex.append(" ".join(row_str) + " \\\\")
+
+    # 5. Footer
+    latex.append(r"            \bottomrule")
+    latex.append(r"        \end{tabular}")
+    latex.append(r"    }")
+    latex.append(f"    \\caption{{{caption}}}")
+    latex.append(f"    \\label{{{label}}}")
+    latex.append(r"\end{table}")
+
+    return "\n".join(latex)
