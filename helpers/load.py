@@ -167,9 +167,10 @@ def load_and_preprocess_images(
         ]
 
         # Collect results as they complete
-        for future in tqdm(
-            as_completed(futures), total=len(futures), desc="Loading images"
-        ):
+        # for future in tqdm(
+        #     as_completed(futures), total=len(futures), desc="Loading images"
+        # ):
+        for future in as_completed(futures):
             image_name, img_tensor, coords, scale = future.result()
             images_dict[image_name] = {
                 "image": img_tensor.to(device, dtype=dtype),
@@ -332,9 +333,10 @@ def load_and_preprocess_depths(
         ]
 
         # Collect results as they complete
-        for future in tqdm(
-            as_completed(futures), total=len(futures), desc="Loading depth maps"
-        ):
+        # for future in tqdm(
+        #     as_completed(futures), total=len(futures), desc="Loading depth maps"
+        # ):
+        for future in as_completed(futures):
             try:
                 image_name, depth_tensor, confidence_tensor = future.result()
             except Exception as e:

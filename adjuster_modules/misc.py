@@ -154,8 +154,10 @@ class MiscModule:
                 f"{perc_improvement:>{perc_width}}%"
             )
             steps = len(self.loss_list)
-            conv = " (converged)" if getattr(self, "convergence", False) else ""
-            print(f"{f'Total steps{conv}:':<{key_width}}{steps:>{val_width}d}")
+            print(
+                f"{'Mean (Edges) Reproj. Error:':<{key_width}}{self.mre.mean():>{val_width}.3f}"
+            )
+            print(f"{f'Total steps:':<{key_width}}{steps:>{val_width}d}")
 
         print("=" * w)
 

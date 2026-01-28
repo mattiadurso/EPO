@@ -120,7 +120,7 @@ def unproject_2D_to_world(
 
 def from_homogeneous(points: Tensor) -> Tensor:
     """Converts homogeneous coordinates to 2D points."""
-    eps = 1e-8
+    eps = 1e-10
     z_vec = points[..., -1:]
     # set the results of division by zero/near-zero to 1.0
     # follow the convention of opencv:
