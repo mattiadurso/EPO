@@ -31,7 +31,7 @@ def read_results(
             input_folder="sparse",
             return_df=True,
             thrs=[thr],
-            round_to=round_to,
+            round_to=8,
             verbose=False,
         )
 
@@ -75,7 +75,7 @@ def read_results(
     for rem in remove:
         df.drop(rem, inplace=True, errors="ignore")
 
-    df.loc["mean"] = df.mean()
+    df.loc["mean"] = df.mean(numeric_only=True)
     df = df.round(round_to)
 
     # clean up cell prints
@@ -287,25 +287,38 @@ def read_results_nvs(
     df = df.pivot(index="scene", columns="method", values=metric_cols)
     df.columns = df.columns.swaplevel(0, 1)
 
-    # Custom Sort: Use provided order or default (GT first, then alphabetical)
+    # Get unique methods and metrics
+    unique_methods = df.columns.get_level_values(0).unique().tolist()
+    unique_metrics = df.columns.get_level_values(1).unique().tolist()
+
+    # Determine method order
     if column_order is None:
-
-        def sort_key(col_tuple):
-            method, metric = col_tuple
-            return (0 if method == "GT" else 1, method, metric)
-
-        df = df[sorted(df.columns, key=sort_key)]
+        # Default: GT first, then alphabetical
+        if "GT" in unique_methods:
+            ordered_methods = ["GT"] + sorted([m for m in unique_methods if m != "GT"])
+        else:
+            ordered_methods = sorted(unique_methods)
     else:
-        # Reorder columns based on provided column_order
-        def sort_key(col_tuple):
-            method, metric = col_tuple
-            try:
-                method_idx = column_order.index(method)
-            except ValueError:
-                method_idx = len(column_order)
-            return (method_idx, metric)
+        # Use provided order, append any missing methods at the end
+        ordered_methods = [m for m in column_order if m in unique_methods]
+        remaining = [m for m in unique_methods if m not in column_order]
+        ordered_methods.extend(sorted(remaining))
 
-        df = df[sorted(df.columns, key=sort_key)]
+    # Custom metric order: PSNR, SSIM, LPIPS
+    metric_order = ["PSNR", "SSIM", "LPIPS"]
+    ordered_metrics = [m for m in metric_order if m in unique_metrics]
+    # Append any remaining metrics not in the predefined order
+    ordered_metrics.extend([m for m in unique_metrics if m not in metric_order])
+
+    # Build new column order: for each method, include all metrics
+    new_columns = []
+    for method in ordered_methods:
+        for metric in ordered_metrics:
+            if (method, metric) in df.columns:
+                new_columns.append((method, metric))
+
+    # Reindex with the new column order
+    df = df[new_columns]
 
     df.sort_index(axis=0, inplace=True)
 
