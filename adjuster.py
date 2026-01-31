@@ -54,6 +54,7 @@ from helpers.reprojection_compiled import (
 )
 from helpers.frustum import build_view_graph_from_frustums
 from modules import *
+from modules.stopping_criterion import evaluate_pose_changes
 from adjuster_modules import *
 
 import sys
@@ -61,7 +62,9 @@ import sys
 sys.path.append("/home/mattia/Desktop/Repos/posebench/benchmarks_3D")
 from benchmark_pose import eval_colmap_model
 
-from modules.stopping_criterion import evaluate_pose_changes, evaluate_depth_changes
+
+# sys.path.append("/home/mattia/HDD_Fast/dinov3")
+# from dinov3_wrapper import DINOv3Wrapper
 
 
 class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
@@ -445,7 +448,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.convergence_tol_pose = convergence_tol_pose
         self.convergence_tol_depth = convergence_tol_depth
         self.convergence_tol_loss = convergence_tol_loss
-        self.convergence_second = not early_stop
+        self.convergence_second = True if early_stop == "none" else False
+
         time_start = time.time()
 
         if use_rerun:
@@ -613,8 +617,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
             if not self.convergence_first:
                 convergence_first = self.check_convergence(
-                    self.changes["max"],
+                    list_of_changes=self.changes["max"],
                     window=window_pose,
+                    early_stop="pose",
                     tol=convergence_tol_pose,
                 )
                 if convergence_first:
@@ -633,8 +638,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             elif self.convergence_first:
                 if early_stop == "pose":
                     if self.check_convergence(
-                        self.changes["max"],
+                        list_of_changes=self.changes["max"],
                         window=window_depth,
+                        early_stop="pose",
                         tol=convergence_tol_depth,
                     ):
                         self.convergence_second = True
@@ -642,7 +648,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
                 elif early_stop == "loss":
                     if self.check_convergence(
-                        self.loss_list,
+                        list_of_changes=self.loss_list,
                         window=window_loss,
                         early_stop="loss",
                         tol=convergence_tol_loss,
@@ -682,7 +688,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.print_summary() if self.verbose else print("=" * 70, end="\n\n")
 
     ### Forward and backward helpers ###
-    def check_convergence(self, list_of_changes, early_stop="pose", window=25, tol=0.5):
+    def check_convergence(self, list_of_changes, early_stop, window, tol):
         """
         Evaluate convergence based on pose changes: max(delta_r, delta_t).
         Stop when smoothed max change is below tol for 'window' consecutive steps.
@@ -747,7 +753,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         ):
             self.poses.optimizer_and_scheduler_step()
 
-        if self.grad_z is True:  # self.convergence_first is True:
+        if self.grad_z is True and self.convergence_first is True:
             # backprop on this without first stabilizing the mlp leads to bad stuff
             self.sampled_depth.optimizer_and_scheduler_step()
 
