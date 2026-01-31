@@ -64,21 +64,21 @@ for dataset in datasets:
             reconstruction_path=reconstruction_path,
             images_path=images_path,
             depths_path=depths_path,
-            grad_q=True,
-            grad_t=True,
-            grad_t_offset=False,
+            # grad_q=True,
+            # grad_t=True,
+            grad_t_offset=True,
             grad_k=True,
             grad_z=True,
             use_mlp_pose_refinement=True,
-            q_lr=1e-4,
-            t_lr=1e-3,
+            # q_lr=1e-4,
+            # t_lr=1e-3,
             k_lr=1e-3,
             z_lr=3e-3,
             mlp_pose_lr=3e-3,
             max_edges_points=12_288,
             max_viewgraph_pairs=4_096,
             single_camera_per_folder=True,
-            max_num_iterations=100,
+            max_num_iterations=2048,
             viz=True,
             verbose=False,
         )
@@ -90,7 +90,7 @@ for dataset in datasets:
             convergence_tol_loss=5e-5,  # relative change %
             window_loss=50,
             # gt_path=gt_path,
-            early_stop="none",  # to stop after second pose convergence
+            early_stop="pose",  # to stop after second pose convergence
         )
 
         adjuster.to_colmap(
