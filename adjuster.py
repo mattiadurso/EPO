@@ -385,8 +385,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.convergence = False
         self.blacklist = set()
         self.changes = {"q": [], "t": [], "max": [], "steps": [], "z": []}
-        self.convergence_pose = False
-        self.convergence_depth = False
+        self.convergence_first = False
+        self.convergence_second = False
+        self.convergence_loss = False
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -397,10 +398,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         residuals_chunk_size=2048,
         quantile=0.95,
         window_pose=25,
-        window_depth=25,
+        window_depth=50,
+        window_loss=100,
         convergence_tol_pose=0.5,  # degrees
         convergence_tol_depth=0.1,  # relative change %
-        early_stop=True,
+        convergence_tol_loss=5e-5,  # relative change %
+        early_stop="pose",
         drop_last=False,
         debug=False,
         gt_path=None,
@@ -421,7 +424,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             window_depth (int, optional): Window size for depth convergence evaluation. Default is 25.
             convergence_tol_pose (float, optional): Tolerance for pose convergence. Default is 0.5.
             convergence_tol_depth (float, optional): Tolerance for depth convergence. Default is 0.1. Not used when early_stop is False.
-            early_stop (bool, optional): Whether to stop early if depth convergence is reached. Default is True.
+            early_stop (str, optional): Whether to stop early if depth convergence is reached. Default is 'pose'.
             drop_last (bool, optional): Whether to drop the last batch if smaller than batch_size. Default is False.
             debug (bool, optional): Whether to enable debug mode. Default is False.
             gt_path (str, optional): Path to the ground truth data. Default is None.
@@ -433,12 +436,16 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             opt (str, optional): Path to the optimization output. Default is "optimized_reconstruction_GD/_current_test".
 
         """
+        assert early_stop in ["none", "pose", "loss"]
+
         # assuming to to do not changes these or move to init
         self.window_pose = window_pose
         self.window_depth = window_depth
+        self.window_loss = window_loss
         self.convergence_tol_pose = convergence_tol_pose
         self.convergence_tol_depth = convergence_tol_depth
-        self.convergence_depth = not early_stop
+        self.convergence_tol_loss = convergence_tol_loss
+        self.convergence_second = not early_stop
         time_start = time.time()
 
         if use_rerun:
@@ -527,7 +534,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             loss.backward()
             self.timings["gradients_computation"] += time.time() - s_time
 
-            self.optimizer_and_scheduler_step(loss.detach())
+            self.optimizer_and_scheduler_step()
 
             if use_rerun:
                 # Handle Rerun API variations
@@ -604,37 +611,56 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.changes["steps"].append(step)
             past_poses = current_poses
 
-            if not self.convergence_pose:
-                convergence_pose = self.check_convergence(
+            if not self.convergence_first:
+                convergence_first = self.check_convergence(
                     self.changes["max"],
                     window=window_pose,
                     tol=convergence_tol_pose,
                 )
-                if convergence_pose:
-                    self.convergence_pose = True
+                if convergence_first:
+                    self.convergence_first = True
                     self.timings["pose_convergence_time"] = time.time() - time_start
                     if self.verbose:
                         print(f"Pose convergence reached at step {step}.")
 
                     # If not optimizing depth, mark it as converged immediately
                     if not self.grad_z:
-                        self.convergence_depth = True
+                        self.convergence_second = True
                         self.timings["depth_convergence_time"] = (
                             time.time() - time_start
                         )
 
-            elif self.convergence_pose and early_stop:
-                if self.check_convergence(
-                    self.changes["max"],
-                    window=window_depth,
-                    tol=convergence_tol_depth,
-                ):
-                    self.convergence_depth = True
-                    self.timings["depth_convergence_time"] = time.time() - time_start
+            elif self.convergence_first:
+                if early_stop == "pose":
+                    if self.check_convergence(
+                        self.changes["max"],
+                        window=window_depth,
+                        tol=convergence_tol_depth,
+                    ):
+                        self.convergence_second = True
+                        self.timings["early_stop_check"] = time.time() - time_start
+
+                elif early_stop == "loss":
+                    if self.check_convergence(
+                        self.loss_list,
+                        window=window_loss,
+                        early_stop="loss",
+                        tol=convergence_tol_loss,
+                    ):
+                        self.convergence_second = True
+                        self.timings["early_stop_check"] = time.time() - time_start
+
+                elif early_stop == "none":
+                    # nothing to do in this case
+                    pass
 
             self.timings["early_stop_check"] += time.time() - early_stop_start
 
-            if self.convergence_pose and self.convergence_depth:
+            if (
+                self.convergence_first
+                and self.convergence_second
+                and early_stop != "none"
+            ):
                 if self.verbose:
                     print(f"Stopping optimization at step {step}. Convergence reached.")
                 break
@@ -656,14 +682,14 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.print_summary() if self.verbose else print("=" * 70, end="\n\n")
 
     ### Forward and backward helpers ###
-    def check_convergence(self, list_of_changes, window=25, tol=0.5):
+    def check_convergence(self, list_of_changes, early_stop="pose", window=25, tol=0.5):
         """
         Evaluate convergence based on pose changes: max(delta_r, delta_t).
         Stop when smoothed max change is below tol for 'window' consecutive steps.
         """
         # We need at least 2*window - 1 steps to have 'window' smoothed points
         # to check for stability over 'window' steps.
-        required_len = 2 * window - 1
+        required_len = int(2 * window - 1)
 
         if len(list_of_changes) < required_len:
             return False
@@ -679,13 +705,14 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         recent_changes = [x.item() if torch.is_tensor(x) else x for x in recent_changes]
 
         # Compute smoothed max changes for this chunk
-        smoothed_max = np.convolve(
-            recent_changes, np.ones(window) / window, mode="valid"
-        )
+        smoothed = np.convolve(recent_changes, np.ones(window) / window, mode="valid")
 
-        # smoothed_max should have length 'window' now.
+        if early_stop == "loss":
+            # Relative change: (current - previous) / previous
+            smoothed = np.abs(np.diff(smoothed) / (np.abs(smoothed[:-1]) + 1e-8))
+
         # Check if ALL of them are below tolerance.
-        return np.all(smoothed_max < tol)
+        return np.all(smoothed < tol)
 
     def compute_auc(self, opt, gt_path, step):
         AUC_score_max, num_images, _ = eval_colmap_model(
@@ -708,7 +735,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         if hasattr(self.sampled_depth, "optimizer"):
             self.sampled_depth.optimizer.zero_grad()
 
-    def optimizer_and_scheduler_step(self, loss):
+    def optimizer_and_scheduler_step(self):
         """Perform optimizer step and scheduler step for all optimizers."""
         # Ideally each of them should be able to run independently until needed (reaching min lr),
         # but for now we keep them in sync for simplicity.
@@ -718,14 +745,15 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             or self.grad_t is True
             or self.use_mlp_pose_refinement is True
         ):
-            self.poses.optimizer_and_scheduler_step(loss)
+            self.poses.optimizer_and_scheduler_step()
 
-        if self.grad_z is True and self.convergence_pose is True:
-            self.sampled_depth.optimizer_and_scheduler_step(loss)
+        if self.grad_z is True:  # self.convergence_first is True:
+            # backprop on this without first stabilizing the mlp leads to bad stuff
+            self.sampled_depth.optimizer_and_scheduler_step()
 
         # independent from phase
         if self.grad_k:
-            self.intrinsics.optimizer_and_scheduler_step(loss)
+            self.intrinsics.optimizer_and_scheduler_step()
 
         self.timings["parameters_update"] += time.time() - s_time
 

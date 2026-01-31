@@ -62,12 +62,6 @@ class CameraModule(BaseModule):
 
         self.update_all_matrices()  # Pre-compute all intrinsic matrices
 
-    def optimizer_and_scheduler_step(self, loss):
-        """Perform optimizer step and update scheduler based on loss."""
-        self.optimizer.step()
-        if hasattr(self, "scheduler"):
-            self.scheduler.step()
-
     def get_all_intrinsic_matrix(self):
         """Get all intrinsic matrices."""
         return self.keys, self.get_intrinsic_matrix(self.keys)
