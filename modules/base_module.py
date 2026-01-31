@@ -98,7 +98,7 @@ class BaseModule(nn.Module):
             self.optimizer, schedulers=[warmup, decay], milestones=[warmup_steps]
         )
 
-    def optimizer_and_scheduler_step(self, loss):
+    def optimizer_and_scheduler_step(self):
         """Perform optimizer step and update scheduler based on loss."""
         self.optimizer.step()
         self.scheduler.step()
