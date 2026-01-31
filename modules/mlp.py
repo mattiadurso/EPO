@@ -25,6 +25,8 @@ class PoseRefinementMLP(nn.Module):
         self.fc6 = nn.Linear(hidden_dim, output_dim)
         self.act = nn.ReLU()
 
+        self.skip = nn.Identity()
+
         # Initialize weights
         self._init_weights()
 
@@ -103,7 +105,7 @@ class PoseRefinementMLP(nn.Module):
 
         x1 = self.act(self.fc1(x0))
         x2 = self.act(self.fc2(x1))
-        x3 = self.act(self.fc3(x2) + x1)  # Residual connection
+        x3 = self.act(self.fc3(x2) + self.skip(x1))  # Residual connection
 
         x4 = self.act(self.fc4(x3))
         x5 = self.act(self.fc5(x4))

@@ -105,7 +105,7 @@ class PoseModule(BaseModule):
             self.mlp = PoseRefinementMLP(
                 input_dim=12,  # 3x4 pose matrix flattened
                 output_dim=12,  # 3x4 pose matrix flattened
-                hidden_dim=256,  # or 256 for complex scenarios
+                hidden_dim=128,  # or 256 for complex scenarios
             ).to(self.device, dtype=self.dtype)
             # Initialize optimizer with MLP parameters
             self.init_optimizer(mlp_lr=mlp_lr)
