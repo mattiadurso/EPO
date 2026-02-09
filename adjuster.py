@@ -63,10 +63,6 @@ sys.path.append("/home/mattia/Desktop/Repos/posebench/benchmarks_3D")
 from benchmark_pose import eval_colmap_model
 
 
-# sys.path.append("/home/mattia/HDD_Fast/dinov3")
-# from dinov3_wrapper import DINOv3Wrapper
-
-
 class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
     """
     Module to adjust poses and intrinsics of a given reconstruction using edge alignment losses.

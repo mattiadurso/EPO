@@ -310,6 +310,7 @@ class ReconstructAndVizModule:
             "convergence_tol_depth": self.convergence_tol_depth,
         }
         if hasattr(self, "mre"):
+            training_logs["observations"] = len(self.mre)
             training_logs["mean_reproj_error"] = self.mre.mean().item()
             training_logs["median_reproj_error"] = np.median(self.mre).item()
         # sort keys alphabetically
