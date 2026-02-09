@@ -14,7 +14,7 @@ class PoseRefinementMLP(nn.Module):
     - Output: 3x4 pose matrix with orthonormalized rotation via Gram-Schmidt.
     """
 
-    def __init__(self, input_dim, output_dim, hidden_dim=256):
+    def __init__(self, input_dim, output_dim, hidden_dim=128):
         super().__init__()
         # The 6 layers
         self.fc1 = nn.Linear(input_dim, hidden_dim)
@@ -113,31 +113,6 @@ class PoseRefinementMLP(nn.Module):
         x6 = self.fc6(x5) + x0  # P = MLP(P) + P
 
         return self.gram_schmidt(x6.view(B, H, W))
-
-    def predict_residuals(self, x):
-        """
-        Predicts only the residuals to be added to the input poses.
-
-        Args:
-            x: (Batch_Size, 3, 4) tensor containing 3x4 matrices pose.
-
-        Returns:
-            residuals: (Batch_Size, 3, 4) tensor of predicted residuals.
-        """
-        # flatten x
-        B = x.shape[0]
-        x = x.view(B, -1)
-
-        # Forward pass with residual connections
-        x0 = self.act(self.fc1(x))
-        x1 = self.act(self.fc2(x0))
-        x2 = self.act(self.fc3(x1) + x0)  # Residual connection
-
-        x3 = self.act(self.fc4(x2))
-        x4 = self.act(self.fc5(x3))
-        residuals = self.fc6(x4)  # No addition of input here
-
-        return residuals.view(B, 3, 4)
 
 
 if __name__ == "__main__":
