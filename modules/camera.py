@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from modules.base_module import BaseModule
+from helpers.reprojection_compiled import invert_K
 
 
 # paramtric f
@@ -73,6 +74,9 @@ class CameraModule(BaseModule):
         if isinstance(indices[0], str):
             indices = self.map_names_to_indices(indices)
 
+        if self.cameras is not None:
+            return self.cameras[indices]
+
         batch_size = indices.shape[0]
 
         # 2. Retrieve the model type for these specific cameras
@@ -111,6 +115,19 @@ class CameraModule(BaseModule):
                 )
 
             return K
+
+    def get_inverse_intrinsic_matrix(self, indices) -> torch.Tensor:
+        """Get inverse of intrinsic matrix for given camera IDs."""
+
+        if isinstance(indices[0], str):
+            indices = self.map_names_to_indices(indices)
+
+        if self.cameras_inv is not None:
+            return self.cameras_inv[indices]
+
+        K = self.get_intrinsic_matrix(indices)
+        K_inv = invert_K(K)
+        return K_inv
 
     def _build_pinhole(
         self, tensor_indices: torch.Tensor, batch_size: int
@@ -172,8 +189,12 @@ class CameraModule(BaseModule):
     def update_all_matrices(self):
         """Init/Update all intrinsic matrices for all cameras and store them internally."""
         all_ids = self.keys
+        self.cameras = None
         self.cameras = self.get_intrinsic_matrix(all_ids)
-        self.cameras_inv = torch.linalg.inv(self.cameras)
+
+        # don't using to have simpler camera management
+        # self.cameras_inv = None
+        # self.cameras_inv = self.get_inverse_intrinsic_matrix(all_ids)
 
     def __repr__(self):
         s = "CameraModel:\n"

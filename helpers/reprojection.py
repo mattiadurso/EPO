@@ -8,6 +8,7 @@ from helpers.reprojection_compiled import (
     from_homogeneous,
     unproject_to_3D,
     invert_P,
+    invert_K,
     project_to_2D,
 )
 
@@ -291,7 +292,7 @@ def reproject_2D_2D(
 
     # ? use the depth to define the 3D coordinates of points in the ref system of camera0
     K0_dtype = K0.dtype
-    K0_inv = torch.linalg.inv(K0.float()).to(K0_dtype)  # does not support bfloat16
+    K0_inv = invert_K(K0.float()).to(K0_dtype)  # does not support bfloat16
     xyz0 = unproject_to_3D(xy0, K0_inv, selected_depths0)  # B,n,3
 
     # ? change the ref system of the 3d point to camera1
