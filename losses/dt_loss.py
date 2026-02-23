@@ -85,15 +85,8 @@ def sample_distance_field(
     dt_field: torch.Tensor,
     edge_coords: torch.Tensor,
 ):
-    """
-    Simplified version of sample_distance_field.
-    Assumes input edge_coords are free of NaNs (pre-filtered).
-
-    Args:
-        dt_field: (B, C, H, W) or (B, H, W) distance fields
-        edge_coords: (B, N, 2) projected coordinates, assumed safe.
-    """
-    B, H, W = dt_field.shape[-3], dt_field.shape[-2], dt_field.shape[-1]
+    # Safely extract H and W from the last two dimensions of the (B, 1, H, W) tensor
+    H, W = dt_field.shape[-2:]
     device = dt_field.device
     dtype = dt_field.dtype
 
@@ -104,14 +97,10 @@ def sample_distance_field(
     norm_x = (x / (W - 1)) * 2 - 1
     norm_y = (y / (H - 1)) * 2 - 1
 
-    # Stack: (B, N, 1, 2) required for grid_sample 4D input
+    # Stack: (B, N, 1, 2) required for grid_sample
     grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(2)
 
-    # Grid Sample
-    # Input dt_field must be (B, C, H, W)
-    if dt_field.dim() == 3:
-        dt_field = dt_field.unsqueeze(1)
-
+    # dt_field is already (B, 1, H, W), so we feed it straight in
     sampled = F.grid_sample(
         dt_field,
         grid,
@@ -120,8 +109,8 @@ def sample_distance_field(
         align_corners=True,
     )
 
-    # Output Shaping
-    sampled_dists = sampled.squeeze(-1).squeeze(1)  # (B, N)
+    # Output is (B, 1, N, 1). Squeeze the dummy dimensions to get (B, N)
+    sampled_dists = sampled.squeeze(-1).squeeze(1)
 
     return sampled_dists.to(device=device, dtype=dtype)
 
