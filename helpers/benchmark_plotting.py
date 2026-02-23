@@ -24,6 +24,7 @@ def read_results(
     # Read results
     dfs = {}
     for name in models:
+
         dfs[name] = eval_colmap_model_all_scenes(
             target_path=base_target,
             target_folder=target_folder,
@@ -242,7 +243,7 @@ def plot_auc5_with_time(df, dataset, models, thr, ignore_time=False):
 
 def read_results_nvs(
     nvs_results_path="/home/mattia/HDD_Fast/gaussian-splatting-results/data",
-    exclude_metrics=("SSIM",),
+    exclude_metrics=(),
     column_order=None,
 ):
     """
@@ -327,10 +328,6 @@ def read_results_nvs(
     df_final.index.name = "Scene"
 
     return df_final
-
-
-import pandas as pd
-import numpy as np
 
 
 def latexfy(
@@ -431,19 +428,22 @@ def latexfy(
             val_time = df.loc[idx, m["time"]]
 
             # Helper to format and optionally bold
-            def format_cell(val, best_val, precision, is_vggt):
+            def format_cell(val, best_val, precision, is_vggt, bold_enabled=True):
                 if pd.isnull(val):
                     return "-"
                 txt = f"{val:.{precision}f}"
-                # Only bold if it matches the best value AND is not VGGT
-                if not is_vggt and val == best_val:
-                    return f"\\textbf{{{txt}}}"
+                if bold_enabled and not is_vggt and val == best_val:
+                    txt = f"\\textbf{{{txt}}}"
                 return txt
 
             is_vggt = m["name"] == "VGGT"
 
-            str_auc = format_cell(val_auc, best_auc, auc_round, is_vggt)
-            str_time = format_cell(val_time, best_time, time_round, is_vggt)
+            str_auc = format_cell(
+                val_auc, best_auc, auc_round, is_vggt, bold_enabled=False
+            )
+            str_time = format_cell(
+                val_time, best_time, time_round, is_vggt, bold_enabled=False
+            )
 
             row_str.append(f"& {str_auc} & {str_time}")
 
@@ -470,8 +470,6 @@ def latexfy(
 
             if pd.notnull(val_time):
                 txt_time = f"{val_time:.{time_round}f}"
-                if not is_vggt:
-                    txt_time = f"\\textbf{{{txt_time}}}"
             else:
                 txt_time = "-"
 

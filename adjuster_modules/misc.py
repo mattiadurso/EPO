@@ -171,15 +171,18 @@ class MiscModule:
         torch.cuda.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)  # For multi-GPU
 
-        # 3. Force deterministic algorithms (Crucial!)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-        # This will throw errors if an op is non-deterministic
-        # torch.use_deterministic_algorithms(True)
+        # debug
+        # torch.backends.cudnn.deterministic = True
+        # torch.backends.cudnn.benchmark = False
+        # torch.backends.cuda.matmul.allow_tf32 = False
+        # torch.backends.cudnn.allow_tf32 = False
 
-        # 4. Disable TF32 (Crucial for precision stability!)
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
+        # inference
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        # torch.backends.cuda.matmul.allow_tf32 = True
+        # torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
     def __repr__(self):
         repr_str = f"Adjuster(\n"
