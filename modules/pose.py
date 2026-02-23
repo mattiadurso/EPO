@@ -191,6 +191,9 @@ class PoseModule(BaseModule):
         if isinstance(indices[0], str):
             indices = self.map_names_to_indices(indices)
 
+        if self.poses is not None:
+            return self.poses[indices]
+
         # Retrieve components
         R = self.get_rotation_matrix(indices)  # (B, 3, 3)
         t = self.get_translation(indices)  # (B, 3)
@@ -275,9 +278,12 @@ class PoseModule(BaseModule):
     def update_all_matrices(self):
         """Init/Update all extrinsic matrices for all images and store them internally."""
         all_names = list(self.image_to_tensor_idx.keys())
+        self.poses = None  # Invalidate cache before recomputing
         self.poses = self.get_projection_matrix(all_names)
 
     def get_all_matrices(self):
         """Get all extrinsic matrices for all images."""
-        all_names = list(self.image_to_tensor_idx.keys())
-        return self.get_projection_matrix(all_names)
+        if self.poses is None:
+            self.update_all_matrices()
+
+        return self.poses

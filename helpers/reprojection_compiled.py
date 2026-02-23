@@ -59,7 +59,28 @@ def unproject_to_3D(xy: Tensor, K_inv: Tensor, depths: Tensor) -> Tensor:
     return xyz_scaled
 
 
-def invert_P(P: Tensor) -> Tensor:
+def invert_K(K: Tensor) -> Tensor:
+    """
+    Closed-form inversion of batched 3x3 intrinsic matrices.
+    K is expected to have shape (B, 3, 3).
+    """
+    K_inv = torch.zeros_like(K)
+
+    fx = K[:, 0, 0]
+    fy = K[:, 1, 1]
+    cx = K[:, 0, 2]
+    cy = K[:, 1, 2]
+
+    K_inv[:, 0, 0] = 1.0 / fx
+    K_inv[:, 1, 1] = 1.0 / fy
+    K_inv[:, 0, 2] = -cx / fx
+    K_inv[:, 1, 2] = -cy / fy
+    K_inv[:, 2, 2] = 1.0
+
+    return K_inv
+
+
+def invert_P(P: Tensor, return_Rt=False) -> Tensor:
     """invert the extrinsics P matrix in a more stable way
     Args:
         P: input extrinsics P matrix
@@ -68,6 +89,16 @@ def invert_P(P: Tensor) -> Tensor:
         P_inv: the inverse of the P matrix
             Bx4x4
     """
+    if return_Rt:
+        # Extract R and t directly from the 3x4 or 4x4 P0 matrix
+        R = P[:, :3, :3]
+        t = P[:, :3, 3:]
+
+        # Mathematical inverse of SE(3) is just R^T and -R^T @ t
+        R_inv = R.transpose(-2, -1)
+        t_inv = -R_inv @ t
+        return R_inv, t_inv
+
     B = P.shape[0]
     R = P[:, 0:3, 0:3]
     t = P[:, 0:3, 3:4]
@@ -102,14 +133,13 @@ def unproject_2D_to_world(
             B,n,3
     """
     # invert K and P
-    K0_inv = torch.linalg.inv(K0)
-    P0_inv = invert_P(P0)
+    K0_inv = invert_K(K0)
+    R_inv, t_inv = invert_P(P0, return_Rt=True)
 
     # 2D -> 3D camera
     xyz_camera = unproject_to_3D(xy0, K0_inv, depth0)  # B,n,3
 
     # 3D camera -> world
-    R_inv, t_inv = P0_inv[:, :3, :3], P0_inv[:, :3, 3:]  # B,3,3 , B,3,1
     xyz_world = (R_inv @ xyz_camera.permute(0, 2, 1) + t_inv).permute(0, 2, 1)  # B,n,3
 
     return xyz_world
