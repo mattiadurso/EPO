@@ -299,8 +299,8 @@ class ReconstructAndVizModule:
             "auc_saving_freq": self.auc_saving_freq,
             "list_auc": self.auc_list,
             "list_changes": self.changes,
-            "convergence_first": self.convergence_first,
-            "convergence_second": self.convergence_second,
+            "convergence_first": self.mlp_pose_convergence,
+            "convergence_second": self.optim_convergence,
             "timings": self.timings,
             "max_edges": self.max_edges,
             "len_viewgraph": len(self.viewgraph),
@@ -310,7 +310,7 @@ class ReconstructAndVizModule:
             "convergence_tol_depth": self.convergence_tol_depth,
         }
         if hasattr(self, "mre"):
-            training_logs["observations"] = len(self.mre)
+            training_logs["observations"] = self.pad_masks.params.sum().item()
             training_logs["mean_reproj_error"] = self.mre.mean().item()
             training_logs["median_reproj_error"] = np.median(self.mre).item()
         # sort keys alphabetically
