@@ -9,6 +9,13 @@ parser = argparse.ArgumentParser(description="Process dataset scenes")
 parser.add_argument("--dataset", type=str, default="mipnerf360", help="Dataset name")
 parser.add_argument("--edges", type=str, default="canny", help="Edge type")
 parser.add_argument("--note", type=str, default="", help="Run note")
+parser.add_argument(
+    "--max_iterations", type=int, default=2000, help="Maximum number of iterations"
+)
+parser.add_argument(
+    "--early_stop", type=str, default="pose", help="Early stopping criterion"
+)
+parser.add_argument("--model", type=str, default="vggt", help="Model name")
 args = parser.parse_args()
 
 
@@ -52,7 +59,7 @@ for dataset in datasets:
         )
         gt_path = os.path.join(dataset_cfg["gt_path"], scene, dataset_cfg["gt_folder"])
 
-        opt = f"benchmarks/vggt_edge_{args.edges}{args.note}/{dataset}/{scene}/sparse"
+        opt = f"benchmarks/{args.model}_edge_{args.edges}{args.note}/{dataset}/{scene}/sparse"
 
         os.makedirs(opt, exist_ok=True)
 
@@ -61,15 +68,16 @@ for dataset in datasets:
         # ==============================================================================
 
         adjuster = Adjuster(
-            reconstruction_path=reconstruction_path,
+            reconstruction_path=reconstruction_path.replace("vggt", args.model),
             images_path=images_path,
-            depths_path=depths_path,
+            depths_path=depths_path.replace("vggt", args.model),
             # grad_q=True,
             # grad_t=True,
             grad_t_offset=True,
             grad_k=True,
             grad_z=True,
             use_mlp_pose_refinement=True,
+            detector=args.edges,
             # q_lr=1e-4,
             # t_lr=1e-3,
             k_lr=1e-3,
@@ -78,7 +86,7 @@ for dataset in datasets:
             max_edges_points=12_288,
             max_viewgraph_pairs=4_096,
             single_camera_per_folder=True,
-            max_num_iterations=2048,
+            max_num_iterations=args.max_iterations,
             viz=True,
             verbose=False,
         )
@@ -90,7 +98,7 @@ for dataset in datasets:
             convergence_tol_loss=5e-5,  # relative change %
             window_loss=50,
             # gt_path=gt_path,
-            early_stop="pose",  # to stop after second pose convergence
+            early_stop=args.early_stop,
         )
 
         adjuster.to_colmap(
