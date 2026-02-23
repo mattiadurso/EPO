@@ -274,17 +274,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         s_time = time.time()
         # compute viewgraph
         self._compute_viewgraph(type=self.matcher_type)
-        self.len_viewgraph = len(self.viewgraph)
-        self.adj_list = {}
-        for i, j in self.viewgraph:
-            self.adj_list.setdefault(i, []).append(j)
-            self.adj_list.setdefault(j, []).append(i)
         self.timings["compute_viewgraph"] = time.time() - s_time
-        if self.verbose:
-            values = [len(v) for v in self.adj_list.values()]
-            print(
-                f"Average degree: {np.mean(values):.2f}, min connection {min(values)}, less than 5 neighbors: {(np.array(values)<5).sum()} images"
-            )
 
         ## Prepare batched parameters modules that do not need to be optimized
         self.image_id_map = {}
@@ -306,7 +296,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.device, dtype=self.dtype
         )
         pad_masks = torch.stack(pad_masks, dim=0).to(self.device).bool()
-        dt_fields = torch.stack(dt_fields, dim=0).to(self.device, dtype=self.dtype)
+        dt_fields = (
+            torch.stack(dt_fields, dim=0).to(self.device, dtype=self.dtype).unsqueeze(1)
+        )
         images_shapes = torch.stack(images_shapes, dim=0).to(
             self.device, dtype=self.dtype
         )
@@ -384,8 +376,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.convergence = False
         self.blacklist = set()
         self.changes = {"q": [], "t": [], "max": [], "steps": [], "z": []}
-        self.convergence_first = False
-        self.convergence_second = False
+        self.mlp_pose_convergence = False
+        self.optim_convergence = False
         self.convergence_loss = False
 
         gc.collect()
@@ -403,6 +395,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         convergence_tol_depth=0.1,  # relative change %
         convergence_tol_loss=5e-5,  # relative change %
         early_stop="pose",
+        recompute_viewgraph=False,
         drop_last=False,
         debug=False,
         gt_path=None,
@@ -424,6 +417,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             convergence_tol_pose (float, optional): Tolerance for pose convergence. Default is 0.5.
             convergence_tol_depth (float, optional): Tolerance for depth convergence. Default is 0.1. Not used when early_stop is False.
             early_stop (str, optional): Whether to stop early if depth convergence is reached. Default is 'pose'.
+            recompute_viewgraph (bool, optional): Whether to recompute the viewgraph after first convergence. Default is False.
             drop_last (bool, optional): Whether to drop the last batch if smaller than batch_size. Default is False.
             debug (bool, optional): Whether to enable debug mode. Default is False.
             gt_path (str, optional): Path to the ground truth data. Default is None.
@@ -444,7 +438,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.convergence_tol_pose = convergence_tol_pose
         self.convergence_tol_depth = convergence_tol_depth
         self.convergence_tol_loss = convergence_tol_loss
-        self.convergence_second = True if early_stop == "none" else False
+        self.optim_convergence = True if early_stop == "none" else False
 
         time_start = time.time()
 
@@ -605,52 +599,55 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 current_poses,
                 quantile=quantile,
             )
-            self.changes["q"].append(err_q)
-            self.changes["t"].append(err_t)
+            if self.verbose:
+                self.changes["q"].append(err_q)
+                self.changes["t"].append(err_t)
             self.changes["max"].append(max_err)
             self.changes["steps"].append(step)
             past_poses = current_poses
 
-            if not self.convergence_first:
-                convergence_first = self.check_convergence(
+            if not self.mlp_pose_convergence:
+                mlp_pose_convergence = self.check_convergence(
                     list_of_changes=self.changes["max"],
                     window=window_pose,
                     early_stop="pose",
                     tol=convergence_tol_pose,
                 )
-                if convergence_first:
-                    self.convergence_first = True
+                if mlp_pose_convergence:
+                    self.mlp_pose_convergence = True
                     self.timings["pose_convergence_time"] = time.time() - time_start
                     if self.verbose:
                         print(f"Pose convergence reached at step {step}.")
 
+                    # recompute viewgraph, hopefully with more pairs now
+                    if recompute_viewgraph:
+                        self._compute_viewgraph(type=self.matcher_type)
+
                     # If not optimizing depth, mark it as converged immediately
                     if not self.grad_z:
-                        self.convergence_second = True
+                        self.optim_convergence = True
                         self.timings["depth_convergence_time"] = (
                             time.time() - time_start
                         )
 
-            elif self.convergence_first:
+            elif self.mlp_pose_convergence:
                 if early_stop == "pose":
                     if self.check_convergence(
                         list_of_changes=self.changes["max"],
                         window=window_depth,
-                        early_stop="pose",
+                        early_stop=early_stop,  # "pose"
                         tol=convergence_tol_depth,
                     ):
-                        self.convergence_second = True
-                        self.timings["early_stop_check"] = time.time() - time_start
+                        self.optim_convergence = True
 
                 elif early_stop == "loss":
                     if self.check_convergence(
                         list_of_changes=self.loss_list,
                         window=window_loss,
-                        early_stop="loss",
+                        early_stop=early_stop,  # "loss"
                         tol=convergence_tol_loss,
                     ):
-                        self.convergence_second = True
-                        self.timings["early_stop_check"] = time.time() - time_start
+                        self.optim_convergence = True
 
                 elif early_stop == "none":
                     # nothing to do in this case
@@ -659,12 +656,13 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.timings["early_stop_check"] += time.time() - early_stop_start
 
             if (
-                self.convergence_first
-                and self.convergence_second
+                self.mlp_pose_convergence
+                and self.optim_convergence
                 and early_stop != "none"
             ):
                 if self.verbose:
                     print(f"Stopping optimization at step {step}. Convergence reached.")
+                self.completed_iterations += 1
                 break
 
             self.completed_iterations += 1
@@ -749,7 +747,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         ):
             self.poses.optimizer_and_scheduler_step()
 
-        if self.grad_z is True and self.convergence_first is True:
+        if self.grad_z is True and self.mlp_pose_convergence is True:
             # backprop on this without first stabilizing the mlp leads to bad stuff
             self.sampled_depth.optimizer_and_scheduler_step()
 
@@ -964,8 +962,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             return torch.tensor(0.0, device=self.device)
 
         residuals_pairs = residuals.view(-1, 2)
-
-        # clamp residuals. 15 is quite high already
         residuals_pairs = torch.clamp(residuals_pairs, min=0, max=10.0)
 
         # Use Huber loss for robust cost
@@ -1221,8 +1217,21 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
         self.viewgraph.sort(key=lambda x: (x[0], x[1]))
 
+        self.len_viewgraph = len(self.viewgraph)
+        self.adj_list = {}
+        for i, j in self.viewgraph:
+            self.adj_list.setdefault(i, []).append(j)
+            self.adj_list.setdefault(j, []).append(i)
+
+        if self.verbose:
+            values = [len(v) for v in self.adj_list.values()]
+            print(
+                f"Average degree: {np.mean(values):.2f}, min connection {min(values)}, less than 5 neighbors: {(np.array(values)<5).sum()} images"
+            )
+
     ### Edges
     def _extract_edges(self, confidence_threshold=0.2):
+        tot_edges = 0
         # for image_name in tqdm(self.images.keys(), desc=f"Extracting edges"):
         for image_name in self.images.keys():
             # Extract edge map
@@ -1259,6 +1268,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.images[image_name]["edges"] = valid_edges.to(
                 self.device, dtype=self.dtype
             )
+            tot_edges += valid_edges.shape[0]
+        self.observations = tot_edges
 
         # pad to have same number of edges per image
         self._pad_edges()
