@@ -308,6 +308,22 @@ class ReconstructAndVizModule:
             "window_depth": self.window_depth,
             "convergence_tol_pose": self.convergence_tol_pose,
             "convergence_tol_depth": self.convergence_tol_depth,
+            "min_viewgraph_points": self.min_points,
+            "reprojection_error": self.reprojection_error,
+            "sampling_factor": self.sampling_factor,
+            "grad_t_offset": self.grad_t_offset,
+            "grad_k": self.grad_k,
+            "grad_z": self.grad_z,
+            "grad_mlp_pose_refinement": self.use_mlp_pose_refinement,
+            "lr_mlp_pose": self.mlp_pose_lr,
+            "lr_k": self.k_lr,
+            "lr_z": self.z_lr,
+            "lr_q": self.q_lr,
+            "lr_t": self.t_lr,
+            "matcher_type": self.matcher_type,
+            
+
+
         }
         if hasattr(self, "mre"):
             training_logs["observations"] = self.pad_masks.params.sum().item()
@@ -374,10 +390,10 @@ class ReconstructAndVizModule:
 
             # Frustum visualization
             cam = recon.cameras[img.camera_id]
-            strips = self.get_frustum_strips(scale=0.15, w=cam.width, h=cam.height)
+            strips = self.get_frustum_strips(scale=0.20, w=cam.width, h=cam.height)
             rr.log(
                 f"world/{entity}/{img.name}/cam",
-                rr.LineStrips3D(strips, colors=camera_color, radii=0.002),
+                rr.LineStrips3D(strips, colors=camera_color, radii=0.005),
                 static=static_cameras,
             )
 

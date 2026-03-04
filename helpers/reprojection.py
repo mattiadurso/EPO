@@ -360,9 +360,6 @@ def filter_viewgraph_by_reprojection_batched(
 
     num_pairs = len(viewgraph)
 
-    # for batch_start in tqdm(
-    #     range(0, num_pairs, batch_size), desc="Filtering viewgraph"
-    # ):
     for batch_start in range(0, num_pairs, batch_size):
         batch_end = min(batch_start + batch_size, num_pairs)
         batch_pairs = viewgraph[batch_start:batch_end]
@@ -391,7 +388,6 @@ def filter_viewgraph_by_reprojection_batched(
 
         # Expand grid
         kpts0 = grid.expand(current_batch_size, -1, -1)  # (B, N, 2)
-        tot = kpts0.shape[1]
 
         # Forward projection: img_i -> img_j
         kpts1 = reproject_2D_2D(
@@ -442,9 +438,8 @@ def filter_viewgraph_by_reprojection_batched(
 
             if num_valid >= min_points:
                 filtered_viewgraph.append((i_name, j_name))
-                valid_points_per_pair[(i_name, j_name)] = num_valid
-
-            # print(f"Pair ({i_name}, {j_name}): {num_valid}/{tot} valid points")
+            # all pairs
+            valid_points_per_pair[(i_name, j_name)] = num_valid
 
     if verbose:
         print(
