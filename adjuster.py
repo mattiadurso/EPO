@@ -82,14 +82,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         max_workers (int, optional): Maximum number of workers for parallel loading. Default is -1 (all available).
         detector_params (dict, optional): Parameters for the edge detector.
         seed (int, optional): Random seed for reproducibility. Default is 0.
-        optim (str, optional): Optimizer to use ("adamw" or "lm"). Default is "adamw".
         scheduler_name (str, optional): Learning rate scheduler name. Default is None.
         scheduler_params (dict, optional): Parameters for the learning rate scheduler.
         grad_q (bool, optional): Whether to optimize rotation quaternions. Default is True.
         grad_t (bool, optional): Whether to optimize translation vectors. Default is True.
         grad_k (bool, optional): Whether to optimize camera intrinsics. Default is True.
         grad_z (bool, optional): Whether to optimize depth scale. Default is False.
-        viz (bool, optional): Whether to visualize intermediate results. Default is False.
         gt_path (str, optional): Path to ground truth data for evaluation. Default is None.
         max_edges_points (int, optional): Maximum number of edge points to use per image. Default is 16384.
         max_viewgraph_pairs (int, optional): Maximum number of viewgraph pairs to use at each optimization step.
@@ -135,23 +133,28 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         use_mlp_pose_refinement=True,
         auc_saving_freq=50,
         max_num_iterations=2000,
-        viz=False,  # it true del non used stuff during computation
         verbose=False,
-        dtype=torch.float32,
+        # viewgraph params
+        min_points=750,
+        sampling_factor=5,
+        reprojection_error=3,
+        run_mode="inference",  # or "debug" for deterministic results and more logging
     ):
         super().__init__()
-        assert dtype in [
-            torch.float32,
-            # torch.bfloat16,
-        ], "Only float32 and bfloat16 are supported for now due to their large dynamic range."
+        self.device = device
+        self.dtype = torch.float32
 
         # fix seed
         self.seed = seed
-        self.fix_seed()
+        self.mode = run_mode
+        self.fix_seed(mode=run_mode)
+        self.rng = torch.Generator(device=self.device)
+        self.rng.manual_seed(self.seed)
+        self.rng_cpu = torch.Generator(device="cpu")
+        self.rng_cpu.manual_seed(self.seed)
 
         self.max_workers = os.cpu_count() if max_workers < 0 else max_workers
         self.images_size = images_size
-        self.device = device
         self.load_with_pad = load_with_pad
         self.images_path = images_path
         self.depths_path = depths_path
@@ -159,7 +162,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.single_camera_per_folder = single_camera_per_folder
         self.sequential_matcher_window = sequential_matcher_window
         self.convergence = False
-        self.dtype = dtype
         self.auc_th = [1, 3, 5]
         self.completed_iterations = 0
         self.max_num_iterations = max_num_iterations
@@ -172,6 +174,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.unreliable_area_masks_path = unreliable_area_masks_path
         self.use_depth_confidence = use_depth_confidence
         self.verbose = verbose
+        self.min_points = min_points
+        self.sampling_factor = sampling_factor
+        self.reprojection_error = reprojection_error
 
         # Edge extractor
         if detector == "canny":
@@ -273,7 +278,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         ## Viewgraph from frustums
         s_time = time.time()
         # compute viewgraph
-        self._compute_viewgraph(type=self.matcher_type)
+        self._compute_viewgraph(
+            type=self.matcher_type,
+            min_points=min_points,
+            sampling_factor=sampling_factor,
+            reprojection_error=reprojection_error,
+        )
         self.timings["compute_viewgraph"] = time.time() - s_time
 
         ## Prepare batched parameters modules that do not need to be optimized
@@ -364,11 +374,10 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.timings["early_stop_check"] = 0
 
         # # At this point I might get rid of rgb images to save memory as not needed for edge loss
-        if not viz:
-            for image_name in self.images.keys():
-                self.images[image_name].pop("image")
-                self.images[image_name].pop("depth")
-                self.images[image_name].pop("edges_map")
+        # for image_name in self.images.keys():
+        #     self.images[image_name].pop("image")
+        #     self.images[image_name].pop("depth")
+        #     self.images[image_name].pop("edges_map")
 
         self.loss_list = []
         self.lr_list = {"q": [], "t": [], "mlp": [], "k": [], "z": []}
@@ -395,7 +404,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         convergence_tol_depth=0.1,  # relative change %
         convergence_tol_loss=5e-5,  # relative change %
         early_stop="pose",
-        recompute_viewgraph=False,
         drop_last=False,
         debug=False,
         gt_path=None,
@@ -456,7 +464,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                         static_cameras=True,
                         points3D=True,
                         static_points=True,
-                        camera_color=[0, 255, 0],
+                        camera_color=[48, 125, 73],
                     )
                 except Exception as e:
                     print(f"Warning: Failed to load GT for Rerun visualization: {e}")
@@ -469,7 +477,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                         static_cameras=True,
                         points3D=False,
                         static_points=True,
-                        camera_color=[0, 0, 255],
+                        camera_color=[0, 50, 106],
                     )
                 except Exception as e:
                     print(
@@ -552,7 +560,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                     static_cameras=False,
                     points3D=False,
                     static_points=False,
-                    camera_color=[255, 0, 0],  # red
+                    camera_color=[186, 39, 34],  # red
                 )
 
             # ============================================================
@@ -618,10 +626,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                     self.timings["pose_convergence_time"] = time.time() - time_start
                     if self.verbose:
                         print(f"Pose convergence reached at step {step}.")
-
-                    # recompute viewgraph, hopefully with more pairs now
-                    if recompute_viewgraph:
-                        self._compute_viewgraph(type=self.matcher_type)
 
                     # If not optimizing depth, mark it as converged immediately
                     if not self.grad_z:
@@ -1146,7 +1150,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                     )
 
     @torch.no_grad()
-    def _compute_viewgraph(self, type="exhaustive"):
+    def _compute_viewgraph(
+        self, type="exhaustive", min_points=750, sampling_factor=5, reprojection_error=3
+    ):
         """Compute viewgraph and filter by reprojection error and returns the sorted viewgraph."""
         if self.viewgraph_path is not None:
             # Load viewgraph from file
@@ -1168,9 +1174,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 images_with_depth=self.images,
                 dtype=self.dtype,
             )
-            min_points = 100
-            sampling_factor = 5
-            reprojection_error = 5.0
+            # min_points = 100
+            # sampling_factor = 5
+            # reprojection_error = 5.0
 
         elif type == "sequential":
             # Build sequential viewgraph based on sorted image names with a window size of 10
@@ -1187,9 +1193,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             # Build exhaustive viewgraph (all pairs)
             image_names = sorted(list(self.images.keys()))
             viewgraph = list(combinations(image_names, 2))
-            min_points = 750  # ~12.5% (1/8) of 518*290
-            sampling_factor = 5  # after sampling
-            reprojection_error = 3.0
+            # min_points = 750  # ~12.5% (1/8) of 518*290
+            # sampling_factor = 5  # after sampling
+            # reprojection_error = 3.0
 
         else:
             raise ValueError(f"Viewgraph type {type} not supported.")
@@ -1225,9 +1231,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
         if self.verbose:
             values = [len(v) for v in self.adj_list.values()]
-            print(
-                f"Average degree: {np.mean(values):.2f}, min connection {min(values)}, less than 5 neighbors: {(np.array(values)<5).sum()} images"
-            )
+            if len(values) > 0:
+                print(
+                    f"Average degree: {np.mean(values):.2f}, min connection {min(values)}, less than 5 neighbors: {(np.array(values)<5).sum()} images"
+                )
+            else:
+                print("\n >>> No valid pairs in viewgraph, which is a BIG problem! <<<")
 
     ### Edges
     def _extract_edges(self, confidence_threshold=0.2):
