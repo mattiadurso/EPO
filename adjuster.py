@@ -252,18 +252,18 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.num_images = len(self.images)
         self.timings["load_images"] = time.time() - s_time
 
-        ## Load poses and intrinsics
-        s_time = time.time()
-        # creating poses such self.poses[image_name] = PoseModel(...)
-        # creating intrinsics such self.intrinsics[cam_id] = CameraModel(...)
-        # using image name and camera id/foler str
-        self._read_cameras_from_reconstruction()  # into self.images and self.intrinsics
-        self.timings["load_poses_and_intrinsics"] = time.time() - s_time
-
         ## Load depth maps
         s_time = time.time()
         self._load_and_preprocess_depths()
         self.timings["load_depth_maps"] = time.time() - s_time
+
+        ## Load poses and intrinsics
+        s_time = time.time()
+        # creating poses such self.poses[image_name] = PoseModel(...)
+        # creating intrinsics such self.intrinsics[cam_id] = CameraModel(...)
+        # using image name and camera id/folder str
+        self._read_cameras_from_reconstruction()  # into self.images and self.intrinsics
+        self.timings["load_poses_and_intrinsics"] = time.time() - s_time
 
         ## Extract edges
         s_time = time.time()
