@@ -55,7 +55,7 @@ from helpers.reprojection_compiled import (
 from helpers.frustum import build_view_graph_from_frustums
 from modules import *
 from modules.stopping_criterion import evaluate_pose_changes
-from adjuster_modules import *
+from epo_modules import *
 
 import sys
 
@@ -63,7 +63,7 @@ sys.path.append("/home/mattia/Desktop/Repos/posebench/benchmarks_3D")
 from benchmark_pose import eval_colmap_model
 
 
-class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
+class epo(nn.Module, MiscModule, ReconstructAndVizModule):
     """
     Module to adjust poses and intrinsics of a given reconstruction using edge alignment losses.
     Args:
@@ -881,7 +881,10 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss."""
         # reduce viewgraph if too large
         if len(sampled_viewgraph) > self.max_viewgraph_pairs:
-            indices = torch.randperm(len(sampled_viewgraph))[: self.max_viewgraph_pairs]
+            # indices = torch.randperm(len(sampled_viewgraph))[: self.max_viewgraph_pairs]
+            indices = torch.randperm(len(sampled_viewgraph), generator=self.rng_cpu)[
+                : self.max_viewgraph_pairs
+            ]
             sampled_viewgraph = sampled_viewgraph[indices]
 
         # divide self.viewgraph in batches if len(self.viewgraph) > batch size
@@ -1322,9 +1325,13 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
             if n_edges > max_edges_to_retain:
                 # randomly sample max_edges
-                indices = torch.randperm(n_edges, device=edges.device)[
-                    :max_edges_to_retain
-                ]
+                # indices = torch.randperm(n_edges, device=edges.device)[
+                #     :max_edges_to_retain
+                # ]
+                indices = torch.randperm(
+                    n_edges, device=edges.device, generator=self.rng
+                )[:max_edges_to_retain]
+
                 edges = edges[indices]
                 n_edges = max_edges_to_retain
 
@@ -1431,87 +1438,79 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 if __name__ == "__main__":
     import json
 
-    dataset = "terrasky3D"  # terrasky3D, mipnerf360,
-    scene = "graz_townhall"  # vienna_state_opera, bicycle, bonsai, statue, 7831862f02
+    dataset = "mipnerf360"  # terrasky3D, mipnerf360,
+    scene = "bicycle"  # vienna_state_opera, bicycle, bonsai, statue, 7831862f02
 
     # Load dataset paths and parameters from JSON
     with open("benchmarks/paths.json") as f:
         paths_cfg = json.load(f)
 
-    for dataset in ["terrasky3D", "scannetpp"]:
-        scenes = sorted(os.listdir(paths_cfg[dataset]["images_path"]))
+    # for dataset in ["terrasky3D", "scannetpp"]:
+    #     scenes = sorted(os.listdir(paths_cfg[dataset]["images_path"]))
 
-        for scene in scenes:
-            if (
-                os.path.exists(f"rerun/{scene}.rrd")
-                or scene[0] == "."
-                or scene.endswith(".py")
-            ):
-                continue
+    #     for scene in scenes:
+    # if os.path.exists(f"rerun/{scene}.rrd") or scene[0] == "." or scene.endswith(".py"):
+    #     continue
 
-            dataset_cfg = paths_cfg[dataset]
+    dataset_cfg = paths_cfg[dataset]
 
-            images_path = os.path.join(
-                dataset_cfg["images_path"], scene, dataset_cfg["images_folder"]
-            )
-            base_path = dataset_cfg["base_path"]
-            reconstruction_path = os.path.join(
-                base_path, scene, dataset_cfg["reconstruction_folder"]
-            )
-            depths_path = os.path.join(
-                base_path,
-                scene,
-                dataset_cfg.get("depths_folder", dataset_cfg.get("depth_folder", "")),
-            )
-            gt_path = os.path.join(
-                dataset_cfg["gt_path"], scene, dataset_cfg["gt_folder"]
-            )
+    images_path = os.path.join(
+        dataset_cfg["images_path"], scene, dataset_cfg["images_folder"]
+    )
+    base_path = dataset_cfg["base_path"]
+    reconstruction_path = os.path.join(
+        base_path, scene, dataset_cfg["reconstruction_folder"]
+    )
+    depths_path = os.path.join(
+        base_path,
+        scene,
+        dataset_cfg.get("depths_folder", dataset_cfg.get("depth_folder", "")),
+    )
+    gt_path = os.path.join(dataset_cfg["gt_path"], scene, dataset_cfg["gt_folder"])
 
-            adjuster = Adjuster(
-                reconstruction_path=reconstruction_path,
-                images_path=images_path,
-                depths_path=depths_path,
-                k_lr=1e-3,
-                grad_k=False,
-                z_lr=3e-3,
-                grad_z=True,
-                mlp_pose_lr=3e-3,
-                use_mlp_pose_refinement=True,
-                matcher_type="exhaustive",
-                viz=True,
-                use_amp=False,
-                max_edges_points=12_288,
-                max_viewgraph_pairs=4_096,
-                single_camera_per_folder=True,
-                verbose=True,
-                auc_saving_freq=5,
-                max_num_iterations=2000,
-            )
+    epo = epo(
+        reconstruction_path=reconstruction_path,
+        images_path=images_path,
+        depths_path=depths_path,
+        k_lr=1e-3,
+        grad_k=False,
+        z_lr=3e-3,
+        grad_z=True,
+        mlp_pose_lr=3e-3,
+        use_mlp_pose_refinement=True,
+        matcher_type="exhaustive",
+        max_edges_points=12_288,
+        max_viewgraph_pairs=4_096,
+        single_camera_per_folder=True,
+        verbose=True,
+        auc_saving_freq=5,
+        max_num_iterations=2000,
+    )
 
-            adjuster(
-                batch_size=256,
-                residuals_chunk_size=2048,
-                window_pose=25,
-                window_depth=50,
-                gt_path=gt_path,
-                ba_path=reconstruction_path.replace("vggt", "vggt_ba"),
-                use_rerun=True,
-                spawn_rerun=False,
-                rerun_save_path=".",
-                scene_name=scene,
-            )
+    epo(
+        batch_size=256,
+        residuals_chunk_size=2048,
+        window_pose=25,
+        window_depth=50,
+        gt_path=gt_path,
+        ba_path=reconstruction_path.replace("vggt", "vggt_ba_ref"),
+        use_rerun=True,
+        spawn_rerun=True,
+        rerun_save_path=".",
+        scene_name=scene,
+    )
 
-            # Saving
-            save_points = True  # recall to set mean track len = 0 in colmap gui
-            opt = "optimized_reconstruction_GD/_current_test"
+    # Saving
+    save_points = True  # recall to set mean track len = 0 in colmap gui
+    opt = "optimized_reconstruction_GD/_current_test"
 
-            adjuster.to_colmap(
-                opt,
-                verbose=False,
-                max_points_per_image=100_000 // adjuster.num_images,
-                save_points=save_points,
-                final_dbscan_filtering=False,
-                dbscan_eps=0.1,
-                dbscan_min_samples=5,
-                gt_path=gt_path,
-            )
+    epo.to_colmap(
+        opt,
+        verbose=False,
+        max_points_per_image=100_000 // epo.num_images,
+        save_points=save_points,
+        final_dbscan_filtering=False,
+        dbscan_eps=0.1,
+        dbscan_min_samples=5,
+        gt_path=gt_path,
+    )

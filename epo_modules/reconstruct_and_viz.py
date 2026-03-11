@@ -16,7 +16,7 @@ from matplotlib.colors import Normalize
 
 
 class ReconstructAndVizModule:
-    """Module for reconstruction export and visualization functions. Just to have less code in Adjuster."""
+    """Module for reconstruction export and visualization functions. Just to have less code in epo."""
 
     @torch.no_grad()
     def visualize_residuals(
@@ -321,9 +321,6 @@ class ReconstructAndVizModule:
             "lr_q": self.q_lr,
             "lr_t": self.t_lr,
             "matcher_type": self.matcher_type,
-            
-
-
         }
         if hasattr(self, "mre"):
             training_logs["observations"] = self.pad_masks.params.sum().item()
