@@ -5,7 +5,7 @@ import numpy as np
 
 
 class MiscModule:
-    """Miscellaneous module for utility functions. Just to have less code in Adjuster."""
+    """Miscellaneous module for utility functions. Just to have less code in epo."""
 
     def __init__(self):
         self.name = "Miscellaneous Module"
@@ -161,7 +161,9 @@ class MiscModule:
 
         print("=" * w)
 
-    def fix_seed(self):
+    def fix_seed(self, mode="inference"):
+        assert mode in ["inference", "debug"]
+
         # 1. Standard Python/Numpy seeds
         random.seed(self.seed)
         np.random.seed(self.seed)
@@ -172,20 +174,23 @@ class MiscModule:
         torch.cuda.manual_seed_all(self.seed)  # For multi-GPU
 
         # debug
-        # torch.backends.cudnn.deterministic = True
-        # torch.backends.cudnn.benchmark = False
-        # torch.backends.cuda.matmul.allow_tf32 = False
-        # torch.backends.cudnn.allow_tf32 = False
+        if mode == "debug":
+            os.environ["PYTHONHASHSEED"] = "0"
+            os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # For debugging only - slow!
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
 
         # inference
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True
-        # torch.backends.cuda.matmul.allow_tf32 = True
-        # torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
+        if mode == "inference":
+            # faster but non-deterministic, which introduce a bit of variability in the results
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision("high")
 
     def __repr__(self):
-        repr_str = f"Adjuster(\n"
+        repr_str = f"epo(\n"
         repr_str += f"  Reconstruction path: {self.reconstruction_path}\n"
         repr_str += f"  Images path: {self.images_path}\n"
         repr_str += f"  Depths path: {self.depths_path}\n"
