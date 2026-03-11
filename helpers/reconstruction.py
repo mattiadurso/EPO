@@ -92,7 +92,7 @@ def dbscan_filter(reconstruction, eps=0.5, min_samples=20):
 
 @torch.no_grad()
 def build_reconstruction(
-    adjuster,
+    epo,
     output_path="optimized_reconstruction",
     save_points=True,
     verbose=False,
@@ -106,7 +106,7 @@ def build_reconstruction(
     Create a pycolmap.Reconstruction from images and intrinsics dictionaries.
 
     Args:
-        adjuster: Adjuster instance with images, poses, and intrinsics
+        epo: epo instance with images, poses, and intrinsics
         output_path: path to save the reconstruction
         save_points: whether to save 3D points from depth unprojection
         max_points_per_image: maximum number of 3D points per image (default: 100_000)
@@ -121,7 +121,7 @@ def build_reconstruction(
     camera_scales = {}
     unique_cam_ids = set()
 
-    for image_name, image_data in adjuster.images.items():
+    for image_name, image_data in epo.images.items():
         cam_id = image_data["cam_id"]
         scale = image_data.get("scale", 1.0)
         unique_cam_ids.add(cam_id)
@@ -138,7 +138,7 @@ def build_reconstruction(
         unique_cam_ids
     ):  # Fixed: iterate over unique camera IDs found in images
         # Get camera parameters as numpy array
-        model, params = adjuster.intrinsics.get_camera_parameters(cam_id)
+        model, params = epo.intrinsics.get_camera_parameters(cam_id)
         params = params.detach().cpu().float().numpy()
 
         # Get scale for this camera
@@ -165,7 +165,7 @@ def build_reconstruction(
 
         # Get image dimensions from first image with this cam_id
         sample_image = next(
-            (img for img in adjuster.images.values() if img["cam_id"] == cam_id), None
+            (img for img in epo.images.values() if img["cam_id"] == cam_id), None
         )
 
         if sample_image is None:
@@ -180,7 +180,7 @@ def build_reconstruction(
 
         # Convert cam_id to int for COLMAP
         if isinstance(cam_id, str):
-            cam_id_int = adjuster.intrinsics.image_to_tensor_idx[cam_id]
+            cam_id_int = epo.intrinsics.image_to_tensor_idx[cam_id]
         elif cam_id is None:
             cam_id_int = idx + 1  # assign a new ID
         elif isinstance(cam_id, int):
@@ -201,11 +201,9 @@ def build_reconstruction(
         reconstruction.add_camera(cam)
 
     # 2. Add images (poses)
-    for image_id, (image_name, image_data) in enumerate(
-        adjuster.images.items(), start=1
-    ):
+    for image_id, (image_name, image_data) in enumerate(epo.images.items(), start=1):
         # skip if image is blacklisted
-        if image_name in adjuster.blacklist:
+        if image_name in epo.blacklist:
             if verbose:
                 print(f"Skipping blacklisted image: {image_name}")
             continue
@@ -214,9 +212,9 @@ def build_reconstruction(
         scale = image_data.get("scale", 1.0)
 
         # Convert cam_id to int for COLMAP
-        cam_id_int = adjuster.intrinsics.image_to_tensor_idx[cam_id]
+        cam_id_int = epo.intrinsics.image_to_tensor_idx[cam_id]
         # Get rotation matrix and translation
-        q, t = adjuster.poses.get_image_qt([image_name])
+        q, t = epo.poses.get_image_qt([image_name])
         q = q.detach().cpu().numpy()
         t = t.detach().cpu().numpy()
 
@@ -240,27 +238,27 @@ def build_reconstruction(
             print("Unprojecting depth maps to 3D points...")
 
         # Compute fresh 3D world coordinates
-        adjuster.unproject_edges_to_3D()
+        epo.unproject_edges_to_3D()
 
         total_points = 0
-        image_names = sorted(list(adjuster.images.keys()))
+        image_names = sorted(list(epo.images.keys()))
 
         for image_id, image_name in enumerate(image_names, start=1):
             # Skip blacklisted images
-            if image_name in adjuster.blacklist:
+            if image_name in epo.blacklist:
                 if verbose:
                     print(f"Skipping blacklisted image: {image_name}")
                 continue
-            image_data = adjuster.images[image_name]
+            image_data = epo.images[image_name]
             cam_id = image_data["cam_id"]
             scale = image_data.get("scale", 1.0)
 
             # Get unprojected 3D points from edges_3D module
-            points_3D = adjuster.edges_3D.get_parameters([image_name])  # (1, N, 3)
+            points_3D = epo.edges_3D.get_parameters([image_name])  # (1, N, 3)
             points_3D = points_3D[0]  # (N, 3)
 
             # Get pad mask
-            pad_mask = adjuster.pad_masks.get_parameters([image_name])  # (1, N)
+            pad_mask = epo.pad_masks.get_parameters([image_name])  # (1, N)
             pad_mask = pad_mask[0]  # (N,)
 
             # Convert to numpy if needed
@@ -299,7 +297,7 @@ def build_reconstruction(
             # Get RGB values from original image
             if "image" in image_data:
                 image = image_data["image"].detach().cpu().numpy()  # (3, H, W)
-                edges_padded = adjuster.edges_padded.get_parameters(
+                edges_padded = epo.edges_padded.get_parameters(
                     [image_name]
                 )  # (1, N, 2)
                 edges_padded = edges_padded[0].detach().cpu().numpy()  # (N, 2)
