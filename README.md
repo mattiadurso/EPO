@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">EPO💉🩸: Boosting 3D Foundation Models with Featureless Pose Optimization</h1>
+  <h1 align="center">EPO: Boosting 3D Foundation Models with Featureless Pose Optimization</h1>
   <p align="center">
     <a href="https://scholar.google.com/citations?user=9FjTo3YAAAAJ&hl=en">Mattia D'Urso</a><sup>1</sup>
     ·
