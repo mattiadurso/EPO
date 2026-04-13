@@ -58,9 +58,7 @@ bicycle/
         └── ...
 ```
 
-
-
-and save the input in COLMAP format with the following format.
+and save the input in COLMAP format with the following format. A demo scene can be downloaded <a href="https://cloud.tugraz.at/index.php/s/dNfD96WNJ64kZCS">here</a>.
 
 ```
 bicycle/
