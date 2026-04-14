@@ -36,8 +36,29 @@ cd epo
 
 2. Create and activate the conda environment:
 ```bash
-conda env create -f environment.yml     # not there yet, but dependencies are minimal
+conda env create -f environment.yml
 conda activate epo
+```
+or
+```bash
+# 1. Create and activate the environment
+conda create -n epo python=3.10 -y
+conda activate epo
+
+# 2. Install all libraries 
+pip install h5py \
+            kornia \
+            matplotlib \
+            numpy \
+            opencv-python \
+            pandas \
+            pycolmap==3.11 \
+            pypose \
+            scikit-learn \
+            torch \
+            torchvision \
+            tqdm \
+            git+https://github.com/mattiadurso/mylib.git
 ```
 
 
