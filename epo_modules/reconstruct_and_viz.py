@@ -252,6 +252,7 @@ class ReconstructAndVizModule:
         dbscan_eps=0.05,
         dbscan_min_samples=5,
         gt_path=None,
+        save_depth=False,
     ):
         os.system(f"rm -rf {output_path}/*")
         recon = build_reconstruction(
@@ -275,6 +276,42 @@ class ReconstructAndVizModule:
                     --ref_model_path {gt_path} \
                     --alignment_max_error 1 > /dev/null 2>&1"
             )
+
+        if save_depth:
+            print("Saving depth maps...")
+            # saving depth in same format as input
+            import h5py
+
+            os.makedirs(os.path.join(output_path, "depth"), exist_ok=True)
+            for image_name, id in self.image_id_map.items():
+                # read depth, edges, padding and images size
+                depth = self.sampled_depth.get_parameters([id]).detach().cpu().squeeze()
+                edges_pad = (
+                    self.pad_masks.get_parameters([id]).detach().cpu().squeeze().float()
+                )
+                depth = depth * edges_pad  # N
+                edges = (
+                    self.edges_padded.get_parameters([id])
+                    .detach()
+                    .cpu()
+                    .squeeze()
+                    .long()
+                )  # N,2
+
+                hw = self.images[image_name]["hw"]
+                hw_array = torch.zeros(hw, device="cpu")
+
+                # populate hw_array at edges location with depth values
+                hw_array[edges[:, 1], edges[:, 0]] = depth
+                # create cam folder
+                cam = image_name.split("/")[0]
+                os.makedirs(os.path.join(output_path, "depth", cam), exist_ok=True)
+                # saving depth
+                image_name = image_name.split(".")[0] + ".h5"
+                with h5py.File(
+                    os.path.join(output_path, "depth", image_name), "w"
+                ) as f:
+                    f.create_dataset("depth", data=hw_array.numpy(), compression="gzip")
 
         # save loading time and optimization time in timings.txt in same folder as output_path
         timings_path = os.path.join(output_path, "timings.txt")
