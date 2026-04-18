@@ -113,6 +113,9 @@ def build_reconstruction(
         dbscan_eps: epsilon for DBSCAN clustering
         dbscan_min_samples: min samples for DBSCAN clustering
     """
+    # free cache to avoid OOM while saving
+    torch.cuda.empty_cache()
+
     # Create empty reconstruction
     reconstruction = pycolmap.Reconstruction()
 
