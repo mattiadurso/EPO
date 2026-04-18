@@ -84,8 +84,8 @@ def log_reconstruction_rerun(
 
 if __name__ == "__main__":
 
-    dataset = "mipnerf360"
-    scene = "bicycle"
+    dataset = "terrasky3D"
+    scene = "vienna_state_opera"
 
     gt_path = f"/home/mattia/Desktop/datasets/{dataset}/{scene}/sparse_150"
     scene_path = f"optimized_reconstruction_GD/{scene}"

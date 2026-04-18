@@ -2,11 +2,11 @@ import os
 import time
 import json
 import argparse
-from adjuster import Adjuster
+from epo import EPO
 
 # Parse command-line arguments
 parser = argparse.ArgumentParser(description="Process dataset scenes")
-parser.add_argument("--dataset", type=str, default="mipnerf360", help="Dataset name")
+parser.add_argument("--dataset", type=str, default="all", help="Dataset name")
 parser.add_argument("--edges", type=str, default="canny", help="Edge type")
 parser.add_argument("--note", type=str, default="", help="Run note")
 parser.add_argument(
@@ -59,18 +59,25 @@ for dataset in datasets:
         )
         gt_path = os.path.join(dataset_cfg["gt_path"], scene, dataset_cfg["gt_folder"])
 
-        opt = f"benchmarks/{args.model}_edge_{args.edges}{args.note}/{dataset}/{scene}/sparse"
+        note = "_" + args.note if args.note != "" else ""
+        opt = (
+            f"benchmarks/{args.model}_edge_{args.edges}{note}/{dataset}/{scene}/sparse"
+        )
 
         os.makedirs(opt, exist_ok=True)
 
+        if args.model != "vggt":
+            reconstruction_path = reconstruction_path.replace("vggt", args.model)
+            depths_path = depths_path.replace("vggt", args.model)
+
         # ==============================================================================
-        #                     Adjuster
+        #                     epo
         # ==============================================================================
 
-        adjuster = Adjuster(
-            reconstruction_path=reconstruction_path.replace("vggt", args.model),
+        epo = EPO(
+            reconstruction_path=reconstruction_path,
             images_path=images_path,
-            depths_path=depths_path.replace("vggt", args.model),
+            depths_path=depths_path,
             # grad_q=True,
             # grad_t=True,
             grad_t_offset=True,
@@ -80,31 +87,36 @@ for dataset in datasets:
             detector=args.edges,
             # q_lr=1e-4,
             # t_lr=1e-3,
-            k_lr=1e-3,
+            k_lr=3e-3,
             z_lr=3e-3,
             mlp_pose_lr=3e-3,
             max_edges_points=12_288,
             max_viewgraph_pairs=4_096,
             single_camera_per_folder=True,
             max_num_iterations=args.max_iterations,
-            viz=True,
-            verbose=False,
+            verbose=True,
+            # viewgraph params
+            min_points=750,
+            sampling_factor=5,
+            reprojection_error=3,
+            auc_saving_freq=100,
         )
 
         # run the optimization
-        adjuster(
+        epo(
+            window_pose=25,
+            window_depth=50,
             convergence_tol_pose=0.5,  # degrees
             convergence_tol_depth=0.1,  # relative change %
-            convergence_tol_loss=5e-5,  # relative change %
-            window_loss=50,
-            # gt_path=gt_path,
+            # convergence_tol_loss=5e-5,  # relative change %
+            gt_path=gt_path,
             early_stop=args.early_stop,
         )
 
-        adjuster.to_colmap(
+        epo.to_colmap(
             opt,
             verbose=False,
-            max_points_per_image=100_000 // len(adjuster.images),
+            max_points_per_image=100_000 // len(epo.images),
             save_points=True,
             final_dbscan_filtering=False,
         )

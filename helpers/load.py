@@ -4,16 +4,14 @@ import glob
 from typing import List
 import torch
 import pycolmap
+import h5py
+import torch.nn.functional as F
 import numpy as np
-from tqdm import tqdm
 from pathlib import Path
 
 from PIL import Image
 from torchvision import transforms as TF
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import h5py
-import torch.nn.functional as F
-import torchvision.transforms.functional as TVF
 
 
 ### Loading and preprocessing images and depths
@@ -166,10 +164,6 @@ def load_and_preprocess_images(
             for img_path in image_path_list
         ]
 
-        # Collect results as they complete
-        # for future in tqdm(
-        #     as_completed(futures), total=len(futures), desc="Loading images"
-        # ):
         for future in as_completed(futures):
             image_name, img_tensor, coords, scale = future.result()
             images_dict[image_name] = {
@@ -185,12 +179,16 @@ def load_and_preprocess_images(
 def _process_single_depth(
     depth_path, image_name, image_info, target_size, load_with_pad
 ):
-    """Helper function to process a single depth map."""
+    """Helper function to process a single depth map.
+
+    Loads a depth map, crops it to match the original image dimensions (center crop
+    if depth is larger), then resizes it to match the preprocessed image exactly.
+    """
     # Load depth from h5 file
     depth_file = Path(depth_path) / (image_name.split(".")[0] + ".h5")
 
     if not depth_file.exists():
-        return image_name, None
+        return image_name, None, None
 
     h5 = h5py.File(depth_file, "r")
     depth = h5["depth"][()]
@@ -206,15 +204,70 @@ def _process_single_depth(
     else:
         confidence_tensor = None
 
-    # Get original dimensions
-    h, w = depth_tensor.shape[-2:]
+    # Get original image dimensions from image_info
+    # coords stores [x1, y1, x2, y2, orig_width, orig_height]
+    orig_w = int(image_info["coords"][4].item())
+    orig_h = int(image_info["coords"][5].item())
+    # scale according to target size
+    scale = target_size / max(orig_w, orig_h)
+    orig_w, orig_h = int(orig_w * scale), int(orig_h * scale)
+
+    # Get depth map dimensions
+    depth_h, depth_w = depth_tensor.shape[-2:]
+
+    # If depth map is larger than the original image, center crop to original image size
+    if depth_h > orig_h or depth_w > orig_w:
+        crop_top = max((depth_h - orig_h) // 2, 0)
+        crop_left = max((depth_w - orig_w) // 2, 0)
+        crop_h = min(orig_h, depth_h)
+        crop_w = min(orig_w, depth_w)
+
+        depth_tensor = depth_tensor[
+            :,
+            :,
+            crop_top : crop_top + crop_h,
+            crop_left : crop_left + crop_w,
+        ]
+        if confidence_tensor is not None:
+            confidence_tensor = confidence_tensor[
+                :,
+                :,
+                crop_top : crop_top + crop_h,
+                crop_left : crop_left + crop_w,
+            ]
+    else:
+        # # pad border such that depth map has same size as original image
+        # pad_h = max(orig_h - depth_h, 0)
+        # pad_w = max(orig_w - depth_w, 0)
+
+        # depth_tensor = F.pad(
+        #     depth_tensor,
+        #     (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2),
+        #     mode="constant",
+        #     value=float("nan"),
+        # )
+        # if confidence_tensor is not None:
+        #     confidence_tensor = F.pad(
+        #         confidence_tensor,
+        #         (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2),
+        #         mode="constant",
+        #         value=0.0,
+        #     )
+        pass
+
+    # If depth map is smaller than original image, just use it as-is
+    # (it will be resized to match the image below)
+
+    # Now depth_tensor should correspond to the original image content.
+    # Resize it exactly the same way the image was resized.
+    depth_h, depth_w = depth_tensor.shape[-2:]
 
     if load_with_pad:
         # Pad to square (same logic as image loading)
-        max_dim = max(h, w)
+        max_dim = max(depth_h, depth_w)
 
-        pad_h = max_dim - h
-        pad_w = max_dim - w
+        pad_h = max_dim - depth_h
+        pad_w = max_dim - depth_w
 
         # Symmetric pad: (left, right, top, bottom)
         pad = (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2)
@@ -226,7 +279,7 @@ def _process_single_depth(
                 confidence_tensor, pad, mode="constant", value=0.0
             )
 
-        # Resize to target size
+        # Resize to target size (square)
         depth_tensor = F.interpolate(
             depth_tensor,
             size=(target_size, target_size),
@@ -240,41 +293,27 @@ def _process_single_depth(
                 mode="bilinear",
                 align_corners=False,
             )
-
     else:
-        # Resize such that longest edge is target_size. It might be square if from vggt.
-        x1, y1, x2, y2, _, _ = [int(_) for _ in image_info["coords"]]
-
-        # estimate pad
-        pad_x = (depth_tensor.shape[-1] - (x2 - x1)) // 2  # cutting
-        pad_y = (depth_tensor.shape[-2] - (y2 - y1)) // 2
-
-        # cutting
-        depth_tensor = depth_tensor[
-            :, :, y1 + pad_y : y2 + pad_y, x1 + pad_x : x2 + pad_x
-        ]
-        if confidence_tensor is not None:
-            confidence_tensor = confidence_tensor[
-                :, :, y1 + pad_y : y2 + pad_y, x1 + pad_x : x2 + pad_x
-            ]
-
-        h, w = depth_tensor.shape[-2:]
-        if w >= h:
-            scale = target_size / w
+        # Resize preserving aspect ratio such that longest edge is target_size
+        # This matches the logic in _process_single_image
+        if depth_w >= depth_h:
+            scale = target_size / depth_w
         else:
-            scale = target_size / h
+            scale = target_size / depth_h
 
-        # Resize to target size
+        new_h = int(depth_h * scale)
+        new_w = int(depth_w * scale)
+
         depth_tensor = F.interpolate(
             depth_tensor,
-            size=(int(h * scale), int(w * scale)),
+            size=(new_h, new_w),
             mode="bilinear",
             align_corners=False,
         )
         if confidence_tensor is not None:
             confidence_tensor = F.interpolate(
                 confidence_tensor,
-                size=(int(h * scale), int(w * scale)),
+                size=(new_h, new_w),
                 mode="bilinear",
                 align_corners=False,
             )
@@ -317,7 +356,8 @@ def load_and_preprocess_depths(
         )
         return images_dict
 
-    # Process depths in parallel
+    # Process depths in
+    max_workers = 1
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks
         futures = [

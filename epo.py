@@ -63,7 +63,7 @@ sys.path.append("/home/mattia/Desktop/Repos/posebench/benchmarks_3D")
 from benchmark_pose import eval_colmap_model
 
 
-class epo(nn.Module, MiscModule, ReconstructAndVizModule):
+class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
     """
     Module to adjust poses and intrinsics of a given reconstruction using edge alignment losses.
     Args:
@@ -1438,8 +1438,9 @@ class epo(nn.Module, MiscModule, ReconstructAndVizModule):
 if __name__ == "__main__":
     import json
 
-    dataset = "mipnerf360"  # terrasky3D, mipnerf360,
-    scene = "bicycle"  # vienna_state_opera, bicycle, bonsai, statue, 7831862f02
+    dataset = "scannetpp"  # terrasky3D, mipnerf360,
+    scene = "5f99900f09"  # vienna_state_opera, bicycle, bonsai, statue, 7831862f02
+    model = "vggt"
 
     # Load dataset paths and parameters from JSON
     with open("benchmarks/paths.json") as f:
@@ -1468,23 +1469,13 @@ if __name__ == "__main__":
     )
     gt_path = os.path.join(dataset_cfg["gt_path"], scene, dataset_cfg["gt_folder"])
 
-    epo = epo(
+    reconstruction_path = reconstruction_path.replace("vggt", model)
+    depths_path = depths_path.replace("vggt", model)
+
+    epo = EPO(
         reconstruction_path=reconstruction_path,
         images_path=images_path,
         depths_path=depths_path,
-        k_lr=1e-3,
-        grad_k=False,
-        z_lr=3e-3,
-        grad_z=True,
-        mlp_pose_lr=3e-3,
-        use_mlp_pose_refinement=True,
-        matcher_type="exhaustive",
-        max_edges_points=12_288,
-        max_viewgraph_pairs=4_096,
-        single_camera_per_folder=True,
-        verbose=True,
-        auc_saving_freq=5,
-        max_num_iterations=2000,
     )
 
     epo(
@@ -1494,8 +1485,8 @@ if __name__ == "__main__":
         window_depth=50,
         gt_path=gt_path,
         ba_path=reconstruction_path.replace("vggt", "vggt_ba_ref"),
-        use_rerun=True,
-        spawn_rerun=True,
+        use_rerun=False,
+        spawn_rerun=False,
         rerun_save_path=".",
         scene_name=scene,
     )
