@@ -13,7 +13,7 @@ class CameraModule(BaseModule):
         k_params: torch.Tensor,
         lr: float = 1e-3,
         grad: bool = True,
-        warmup_steps: int = 25,
+        warmup_steps: int = 25, #25
         max_num_iterations: int = 1000,
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
@@ -186,8 +186,10 @@ class CameraModule(BaseModule):
 
         return k_model, k_params.squeeze()
 
-    def update_all_matrices(self):
+    def update_all_matrices(self, indices = None):
         """Init/Update all intrinsic matrices for all cameras and store them internally."""
+      
+      
         all_ids = self.keys
         self.cameras = None
         self.cameras = self.get_intrinsic_matrix(all_ids)
@@ -208,6 +210,18 @@ class CameraModule(BaseModule):
             s += f"  Camera {self.tensor_idx_to_image[i]}: Model={model}, Params={params.detach().cpu().tolist()}\n"
             count += 1
         return s
+
+####################################################################3
+
+    def add_element(self, new_image_name, new_id, new_params = None):
+        self.init_scheduler(warmup_steps=0, max_num_iterations = self.max_num_iterations)
+
+        super().add_element(new_image_name, new_id, new_params)
+
+        return 
+
+    def get_parameters_idx(self, indices, recurse=True):
+        return self.params[indices]
 
 
 # # explicit f

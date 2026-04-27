@@ -24,7 +24,7 @@ with open("benchmarks/paths.json") as f:
     paths_cfg = json.load(f)
 
 if args.dataset == "all":
-    datasets = ["mipnerf360", "terrasky3D", "scannetpp"]
+    datasets = ["mipnerf360", "terrasky3D", "scannetpp", "TUM_RGBD"]
 else:
     datasets = [args.dataset]
 
@@ -47,7 +47,7 @@ for dataset in datasets:
     for scene in scenes:
         # Compose paths using template
         images_path = os.path.join(
-            dataset_cfg["images_path"], scene, dataset_cfg["images_folder"]
+           dataset_cfg["base_path"], scene, dataset_cfg["images_folder"]
         )
         reconstruction_path = os.path.join(
             dataset_cfg["base_path"], scene, dataset_cfg["reconstruction_folder"]
@@ -57,7 +57,7 @@ for dataset in datasets:
             scene,
             dataset_cfg.get("depths_folder", dataset_cfg.get("depth_folder", "")),
         )
-        gt_path = os.path.join(dataset_cfg["gt_path"], scene, dataset_cfg["gt_folder"])
+        gt_path = os.path.join(dataset_cfg["base_path"], scene, dataset_cfg["gt_folder"])
 
         opt = f"benchmarks/{args.model}_edge_{args.edges}{args.note}/{dataset}/{scene}/sparse"
 
@@ -88,7 +88,8 @@ for dataset in datasets:
             single_camera_per_folder=True,
             max_num_iterations=args.max_iterations,
             viz=True,
-            verbose=False,
+            verbose=True,
+            auc_saving_freq=1
         )
 
         # run the optimization
@@ -97,7 +98,7 @@ for dataset in datasets:
             convergence_tol_depth=0.1,  # relative change %
             convergence_tol_loss=5e-5,  # relative change %
             window_loss=50,
-            # gt_path=gt_path,
+            gt_path = gt_path,
             early_stop=args.early_stop,
         )
 
@@ -114,3 +115,6 @@ print(f"Total time: {time.time() - s_time:.2f} seconds")
 
 # python test.py mipnerf360 --edges canny && python test.py terrasky3D --edges canny && python test.py scannetpp --edges canny
 # python test.py mipnerf360 --edges teed && python test.py terrasky3D --edges teed && python test.py scannetpp --edges teed
+
+
+#python test.py --dataset TUM_RGBD --edges canny 

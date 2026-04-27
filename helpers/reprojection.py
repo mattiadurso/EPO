@@ -330,6 +330,7 @@ def filter_viewgraph_by_reprojection_batched(
 
     Note: This assumes all images have the same resolution for batching.
     """
+
     filtered_viewgraph = []
     valid_points_per_pair = {}
 
@@ -340,6 +341,7 @@ def filter_viewgraph_by_reprojection_batched(
     # Get all camera data
     all_Ps = poses.get_projection_matrix(image_names)  # (N, 4, 4)
     cam_ids = [images[name]["cam_id"] for name in image_names]
+
     all_Ks = intrinsics.get_intrinsic_matrix(cam_ids)  # (N, 3, 3)
 
     # Pre-compute grids and world points for all images
@@ -358,8 +360,14 @@ def filter_viewgraph_by_reprojection_batched(
         images[first_img_name]["image"], sampling_factor=sampling_factor, border=border
     ).to(device)[None]
 
+
     num_pairs = len(viewgraph)
 
+    
+
+    # for batch_start in tqdm(
+    #     range(0, num_pairs, batch_size), desc="Filtering viewgraph"
+    # ):
     for batch_start in range(0, num_pairs, batch_size):
         batch_end = min(batch_start + batch_size, num_pairs)
         batch_pairs = viewgraph[batch_start:batch_end]
@@ -388,6 +396,7 @@ def filter_viewgraph_by_reprojection_batched(
 
         # Expand grid
         kpts0 = grid.expand(current_batch_size, -1, -1)  # (B, N, 2)
+        tot = kpts0.shape[1]
 
         # Forward projection: img_i -> img_j
         kpts1 = reproject_2D_2D(
@@ -438,8 +447,9 @@ def filter_viewgraph_by_reprojection_batched(
 
             if num_valid >= min_points:
                 filtered_viewgraph.append((i_name, j_name))
-            # all pairs
-            valid_points_per_pair[(i_name, j_name)] = num_valid
+                valid_points_per_pair[(i_name, j_name)] = num_valid
+
+            # print(f"Pair ({i_name}, {j_name}): {num_valid}/{tot} valid points")
 
     if verbose:
         print(

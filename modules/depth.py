@@ -11,7 +11,7 @@ class DepthModule(BaseModule):
         depth: torch.Tensor,
         lr: float = 5e-3,
         grad: bool = True,
-        warmup_steps: int = 25,
+        warmup_steps: int = 25, #25
         max_num_iterations: int = 1000,
         device="cuda",
         dtype=torch.float32,
@@ -68,6 +68,51 @@ class DepthModule(BaseModule):
     def __repr__(self):
         out = f"Depth" + f"parameters={len(self.params.data.detach().tolist()):,})"
         return out
+    
+    #####################################################################################################################
+
+    def get_parameters_idx(self, indices, recurse=True):
+        return self.params[indices]
+
+
+    def add_element(self, 
+                    new_image_name, 
+                    new_id, 
+                    new_sampled_depth,
+                    lr: float = 5e-4
+                    ):
+
+
+        super().add_element(new_image_name, new_id)
+        
+        # Depth
+        # 1- concat new depth to old tensor
+        new_z = new_sampled_depth.unsqueeze(0).to(self.params.device)
+        self.depth = torch.cat([self.depth, new_z], dim=0) 
+
+        # Depth params
+        # 2. Create new parameters (a=0, b=0) for the new element
+        new_params_val = torch.zeros(
+            (1, self.depth.shape[1], 2), 
+            device=self.device, 
+            dtype=self.dtype
+        )
+
+        # 3. Concatenate and re-wrap as nn.Parameter
+        # We use .data or .detach() to avoid tracking the cat operation in the gradient history
+        updated_params = torch.cat([self.params.data, new_params_val], dim=0)
+        self.params = nn.Parameter(updated_params, requires_grad=self.params.requires_grad)
+
+
+        # Update params
+
+        self.lr = float(lr)
+
+        self.init_optimizer(lr=self.lr)
+        self.init_scheduler(warmup_steps=0, max_num_iterations = self.max_num_iterations)
+
+        return 
+    
 
 
 # # depth class to use for test with Z optimized as free variable

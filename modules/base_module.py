@@ -102,3 +102,26 @@ class BaseModule(nn.Module):
         """Perform optimizer step and update scheduler based on loss."""
         self.optimizer.step()
         self.scheduler.step()
+
+    ##########################################################################################################################
+
+    def add_element(
+            self,
+            new_image_name: str,
+            new_id : int,
+            new_params: [torch.Tensor | None] = None,
+        ):
+        """Add to the module a new entry"""
+
+        # 1: Update the dictionary
+        self.image_to_tensor_idx[new_image_name] = new_id
+        
+        # 1b: Update the reverse mapping to keep it in sync
+        self.tensor_idx_to_image[new_id] = new_image_name
+
+        # 2; Update the parameters
+        if new_params is not None and self.params is not None: 
+            new_params = new_params.unsqueeze(0).to(self.params.device)
+            self.params = torch.cat([self.params, new_params], dim=0) 
+     
+        return

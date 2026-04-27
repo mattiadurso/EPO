@@ -91,7 +91,7 @@ class PoseRefinementMLP(nn.Module):
 
         return poses_ortho
 
-    def forward(self, x):
+    def forward(self, x, sum=True):
         """
         Args:
             initial_pose_flat: (Batch_Size, 3, 4) tensor containing 3x4 matrices pose.
@@ -110,9 +110,10 @@ class PoseRefinementMLP(nn.Module):
         x4 = self.act(self.fc4(x3))
         x5 = self.act(self.fc5(x4))
 
-        x6 = self.fc6(x5) + x0  # P = MLP(P) + P
+        x6 = self.fc6(x5) + (x0 if sum else 0)  # P = MLP(P) + P
 
-        return self.gram_schmidt(x6.view(B, H, W))
+        return self.gram_schmidt(x6.view(B, H, W)) if sum else x6.view(B, H, W)
+
 
 
 if __name__ == "__main__":

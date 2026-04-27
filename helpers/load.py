@@ -15,6 +15,8 @@ import h5py
 import torch.nn.functional as F
 import torchvision.transforms.functional as TVF
 
+import matplotlib.pyplot as plt
+
 
 ### Loading and preprocessing images and depths
 def find_images(images_path: str) -> List[str]:
@@ -48,34 +50,44 @@ def find_images(images_path: str) -> List[str]:
 
 
 def _process_single_image(
-    image_path, images_path, target_size, to_tensor, load_with_pad
+    image_path, images_path, target_size, to_tensor, load_with_pad, rescale
 ):
     """Helper function to process a single image."""
     # Open image
     img = Image.open(image_path)
 
+    
     # If there's an alpha channel, blend onto white background
     if img.mode == "RGBA":
         background = Image.new("RGBA", img.size, (255, 255, 255, 255))
         img = Image.alpha_composite(background, img)
 
     # Convert to RGB
+   
     img = img.convert("RGB")
-
+    
     # Get original dimensions
     width, height = img.size
 
+   
+
+
     if load_with_pad:
+        max_dim = max(width, height)
+
+
+        scale = target_size / max_dim
 
         # Make the image square by padding the shorter dimension
-        max_dim = max(width, height)
 
         # Calculate padding
         left = (max_dim - width) // 2
         top = (max_dim - height) // 2
 
         # Calculate scale factor for resizing
-        scale = target_size / max_dim
+      
+        if rescale: 
+            scale = target_size / max_dim
 
         # Calculate final coordinates of original image in target space
         x1 = left * scale
@@ -95,8 +107,9 @@ def _process_single_image(
             (target_size, target_size), Image.Resampling.BICUBIC
         )
 
-    else:
+    elif (not load_with_pad and rescale):
         # resize such that longest edge is target_size
+        
         if width >= height:
             scale = target_size / width
         else:
@@ -106,12 +119,16 @@ def _process_single_image(
             (int(width * scale), int(height * scale)), Image.Resampling.BICUBIC
         )
         coords = np.array([0, 0, width * scale, height * scale, width, height])
+    else:
+        coords = np.array([0, 0, width, height, width, height])
 
     # Convert to tensor
-    img_tensor = to_tensor(square_img)
+    if rescale or load_with_pad: img_tensor = to_tensor(square_img)
+    else: img_tensor = to_tensor(img) 
 
     # Get image relative path wrt images_path
     image_name = Path(image_path).relative_to(images_path).as_posix()
+
 
     return image_name, img_tensor, coords, scale
 
@@ -122,6 +139,7 @@ def load_and_preprocess_images(
     target_size=1024,
     max_workers=20,
     load_with_pad=True,
+    rescale = False,
     dtype=torch.float32,
     device="cuda",
 ):
@@ -162,6 +180,7 @@ def load_and_preprocess_images(
                 target_size,
                 to_tensor,
                 load_with_pad,
+                rescale
             )
             for img_path in image_path_list
         ]
@@ -183,11 +202,12 @@ def load_and_preprocess_images(
 
 
 def _process_single_depth(
-    depth_path, image_name, image_info, target_size, load_with_pad
+    depth_path, image_name, image_info, target_size, load_with_pad, rescale
 ):
     """Helper function to process a single depth map."""
     # Load depth from h5 file
     depth_file = Path(depth_path) / (image_name.split(".")[0] + ".h5")
+
 
     if not depth_file.exists():
         return image_name, None
@@ -212,6 +232,9 @@ def _process_single_depth(
     if load_with_pad:
         # Pad to square (same logic as image loading)
         max_dim = max(h, w)
+
+        scale = target_size / max_dim
+
 
         pad_h = max_dim - h
         pad_w = max_dim - w
@@ -259,9 +282,10 @@ def _process_single_depth(
             ]
 
         h, w = depth_tensor.shape[-2:]
-        if w >= h:
+        
+        if rescale and w >= h:
             scale = target_size / w
-        else:
+        elif rescale:
             scale = target_size / h
 
         # Resize to target size
@@ -280,7 +304,9 @@ def _process_single_depth(
             )
 
     # Remove batch and channel dimensions
+    depth_tensor[depth_tensor==0] = np.nan
     depth_tensor = depth_tensor.squeeze()
+
     if confidence_tensor is not None:
         confidence_tensor = confidence_tensor.squeeze()
 
@@ -293,6 +319,7 @@ def load_and_preprocess_depths(
     target_size=518,
     max_workers=20,
     load_with_pad=False,
+    rescale = False,
     dtype=torch.float32,
     device="cuda",
 ):
@@ -328,6 +355,7 @@ def load_and_preprocess_depths(
                 images_dict[image_name],
                 target_size,
                 load_with_pad,
+                rescale
             )
             for image_name in images_dict.keys()
         ]
@@ -340,12 +368,14 @@ def load_and_preprocess_depths(
             try:
                 image_name, depth_tensor, confidence_tensor = future.result()
             except Exception as e:
-                print(f"Error processing depth for {image_name}: {e}")
+         
                 # if confidence map is missing, set to ones
                 image_name, depth_tensor = future.result()
+                print(f"Error processing depth for {image_name}: {e}")
                 confidence_tensor = None
 
             if depth_tensor is not None:
+                
                 images_dict[image_name].update(
                     {"depth": depth_tensor.to(device, dtype=dtype)}
                 )
@@ -374,7 +404,7 @@ def load_reconstruction(recon_path):
     return recon, cams, imgs, id_to_name, path
 
 
-def process_camera(camera, load_with_pad=False, images_size=518):
+def process_camera(camera, load_with_pad=False, images_size=518, rescale = False):
     # Convert a single pycolmap.Camera to torch tensor
     cam_id = camera.camera_id
     model = camera.model.name
@@ -399,7 +429,8 @@ def process_camera(camera, load_with_pad=False, images_size=518):
     pad_y = (max_dim - height) // 2 if load_with_pad else 0
 
     # Scale factor after resize
-    scale = images_size / max_dim
+    scale = 1 
+    if rescale: scale = images_size / max_dim
 
     # Apply padding shift + scale
     f = f * scale
@@ -414,6 +445,8 @@ def process_camera(camera, load_with_pad=False, images_size=518):
 def process_pose(image):
     # Convert a single pycolmap.Image to torch tensor
     # COLMAP's cam_from_world is already R_cw (world-to-camera rotation)
+
+
     R = torch.tensor(image.cam_from_world.rotation.matrix())
     t = torch.tensor(image.cam_from_world.translation).unsqueeze(1)
 

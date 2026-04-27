@@ -1,6 +1,7 @@
 import os
 import torch
 import pycolmap
+import argparse
 import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
@@ -59,12 +60,25 @@ def log_reconstruction_rerun(
 
         # Frustum visualization
         cam = recon.cameras[img.camera_id]
-        strips = get_frustum_strips(scale=0.15, w=cam.width, h=cam.height)
+        strips = get_frustum_strips(scale=0.0005, w=cam.width, h=cam.height)
         rr.log(
-            f"world/{entity}/{img.name}/cam",
-            rr.LineStrips3D(strips, colors=camera_color, radii=0.005),
+            f"world/{entity}/{img.name}/pincam",
+            rr.LineStrips3D(strips, colors=camera_color, radii=0.05), #0.005
             static=static_cameras,
         )
+        
+        #entity_path = f"world/{entity}/{img.name}"
+        # K = cam.calibration_matrix()
+        # rr.log(
+        #     f"{entity_path}/pincam", # Must be a child of the transform entity
+        #     rr.Pinhole(
+        #         image_from_camera=K,
+        #         width=cam.width,
+        #         height=cam.height,
+        #     ),
+        #     static=static_cameras,
+        # )
+    
 
     # Log GT Point Cloud
     if len(recon.points3D) > 0 and points3D:
@@ -77,23 +91,50 @@ def log_reconstruction_rerun(
 
         rr.log(
             f"world/{entity}/points",
-            rr.Points3D(np.array(pts), colors=np.array(colors), radii=0.01),
+            rr.Points3D(np.array(pts), colors=np.array(colors), radii=0.001),
             static=static_points,
         )
 
 
 if __name__ == "__main__":
 
+    parser = argparse.ArgumentParser("plot VGGT or ToF data")
+
+    parser.add_argument("-r", "--reconstruction", type=str, default="VGGT", help="Recontruction to visualize")
+
+    args = parser.parse_args()
+
+
     dataset = "mipnerf360"
-    scene = "bicycle"
+
+    if(args.reconstruction == "VGGT"):
+        scene = "fr_desk_VGGT_K"
+    elif (args.reconstruction == "TOF"):
+        scene = "fr_desk_TOF_test"
 
     gt_path = f"/home/mattia/Desktop/datasets/{dataset}/{scene}/sparse_150"
     scene_path = f"optimized_reconstruction_GD/{scene}"
-    ba_path = f"benchmarks/vggt_ba/{dataset}/{scene}/sparse"
-    ba_ref_path = f"benchmarks/vggt_ba_ref/{dataset}/{scene}/sparse"
+
+
+    if(args.reconstruction == "VGGT"):
+        base_path = "/media/leonardo/Leo_HD/data/TUM_RGBD_EPO/fr1_desk"
+
+        reconstruction_path = os.path.join(base_path, "VGGT/0")
+        images_path = os.path.join(base_path, "VGGT/images")
+        depths_path = os.path.join(base_path, "VGGT/depth")
+        gt_path = os.path.join(base_path, "VGGT/GT")
+
+    elif (args.reconstruction == "TOF"):
+        base_path = "/media/leonardo/Leo_HD/data/TUM_RGBD_EPO/fr1_desk/final_data/mapping"
+
+        reconstruction_path = os.path.join(base_path, "noisy_1")
+        images_path = os.path.join(base_path, "images")
+        depths_path = os.path.join(base_path,"depth_h5") #"depth_h5_syn")
+        #gt_path = os.path.join("/media/leonardo/Leo_HD/data/TUM_RGBD_EPO/fr1_desk", "VGGT/GT")
+        gt_path = os.path.join(base_path, "0")
 
     # align all to gt
-    for path in [scene_path, ba_path, ba_ref_path]:
+    for path in [scene_path, reconstruction_path]:
         os.system(
             f"colmap model_aligner --input_path {path} --output_path {path} --ref_model_path {gt_path} --alignment_max_error 1"
         )
@@ -114,6 +155,6 @@ if __name__ == "__main__":
     # logs
     log_reconstruction_rerun(gt_path, "gt", camera_color=[28, 186, 81], points3D=True)
 
-    log_reconstruction_rerun(scene_path, "opt", camera_color=[150, 3, 26])
-    log_reconstruction_rerun(ba_path, "ba", camera_color=[71, 168, 216])
-    log_reconstruction_rerun(ba_ref_path, "ba_ref", camera_color=[9, 73, 110])
+    log_reconstruction_rerun(scene_path, "opt", camera_color=[5, 15, 150] )
+    log_reconstruction_rerun(reconstruction_path, "vggt", camera_color=[150, 3, 26])
+

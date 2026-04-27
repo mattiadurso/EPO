@@ -1,0 +1,20 @@
+{
+    "TUM_RGBD":{        
+        "base_path": "/media/leonardo/Leo_HD/data/TUM_RGBD_EPO" ,
+        "images_folder": "VGGT/images" ,
+        "depth_folder": "VGGT/depth",
+        "reconstruction_folder" : "VGGT/0",
+        "gt_folder" : "VGGT/GT"
+    } 
+}
+
+{
+    "TUM_RGBD":{        
+        "base_path": "/media/leonardo/Leo_HD/data/TUM_RGBD_EPO" ,
+        "images_folder": "images" ,
+        "depth_folder": "depth_h5_syn",
+        "reconstruction_folder" : "noise_pose",
+        "gt_folder" : "0"
+    }
+    
+}
