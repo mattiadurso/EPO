@@ -322,7 +322,7 @@ class ReconstructAndVizModule:
             # total at the end
             total = 0.0
             for key, value in self.timings.items():
-                if "total" in key:
+                if "total_" in key:
                     total += value
                     f.write(f"{key}: {value}\n")
             f.write(f"total: {total}\n")
