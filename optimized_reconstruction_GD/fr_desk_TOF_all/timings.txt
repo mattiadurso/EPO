@@ -1,0 +1,19 @@
+load_images: 1.0783 s
+load_poses_and_intrinsics: 0.1652 s
+load_depth_maps: 4.4844 s
+extract_edges: 2.7204 s
+compute_distance_fields: 0.4988 s
+compute_viewgraph: 7.3441 s
+step_pre_computation: 14.4585 s
+prepare_batched_inputs: 16.5409 s
+forward_pass: 509.0239 s
+loss_computation: 603.2863 s
+gradients_computation: 455.7320 s
+parameters_update: 6.2021 s
+logging: 454.7587 s
+early_stop_check: 4.8879 s
+pose_convergence_time: 46.3973 s
+total_loading: 17.287147283554077
+total_optimization: 2090.746126651764
+total: 2108.033273935318
+total: 4216.066547870636

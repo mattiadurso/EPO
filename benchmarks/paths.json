@@ -1,0 +1,25 @@
+{
+    "TUM_RGBD":{
+        "base_path": "/media/leonardo/Leo_HD/data/EPO_track/TUM_RGBD" ,
+        "images_folder": "data/images" ,
+        "depth_folder": "data/depth_refined_h5",
+        "reconstruction_folder" : "data/noisy_1",
+        "gt_folder" : "data/1"
+    },
+    "Replica":{        
+        "base_path": "/media/leonardo/Leo_HD/data/EPO_track/ScanNet/data/scans" ,
+        "images_folder": "data/images" ,
+        "depth_folder": "data/depth_refined_h5",
+        "reconstruction_folder" : "data/noisy_1",
+        "gt_folder" : "data/1"
+    },
+    "Scannet":{        
+        "base_path": "/media/leonardo/Leo_HD/data/EPO_track/TUM_RGBD/Scannet" ,
+        "images_folder": "images" ,
+        "depth_folder": "depth_refined_h5",
+        "reconstruction_folder" : "noisy_1",
+        "gt_folder" : "1"
+    }
+    
+}
+
