@@ -1722,34 +1722,36 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         # === Pose ===
 
         # ---- LAST FRAME ----
-        P_prev = self.poses.poses[prev_idx].detach() 
+        # P_prev = self.poses.poses[prev_idx].detach() 
 
-        R_init = P_prev[:3, :3].clone()
-        t_init_physical = P_prev[:3, 3].clone()
+        # R_init = P_prev[:3, :3].clone()
+        # t_init_physical = P_prev[:3, 3].clone()
 
-        t_init_norm = (t_init_physical - self.poses.t_mean.squeeze()) / self.poses.t_scale
+        # t_init_norm = (t_init_physical - self.poses.t_mean.squeeze()) / self.poses.t_scale
 
 
         # ---- CONSTANT SPEED ----
 
-        # P_prev  = self.poses.poses[prev_idx].detach()
-        # P_prev2 = self.poses.poses[prev_idx_2].detach()
+        P_prev  = self.poses.poses[prev_idx].detach()
+        P_prev2 = self.poses.poses[prev_idx_2].detach()
 
-        # R_prev  = P_prev[:3, :3]
-        # # R_prev2 = P_prev2[:3, :3]
-        # # R_delta = R_prev @ R_prev2.T
-        # # R_init  = R_delta @ R_prev
-        # R_init = R_prev
+        R_prev  = P_prev[:3, :3]
+        R_prev2 = P_prev2[:3, :3]
+        R_delta = R_prev @ R_prev2.T
+        R_init  = R_delta @ R_prev
+        R_init = R_prev
 
-        # t_prev_physical  = P_prev[:3, 3]
-        # t_prev2_physical = P_prev2[:3, 3]
-        # t_init_norm = (2 * t_prev_physical - t_prev2_physical - self.poses.t_mean.squeeze()) / self.poses.t_scale
+        t_prev_physical  = P_prev[:3, 3]
+        t_prev2_physical = P_prev2[:3, 3]
+        alpha = 1  # fraction of velocity step to apply (0 = copy last pose, 1 = full constant velocity)
+        t_pred_physical = t_prev_physical + alpha * (t_prev_physical - t_prev2_physical)
+        t_init_norm = (t_pred_physical - self.poses.t_mean.squeeze()) / self.poses.t_scale
 
 
         self.poses.add_element(
             image_name = image_name,
             R_new = R_init,
-            t_new = t_init_norm /4,
+            t_new = t_init_norm ,
             #t_offset_new = t_offset_init
 
             mlp_lr= self.mlp_pose_lr
@@ -1966,6 +1968,8 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.poses.q_param.data[new_frame_idx] = q_frame.detach()
             self.poses.t_param.data[new_frame_idx] = t_frame.detach()
         self.poses.update_matrix_direct(new_frame_idx)
+
+        return loss
         
     def unproject_edge_to_3D(self, image_name):
         """Unproject 2D edges to 3D points for the given frame and update edges_3D in-place."""
@@ -2019,7 +2023,7 @@ class FrameOptimizer:
 
         end_add = time.time()
 
-        self.adj.forward_frame(image_name, 
+        loss = self.adj.forward_frame(image_name, 
                                refinement_iteration=self.refinement_iterations,
                                q_lr=self.frame_lr, 
                                t_lr=self.frame_lr)
@@ -2027,7 +2031,7 @@ class FrameOptimizer:
         end_opt = time.time()
         self.frame_count += 1
 
-        return  end_opt-start, end_opt-end_add, end_add-start
+        return  loss, end_opt-start, end_opt-end_add, end_add-start
    
 
     
