@@ -993,6 +993,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         drop_last=True,
     ):
         """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss."""
+        
         # reduce viewgraph if too large
         if len(sampled_viewgraph) > self.max_viewgraph_pairs:
             indices = torch.randperm(len(sampled_viewgraph))[: self.max_viewgraph_pairs]
@@ -1652,11 +1653,15 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         # Last frame index
         sorted_keys = sorted(self.images.keys())
 
+        if image_name in self.images.keys(): return
+
         rev_iter = reversed(sorted_keys)
         prev_image_name_1 = next(rev_iter)
         prev_idx = self.image_id_map[prev_image_name_1]
 
         prev_image_name_2 = next(rev_iter)
+        prev_idx_2 = self.image_id_map[prev_image_name_2]
+
 
         image_path = os.path.join(images_path, image_name)
 
@@ -1717,8 +1722,6 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         # === Pose ===
 
         # ---- LAST FRAME ----
-
-
         P_prev = self.poses.poses[prev_idx].detach() 
 
         R_init = P_prev[:3, :3].clone()
@@ -1727,10 +1730,26 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         t_init_norm = (t_init_physical - self.poses.t_mean.squeeze()) / self.poses.t_scale
 
 
+        # ---- CONSTANT SPEED ----
+
+        # P_prev  = self.poses.poses[prev_idx].detach()
+        # P_prev2 = self.poses.poses[prev_idx_2].detach()
+
+        # R_prev  = P_prev[:3, :3]
+        # # R_prev2 = P_prev2[:3, :3]
+        # # R_delta = R_prev @ R_prev2.T
+        # # R_init  = R_delta @ R_prev
+        # R_init = R_prev
+
+        # t_prev_physical  = P_prev[:3, 3]
+        # t_prev2_physical = P_prev2[:3, 3]
+        # t_init_norm = (2 * t_prev_physical - t_prev2_physical - self.poses.t_mean.squeeze()) / self.poses.t_scale
+
+
         self.poses.add_element(
             image_name = image_name,
             R_new = R_init,
-            t_new = t_init_norm,
+            t_new = t_init_norm /4,
             #t_offset_new = t_offset_init
 
             mlp_lr= self.mlp_pose_lr
@@ -1813,7 +1832,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
 
         # New pairs: connect the new frame to every existing frame it overlaps with.
-        existing_names = [n for n in self.images.keys() if n != image_name]
+        existing_names = [n for n in sorted(self.images.keys()) if n != image_name]
         existing_names = existing_names[-window_size:]
         candidate_pairs = list([(image_name, n) for n in existing_names])
 
@@ -1883,6 +1902,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         )
         local_viewgraph = self.viewgraph_ids[new_frame_mask]
 
+        #print(local_viewgraph)
+        local_viewgraph = torch.cat([local_viewgraph, local_viewgraph[:, [1, 0, 2, 3]]], dim=0)
+
         if local_viewgraph.numel() == 0:
             print(f"Warning: No overlapping frames found for {image_name}.")
             return image_name
@@ -1914,7 +1936,11 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 q_override=q_frame, 
                 t_override=t_frame)
             self.intrinsics.update_all_matrices()
-            self.unproject_edge_to_3D(image_name)                                                                
+            self.unproject_edge_to_3D(image_name)    
+
+            
+
+                                                            
 
             residuals, sampled_viewgraphs = self.compute_forward_step(
                 local_viewgraph,
@@ -1982,16 +2008,26 @@ class FrameOptimizer:
         self.frame_count = 0
    
     def track(self, images_path, depths_path, image_name, camera, image):
+        start = time.time()
+
+
         self.adj.add_frame(images_path, 
                            depths_path, 
                            image_name, 
                            camera, image,
                            window_size=self.window_size)
+
+        end_add = time.time()
+
         self.adj.forward_frame(image_name, 
-                               refinement_iteration=50,
+                               refinement_iteration=self.refinement_iterations,
                                q_lr=self.frame_lr, 
                                t_lr=self.frame_lr)
+        
+        end_opt = time.time()
         self.frame_count += 1
+
+        return  end_opt-start, end_opt-end_add, end_add-start
    
 
     

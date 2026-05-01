@@ -1,18 +1,18 @@
-load_images: 0.5656 s
-load_poses_and_intrinsics: 0.2510 s
-load_depth_maps: 2.9905 s
-extract_edges: 0.7172 s
-compute_distance_fields: 0.1618 s
-compute_viewgraph: 0.2818 s
-step_pre_computation: 0.5963 s
-prepare_batched_inputs: 0.5305 s
-forward_pass: 14.4541 s
-loss_computation: 17.8070 s
-gradients_computation: 11.1474 s
-parameters_update: 0.2372 s
-logging: 81.1258 s
-early_stop_check: 0.1944 s
-pose_convergence_time: 63.6661 s
-total_loading: 5.601025581359863
-total_optimization: 0
-total: 5.601025581359863
+load_images: 0.2719 s
+load_poses_and_intrinsics: 0.1596 s
+load_depth_maps: 0.2745 s
+extract_edges: 0.4374 s
+compute_distance_fields: 0.1162 s
+compute_viewgraph: 0.1020 s
+step_pre_computation: 1.6437 s
+prepare_batched_inputs: 0.3430 s
+forward_pass: 9.9546 s
+loss_computation: 11.3090 s
+gradients_computation: 4.2502 s
+parameters_update: 0.5006 s
+logging: 19.5283 s
+early_stop_check: 0.5028 s
+pose_convergence_time: 5.8218 s
+total_loading: 1.3954331874847412
+total_optimization: 48.34222984313965
+total: 49.73766303062439
