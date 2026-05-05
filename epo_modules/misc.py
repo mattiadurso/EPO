@@ -187,7 +187,13 @@ class MiscModule:
             # faster but non-deterministic, which introduce a bit of variability in the results
             torch.backends.cudnn.deterministic = False
             torch.backends.cudnn.benchmark = True
-            torch.set_float32_matmul_precision("high")
+
+            if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+                if "4090" in gpu_name:
+                    torch.set_float32_matmul_precision("high")
+                else:  # default behaviour
+                    torch.set_float32_matmul_precision("highest")
 
     def __repr__(self):
         repr_str = f"epo(\n"
