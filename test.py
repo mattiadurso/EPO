@@ -64,6 +64,10 @@ for dataset in datasets:
             f"benchmarks/{args.model}_edge_{args.edges}{note}/{dataset}/{scene}/sparse"
         )
 
+        if not os.path.isdir(reconstruction_path):
+            print("Skipping " + {reconstruction_path})
+            continue
+
         os.makedirs(opt, exist_ok=True)
 
         if args.model != "vggt":
