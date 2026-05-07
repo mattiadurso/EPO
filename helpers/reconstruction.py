@@ -148,23 +148,11 @@ def build_reconstruction(
         scale = camera_scales.get(cam_id, 1.0)
 
         # Apply inverse scaling to focal lengths (scale back to original)
-        if model == "PINHOLE":
-            params = params.copy()
-            params[0] /= scale  # fx
-            params[1] /= scale  # fy
-            params[2] /= scale  # cx
-            params[3] /= scale  # cy
-            model = pycolmap.CameraModelId.PINHOLE
-
-        elif model == "SIMPLE_PINHOLE":
-            params = params.copy()
-            params[0] /= scale  # f
-            params[1] /= scale  # cx
-            params[2] /= scale  # cy
-            model = pycolmap.CameraModelId.SIMPLE_PINHOLE
-
-        else:
-            raise ValueError(f"Unsupported camera model: {model}")
+        params = params.copy()
+        params[0] /= scale  # f
+        params[1] /= scale  # cx
+        params[2] /= scale  # cy
+        model = pycolmap.CameraModelId.SIMPLE_PINHOLE
 
         # Get image dimensions from first image with this cam_id
         sample_image = next(
