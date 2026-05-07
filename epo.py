@@ -1041,8 +1041,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         else:  # one camera per image
             # Reading cameras from images
             for cam in self.recon.cameras.values():
-                cam_id, model, new_params = process_camera(cam)
-                intrinsics[cam.camera_id] = {
+                _, model, new_params = process_camera(
+                    cam, self.load_with_pad, images_size=self.images_size
+                )
+                cam_id = str(cam.camera_id)
+                intrinsics[cam_id] = {
                     "cam_id": cam_id,
                     "model": model,
                     "parameters": new_params.to(self.device),
@@ -1078,7 +1081,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             if self.single_camera_per_folder:
                 cam_id = image.name.split("/")[0]
             else:
-                cam_id = image.camera_id
+                cam_id = str(image.camera_id)
 
             poses_temp[image.name] = {"R": R, "t": t, "cam_id": cam_id}
 
