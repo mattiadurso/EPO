@@ -14,7 +14,12 @@ from benchmark_pose import eval_colmap_model_all_scenes, eval_colmap_model
 def read_results(
     dataset, target_folder, models, thr=5, round_to=1, remove=[], full=False
 ):
+
     base_target = f"/home/mattia/Desktop/datasets/{dataset}"
+    if dataset == "imc":
+        base_target = (
+            "/home/mattia/Desktop/Repos/posebench/benchmarks_2D/imc/data/phototourism/"
+        )
     base_repo = "/home/mattia/Desktop/Repos/batchsfm/benchmarks"
     base_repo = (
         "/home/mattia/Desktop/Repos/batchsfm/benchmarks_full" if full else base_repo
