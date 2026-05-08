@@ -108,11 +108,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         device="cuda",
         max_workers=-1,
         detector_params={
-            "low_threshold": 0.20,
-            "high_threshold": 0.25,
-            "kernel_size": 7,
-            "sigma": 2,
-        },
+                "low_threshold": 0.15,
+                "high_threshold": 0.20,
+                "kernel_size": 9,
+                "sigma": 2,
+            },  # those seem to be better, before was 0.20, 0.25, 7, 2.0
         seed=0,
         max_edges_points=16_384,  # hard contraint due to memory on 24GB
         max_viewgraph_pairs=8_192,  # hard contraint due to memory on 24GB
