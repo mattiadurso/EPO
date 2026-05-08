@@ -108,11 +108,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         device="cuda",
         max_workers=-1,
         detector_params={
-                "low_threshold": 0.15,
-                "high_threshold": 0.20,
-                "kernel_size": 9,
-                "sigma": 2,
-            },  # those seem to be better, before was 0.20, 0.25, 7, 2.0
+            "low_threshold": 0.15,
+            "high_threshold": 0.20,
+            "kernel_size": 9,
+            "sigma": 2,
+        },  # those seem to be better, before was 0.20, 0.25, 7, 2.0
         seed=0,
         max_edges_points=16_384,  # hard contraint due to memory on 24GB
         max_viewgraph_pairs=8_192,  # hard contraint due to memory on 24GB
@@ -877,8 +877,14 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         batch_size=1024,
         residuals_chunk_size=1024,
         drop_last=True,
+        huber_delta=1.0,
+        clamp_max=10.0,
     ):
-        """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss."""
+        """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss.
+
+        ``huber_delta`` and ``clamp_max`` are forwarded to ``compute_chunk_loss_logic``
+        so robustification happens per-edge before the per-pair mean.
+        """
         # reduce viewgraph if too large
         if len(sampled_viewgraph) > self.max_viewgraph_pairs:
             # indices = torch.randperm(len(sampled_viewgraph))[: self.max_viewgraph_pairs]
@@ -936,8 +942,14 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 r_chunk = residuals[:, i : i + residuals_chunk_size]
                 m_chunk = valid_mask[:, i : i + residuals_chunk_size]
 
-                # Pass the clean residual chunk and the merged validity mask
-                s_chunk, c_chunk = compute_chunk_loss_logic(r_chunk, m_chunk)
+                # Per-sample clamp + Huber are applied inside the chunk logic so
+                # that outlier edges get capped before the per-pair mean reduction.
+                s_chunk, c_chunk = compute_chunk_loss_logic(
+                    r_chunk,
+                    m_chunk,
+                    clamp_max=clamp_max,
+                    huber_delta=huber_delta,
+                )
 
                 total_sum += s_chunk
                 total_count += c_chunk
@@ -962,23 +974,22 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
     def compute_batched_loss(
         self, residuals, sampled_viewgraphs=None, debug=False, delta=1.0
     ):
-        """Vectorized batched loss computation."""
+        """Vectorized batched loss computation.
+
+        ``residuals`` are already per-direction means of per-edge robustified
+        values (clamp + Huber are applied inside ``compute_chunk_loss_logic``).
+        Here we only aggregate the two directions of each pair and average
+        over pairs. The ``delta`` argument is kept for API compatibility but
+        is no longer used here -- pass it through ``compute_forward_step``.
+        """
         s_time = time.time()
 
         if residuals.numel() == 0:
             return torch.tensor(0.0, device=self.device)
 
-        residuals_pairs = residuals.view(-1, 2)
-        residuals_pairs = torch.clamp(residuals_pairs, min=0, max=10.0)
-
-        # Use Huber loss for robust cost
-        pair_losses = F.huber_loss(
-            residuals_pairs,
-            torch.zeros_like(residuals_pairs),
-            reduction="none",
-            delta=delta,
-        )
-        pair_losses = pair_losses.sum(dim=1)  # (num_pairs,)
+        # Each consecutive pair of entries corresponds to (i->j, j->i) for one
+        # viewgraph pair; sum the two directions to get the per-pair loss.
+        pair_losses = residuals.view(-1, 2).sum(dim=1)  # (num_pairs,)
 
         # if sampled_viewgraphs is given, store per-pair losses for logging
         if sampled_viewgraphs is not None and debug:
