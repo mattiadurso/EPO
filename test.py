@@ -89,6 +89,12 @@ for dataset in datasets:
             grad_z=True,
             use_mlp_pose_refinement=True,
             detector=args.edges,
+            detector_params={
+                "low_threshold": 0.15,
+                "high_threshold": 0.20,
+                "kernel_size": 9,
+                "sigma": 2,
+            },  # those seem to be better
             # q_lr=1e-4,
             # t_lr=1e-3,
             k_lr=3e-3,
@@ -113,7 +119,7 @@ for dataset in datasets:
             convergence_tol_pose=0.5,  # degrees
             convergence_tol_depth=0.1,  # relative change %
             # convergence_tol_loss=5e-5,  # relative change %
-            gt_path=gt_path,
+            # gt_path=gt_path,
             early_stop=args.early_stop,
         )
 

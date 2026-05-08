@@ -5,7 +5,7 @@ import torch.nn as nn
 
 class CannyEdgeDetector(nn.Module):
     """
-    A simple canny edge detector using kornia.
+    A simple canny edge detector using kornia implementation.
     """
 
     def __init__(
