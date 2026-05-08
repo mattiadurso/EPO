@@ -13,6 +13,8 @@ class DepthModule(BaseModule):
         grad: bool = True,
         warmup_steps: int = 25,
         max_num_iterations: int = 1000,
+        per_pixel: bool = True,
+        min_depth: float = 1e-3,
         device="cuda",
         dtype=torch.float32,
     ):
@@ -24,6 +26,12 @@ class DepthModule(BaseModule):
             grad: Whether to compute gradients
             warmup_steps: Number of warmup steps for learning rate scheduler
             max_num_iterations: Maximum number of optimization iterations
+            per_pixel: If True, optimize a (scale, shift) pair per pixel of each
+                depth map. If False, optimize a single (scale, shift) pair per
+                depth map (2 params per image).
+            min_depth: Minimum allowed depth value. The output depth is clamped
+                to be at least this value to keep points in front of the camera
+                and avoid negative/zero depths.
             device: Device to run the module on
             dtype: Data type for the tensors
 
@@ -39,10 +47,17 @@ class DepthModule(BaseModule):
         self.max_num_iterations = max_num_iterations
         self.lr = float(lr)
         self.depth = depth
+        self.per_pixel = per_pixel
+        self.min_depth = float(min_depth)
 
-        # Depth params
+        # Depth params: (N, P, 2) per-pixel or (N, 2) per-image
+        if per_pixel:
+            params_shape = (self.depth.shape[0], self.depth.shape[1], 2)
+        else:
+            params_shape = (self.depth.shape[0], 2)
+
         self.params = nn.Parameter(
-            torch.zeros(self.depth.shape[0], self.depth.shape[1], 2)
+            torch.zeros(*params_shape)
             .clone()
             .detach()
             .to(device=self.device, dtype=self.dtype),
@@ -58,9 +73,15 @@ class DepthModule(BaseModule):
         indices = self.map_names_to_indices(ids) if isinstance(ids[0], str) else ids
         # Need to return depth, not inverse depth
         z = self.depth[indices]
-        a = self.params[indices][:, :, 0]
-        b = self.params[indices][:, :, 1]
-        return z * (1 + a) + b
+        if self.per_pixel:
+            a = self.params[indices][:, :, 0]
+            b = self.params[indices][:, :, 1]
+        else:
+            # broadcast a single (scale, shift) pair across all pixels
+            a = self.params[indices][:, 0:1]
+            b = self.params[indices][:, 1:2]
+        # clamp to keep depths in front of the camera (z > 0)
+        return torch.clamp(z * (1 + a) + b, min=self.min_depth)
 
     def get_all_parameters(self):
         return self.get_parameters(list(self.image_to_tensor_idx.keys()))
@@ -68,56 +89,3 @@ class DepthModule(BaseModule):
     def __repr__(self):
         out = f"Depth" + f"parameters={len(self.params.data.detach().tolist()):,})"
         return out
-
-
-# # depth class to use for test with Z optimized as free variable
-# class DepthModule(BaseModule):
-#     def __init__(
-#         self,
-#         image_id_map: dict,
-#         depth: torch.Tensor,
-#         lr: float = 5e-3,
-#         grad: bool = True,
-#         warmup_steps: int = 25,
-#         max_num_iterations: int = 1000,
-#         device="cuda",
-#         dtype=torch.float32,
-#     ):
-#         """Depth module to hold depth parameters"""
-#         super().__init__(
-#             image_id_map=image_id_map,
-#             device=device,
-#             dtype=dtype,
-#         )
-#         self.lr = float(lr)
-
-#         # ID Mappings
-#         self.image_to_tensor_idx = image_id_map
-#         self.tensor_idx_to_image = {v: k for k, v in image_id_map.items()}
-
-#         # storing as inverse depth for better numerical stability
-#         depth = depth.pow(-1)
-
-#         self.params = nn.Parameter(
-#             depth.clone().detach().to(device=self.device, dtype=self.dtype),
-#             requires_grad=grad,
-#         )
-
-#         if grad:
-#             self.init_optimizer(lr=self.lr)
-#             self.init_scheduler(warmup_steps, max_num_iterations)
-
-#     def get_parameters(self, ids):
-#         """Return depth parameters - ensures gradient flow"""
-#         indices = self.map_names_to_indices(ids) if isinstance(ids[0], str) else ids
-#         # Need to return depth, not inverse depth
-#         z = self.params[indices].pow(-1)
-
-#         return z
-
-#     def get_all_parameters(self):
-#         return self.get_parameters(list(self.image_to_tensor_idx.keys()))
-
-#     def __repr__(self):
-#         out = f"Depth" + f"parameters={len(self.params.data.detach().tolist()):,})"
-#         return out
