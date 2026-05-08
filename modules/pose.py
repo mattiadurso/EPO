@@ -216,7 +216,10 @@ class PoseModule(BaseModule):
         P_3x4 = torch.cat([R, t.unsqueeze(2)], dim=2)  # (B, 3, 4)
 
         # adding mlp residual and orthonormalization
-        P_3x4_refined = self.mlp(P_3x4)
+        with torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16, enabled=False
+        ):  # MLP might be sensitive to precision, disable autocast
+            P_3x4_refined = self.mlp(P_3x4)
 
         R = P_3x4_refined[:, :3, :3]
         t = P_3x4_refined[:, :3, 3] + self.get_translation_offset(indices)
