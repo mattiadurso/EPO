@@ -116,18 +116,43 @@ def sample_distance_field(
 
 
 # @torch.compile(mode="reduce-overhead")
-def compute_chunk_loss_logic(residuals_chunk: torch.Tensor, mask_chunk: torch.Tensor):
+def compute_chunk_loss_logic(
+    residuals_chunk: torch.Tensor,
+    mask_chunk: torch.Tensor,
+    clamp_max: float = 10.0,
+    huber_delta: float = 1.0,
+):
     """
     Pure tensor logic for the loss reduction of a single chunk.
-    Assumes mask_chunk correctly identifies valid entries.
+
+    The clamp + Huber are applied per-edge sample (matching Eq. (7)-(8) of the
+    paper) so that individual outlier edges cannot dominate the per-pair mean.
+    The returned ``sum_val`` is therefore the sum of robustified residuals;
+    dividing by ``count_val`` downstream yields the masked per-pair mean Huber.
+
+    Args:
+        residuals_chunk: (B, n) non-negative DTF distances per sampled edge.
+        mask_chunk: (B, n) boolean validity mask.
+        clamp_max: per-sample upper bound on the raw distance (pixels).
+        huber_delta: Huber transition between quadratic and linear regimes.
     """
-    # Masked Summation
     zero = torch.tensor(0.0, device=residuals_chunk.device, dtype=residuals_chunk.dtype)
 
-    # We trust the mask_chunk. Any residual where mask is False is ignored.
-    valid_values = torch.where(mask_chunk, residuals_chunk, zero)
+    # Per-sample clamp (residuals are >= 0 by construction; only the upper tail matters)
+    r_clamped = residuals_chunk.clamp(min=0.0, max=clamp_max)
 
-    sum_val = valid_values.sum(dim=1)
+    # Per-sample Huber: rho(r) = 0.5*r^2 if r<=delta else delta*(r - 0.5*delta)
+    rho = F.huber_loss(
+        r_clamped,
+        torch.zeros_like(r_clamped),
+        reduction="none",
+        delta=huber_delta,
+    )
+
+    # Mask out invalid samples *after* robustification so they contribute nothing.
+    valid_rho = torch.where(mask_chunk, rho, zero)
+
+    sum_val = valid_rho.sum(dim=1)
     count_val = mask_chunk.sum(dim=1).to(torch.long)
 
     return sum_val, count_val
