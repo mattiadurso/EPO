@@ -1,21 +1,31 @@
+"""EPO — Edge-based Pose Optimization.
+
+This module exposes the :class:`EPO` class, the entry point of the pipeline.
+EPO refines camera poses, intrinsics and per-pixel depth for a reconstruction
+produced by a 3D foundation model (e.g. VGGT) by minimizing edge reprojection
+residuals across a viewgraph of overlapping pairs.
+
+Typical usage::
+
+    epo = EPO(reconstruction_path, images_path, depths_path)
+    epo()                        # run the optimization
+    epo.to_colmap("out/sparse")  # export refined COLMAP model
+"""
+
 import os
 import gc
 import math
 import time
+import warnings
+from itertools import combinations
+
 import numpy as np
+import pycolmap
+import rerun as rr
 import torch
 import torch.nn as nn
-import pycolmap
-import warnings
-import random
 import torch.nn.functional as F
-import torchvision.transforms.functional as TF
-
-from itertools import combinations
-import glob
-from PIL import Image
 from tqdm import tqdm
-import rerun as rr
 
 os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
 os.environ["MKL_THREADING_LAYER"] = "GNU"
@@ -47,15 +57,13 @@ from losses.dt_loss import (
 from helpers.reprojection import (
     filter_viewgraph_by_reprojection_batched,
     grid_sample_nan,
-)
-from helpers.reprojection_compiled import (
     unproject_2D_to_world,
     project_and_sample_logic,
 )
 from helpers.frustum import build_view_graph_from_frustums
-from modules import *
+from modules import BaseModule, CameraModule, DepthModule, PoseModule
 from modules.stopping_criterion import evaluate_pose_changes
-from epo_modules import *
+from epo_modules import MiscModule, ReconstructAndVizModule
 
 import sys
 
@@ -64,34 +72,69 @@ from benchmark_pose import eval_colmap_model
 
 
 class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
-    """
-    Module to adjust poses and intrinsics of a given reconstruction using edge alignment losses.
+    """Edge-based Pose Optimization (EPO).
+
+    Refines the poses, intrinsics and per-pixel depth of a 3D-foundation-model
+    reconstruction by minimizing the reprojection of image edges into the
+    distance fields of their pairs in the viewgraph.
+
+    Inputs are read in COLMAP layout from ``reconstruction_path`` together with
+    the corresponding images and dense depth maps. Construction loads the
+    data, builds the viewgraph (frustum overlap by default) and instantiates
+    the learnable submodules; calling the instance runs the optimization.
+
     Args:
-        reconstruction_path (str): Path to the COLMAP reconstruction folder.
-        images_path (str): Path to the folder containing input images.
-        depths_path (str): Path to the folder containing depth maps.
-        viewgraph_path (str, optional): Path to a precomputed viewgraph file. If None, it will be computed from frustums.
-        sky_mask_path (str, optional): Path to the folder containing sky masks. Default is None.
-            This excludes edges from sky regions. Might lead to less constraints in optimization and slightly worse results.
-            Use when sky changes a lot between images. PRovide massk as png images with 1 for sky and 0 for non-sky.
-        lr (float, optional): Learning rate for the optimizer. Default is 1e-3.
-        single_camera_per_folder (bool, optional): Whether to assume a single camera per folder. Default is True.
-        load_with_pad (bool, optional): Whether to load images with padding to make them square. Default is True.
-        detector (str, optional): Edge detector to use. Default is "canny".
-        device (str, optional): Device to use for computation. Default is "cuda".
-        max_workers (int, optional): Maximum number of workers for parallel loading. Default is -1 (all available).
-        detector_params (dict, optional): Parameters for the edge detector.
-        seed (int, optional): Random seed for reproducibility. Default is 0.
-        scheduler_name (str, optional): Learning rate scheduler name. Default is None.
-        scheduler_params (dict, optional): Parameters for the learning rate scheduler.
-        grad_q (bool, optional): Whether to optimize rotation quaternions. Default is True.
-        grad_t (bool, optional): Whether to optimize translation vectors. Default is True.
-        grad_k (bool, optional): Whether to optimize camera intrinsics. Default is True.
-        grad_z (bool, optional): Whether to optimize depth scale. Default is False.
-        gt_path (str, optional): Path to ground truth data for evaluation. Default is None.
-        max_edges_points (int, optional): Maximum number of edge points to use per image. Default is 16384.
-        max_viewgraph_pairs (int, optional): Maximum number of viewgraph pairs to use at each optimization step.
-            It's randomly sampled from the full viewgraph at each iteration. Default is 8192. If pairs are greater than this, it's basically mini batch processing.
+        reconstruction_path: Path to the COLMAP reconstruction folder
+            (``cameras.bin``, ``images.bin``, ``points3D.bin``).
+        images_path: Path to the folder containing the input images.
+        depths_path: Path to the folder containing dense depth maps (``.h5``).
+        viewgraph_path: Optional precomputed viewgraph file. If ``None`` the
+            viewgraph is built from frustum overlap.
+        unreliable_area_masks_path: Optional folder with PNG masks marking
+            unreliable image regions (e.g. sky). Pixels with value 1 are
+            excluded from edge sampling. Reduces constraints but helps when
+            those regions change a lot across views.
+        images_size: Target side length in pixels after resize. Default 518.
+        single_camera_per_folder: If True, all images in a subfolder share a
+            single intrinsics block.
+        load_with_pad: If True, pad images to a square before resizing.
+        detector: Edge detector name (currently ``"canny"``).
+        detector_params: Keyword arguments forwarded to the detector.
+        device: Torch device to run on.
+        max_workers: Max worker threads for parallel I/O. ``-1`` uses
+            ``os.cpu_count()``.
+        seed: Random seed for reproducibility.
+        max_edges_points: Maximum edge samples per image (memory bound).
+        max_viewgraph_pairs: Maximum viewgraph pairs processed per iteration;
+            larger viewgraphs are resampled each step (mini-batching).
+        matcher_type: ``"exhaustive"`` or ``"sequential"``.
+        sequential_matcher_window: Window size used when
+            ``matcher_type == "sequential"``.
+        scene_type: Scene prior, currently informational
+            (``"outdoor"`` / ``"indoor"`` / ``"object_centric"``).
+        use_depth_confidence: If True, weight residuals by per-pixel depth
+            confidence (when available).
+        q_lr, t_lr: Learning rates for raw rotation / translation parameters.
+        k_lr: Learning rate for camera intrinsics.
+        z_lr: Learning rate for depth scale/shift.
+        mlp_pose_lr: Learning rate for the pose-refinement MLP and its
+            translation offset.
+        grad_q, grad_t: Whether to optimize raw quaternions / translations.
+            Both are forced to False when ``use_mlp_pose_refinement`` is True.
+        grad_t_offset: Whether to optimize the per-image translation offset.
+        grad_k: Whether to optimize camera intrinsics.
+        grad_z: Whether to optimize per-pixel depth.
+        use_mlp_pose_refinement: If True, refine poses via an MLP residual
+            instead of the raw q/t parameters.
+        auc_saving_freq: Iterations between AUC checkpoints when ground truth
+            is available.
+        max_num_iterations: Hard cap on optimization steps.
+        verbose: If True, log progress and statistics during the run.
+        min_points: Minimum reprojection-inlier count to keep a viewgraph pair.
+        sampling_factor: Oversampling factor used when building the viewgraph.
+        reprojection_error: Threshold (px) used to filter viewgraph pairs.
+        run_mode: ``"inference"`` (default) or ``"debug"`` (deterministic +
+            extra logging).
     """
 
     def __init__(
@@ -112,10 +155,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             "high_threshold": 0.20,
             "kernel_size": 9,
             "sigma": 2,
-        },  # those seem to be better, before was 0.20, 0.25, 7, 2.0
+        },
         seed=0,
-        max_edges_points=16_384,  # hard contraint due to memory on 24GB
-        max_viewgraph_pairs=8_192,  # hard contraint due to memory on 24GB
+        max_edges_points=16_384,  # hard constraint due to memory on 24GB
+        max_viewgraph_pairs=8_192,  # hard constraint due to memory on 24GB
         matcher_type="exhaustive",  # or "sequential"
         sequential_matcher_window=5,  # only for sequential matcher
         scene_type="outdoor",  # or "indoor", "object_centric" (not used yet)
@@ -143,6 +186,13 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         super().__init__()
         self.device = device
         self.dtype = torch.float32
+
+        # Timings: created up-front so anything before the explicit "Loading"
+        # block (notably the edge-extractor model load) is included in
+        # `total_loading`. Closing happens after the trailing GC at the end
+        # of __init__.
+        self.timings = {}
+        load_start = time.perf_counter()
 
         # fix seed
         self.seed = seed
@@ -236,47 +286,43 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.use_mlp_pose_refinement = use_mlp_pose_refinement
 
         # Loading
-        self.timings = {}
-        time_start = time.time()
-
         ## Load Reconstruction
         self.recon = pycolmap.Reconstruction(self.reconstruction_path)
 
         ## Load Images as dict {image_name: image_tensor}
-        s_time = time.time()
-        self.image_path_list = find_images(
-            self.images_path
-        )  # image name includes subfolder if any
+        s_time = time.perf_counter()
+        # image name includes subfolder if any
+        self.image_path_list = find_images(self.images_path, verbose=self.verbose)
         # loads image, coords, scale, hw into self.images[image_name]
         self._load_and_preprocess_images()
         self.num_images = len(self.images)
-        self.timings["load_images"] = time.time() - s_time
+        self.timings["load_images"] = time.perf_counter() - s_time
 
         ## Load depth maps
-        s_time = time.time()
+        s_time = time.perf_counter()
         self._load_and_preprocess_depths()
-        self.timings["load_depth_maps"] = time.time() - s_time
+        self.timings["load_depth_maps"] = time.perf_counter() - s_time
 
         ## Load poses and intrinsics
-        s_time = time.time()
+        s_time = time.perf_counter()
         # creating poses such self.poses[image_name] = PoseModel(...)
         # creating intrinsics such self.intrinsics[cam_id] = CameraModel(...)
         # using image name and camera id/folder str
         self._read_cameras_from_reconstruction()  # into self.images and self.intrinsics
-        self.timings["load_poses_and_intrinsics"] = time.time() - s_time
+        self.timings["load_poses_and_intrinsics"] = time.perf_counter() - s_time
 
         ## Extract edges
-        s_time = time.time()
+        s_time = time.perf_counter()
         self._extract_edges()  # into self.images
-        self.timings["extract_edges"] = time.time() - s_time
+        self.timings["extract_edges"] = time.perf_counter() - s_time
 
         ## Compute Distance Fields
-        s_time = time.time()
+        s_time = time.perf_counter()
         self._compute_distance_fields()  # into self.images
-        self.timings["compute_distance_fields"] = time.time() - s_time
+        self.timings["compute_distance_fields"] = time.perf_counter() - s_time
 
         ## Viewgraph from frustums
-        s_time = time.time()
+        s_time = time.perf_counter()
         # compute viewgraph
         self._compute_viewgraph(
             type=self.matcher_type,
@@ -284,7 +330,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             sampling_factor=sampling_factor,
             reprojection_error=reprojection_error,
         )
-        self.timings["compute_viewgraph"] = time.time() - s_time
+        self.timings["compute_viewgraph"] = time.perf_counter() - s_time
 
         ## Prepare batched parameters modules that do not need to be optimized
         self.image_id_map = {}
@@ -362,16 +408,20 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             params_to_optimize = self._collect_parameters_to_optimize()
             self._print_params_summary(params_to_optimize)
 
-        self.timings["total_loading"] = time.time() - time_start
-        self.timings["total_optimization"] = 0
-        self.timings["step_pre_computation"] = 0
-        self.timings["prepare_batched_inputs"] = 0
-        self.timings["forward_pass"] = 0
-        self.timings["loss_computation"] = 0
-        self.timings["gradients_computation"] = 0
-        self.timings["parameters_update"] = 0
-        self.timings["logging"] = 0
-        self.timings["early_stop_check"] = 0
+        # Per-iteration accumulators. Floats from the start so callers that
+        # read them before `forward()` runs (e.g. `print_summary` after a
+        # crash) don't see int/float mixing.
+        self.timings["total_optimization"] = 0.0
+        self.timings["setup_visualization"] = 0.0
+        self.timings["step_pre_computation"] = 0.0
+        self.timings["prepare_batched_inputs"] = 0.0
+        self.timings["forward_pass"] = 0.0
+        self.timings["loss_computation"] = 0.0
+        self.timings["gradients_computation"] = 0.0
+        self.timings["parameters_update"] = 0.0
+        self.timings["logging"] = 0.0
+        self.timings["early_stop_check"] = 0.0
+        self.timings["mre"] = 0.0
 
         # # At this point I might get rid of rgb images to save memory as not needed for edge loss
         # for image_name in self.images.keys():
@@ -391,6 +441,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
         gc.collect()
         torch.cuda.empty_cache()
+
+        # Close `total_loading` after the trailing GC + CUDA cache flush so
+        # the number actually covers everything `__init__` does.
+        self._sync()
+        self.timings["total_loading"] = time.perf_counter() - load_start
 
     def forward(
         self,
@@ -448,7 +503,21 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.convergence_tol_loss = convergence_tol_loss
         self.optim_convergence = True if early_stop == "none" else False
 
-        time_start = time.time()
+        # Reset per-iter accumulators so a second `forward()` call starts
+        # clean (otherwise totals leak from the prior run while
+        # `pose_convergence_time` / `depth_convergence_time` are overwritten,
+        # producing an incoherent summary).
+        for k in (
+            "total_optimization", "setup_visualization", "step_pre_computation",
+            "prepare_batched_inputs", "forward_pass", "loss_computation",
+            "gradients_computation", "parameters_update", "logging",
+            "early_stop_check", "mre",
+        ):
+            self.timings[k] = 0.0
+        self.timings.pop("pose_convergence_time", None)
+        self.timings.pop("depth_convergence_time", None)
+
+        forward_start = time.perf_counter()
 
         if use_rerun:
             rr.init("Feature-Less Optimization", spawn=spawn_rerun)
@@ -457,7 +526,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             # Log Ground Truth if available
             if gt_path is not None:
                 try:
-                    print(f"Loading GT from {gt_path} for visualization...")
+                    if self.verbose:
+                        print(f"Loading GT from {gt_path} for visualization...")
                     self.log_reconstruction_rerun(
                         gt_path,
                         entity="gt",
@@ -467,10 +537,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                         camera_color=[48, 125, 73],
                     )
                 except Exception as e:
-                    print(f"Warning: Failed to load GT for Rerun visualization: {e}")
+                    warnings.warn(f"Failed to load GT for Rerun visualization: {e}")
             if ba_path is not None:
                 try:
-                    print(f"Loading BA result from {ba_path} for visualization...")
+                    if self.verbose:
+                        print(f"Loading BA result from {ba_path} for visualization...")
                     self.log_reconstruction_rerun(
                         ba_path,
                         entity="ba",
@@ -480,8 +551,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                         camera_color=[0, 50, 106],
                     )
                 except Exception as e:
-                    print(
-                        f"Warning: Failed to load BA result for Rerun visualization: {e}"
+                    warnings.warn(
+                        f"Failed to load BA result for Rerun visualization: {e}"
                     )
 
         if self.verbose:
@@ -498,7 +569,17 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
         # store past poses for convergence evaluation
         past_poses = self.poses.get_all_matrices().detach().clone()
-        self.timings["logging"] += time.time() - time_start
+
+        # Everything before this point is one-shot prologue work (rerun
+        # init, GT/BA loading for visualization, the verbose banner). It is
+        # NOT per-iteration logging — billing it there inflates the
+        # AVG/iter column.
+        self.timings["setup_visualization"] = time.perf_counter() - forward_start
+
+        # `optimization_start` anchors per-call totals and convergence
+        # times to the actual loop, independent of the prologue.
+        self._sync()
+        optimization_start = time.perf_counter()
 
         # Forward and backward loop
         bar = tqdm(
@@ -508,7 +589,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             desc="Optimizing the scene",
         )
         for step in bar:
-            t_pre = time.time()
+            self._sync()
+            t_pre = time.perf_counter()
 
             # Initialize optimizer gradients for all optimizers
             self.optimizers_zero_grad()
@@ -520,7 +602,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             # Unproject point to world coordinates
             self.unproject_edges_to_3D()
 
-            self.timings["step_pre_computation"] += time.time() - t_pre
+            # Sync so the queued GPU work above is actually finished before
+            # we read the clock — without this, the kernel-launch overhead
+            # is all we'd be measuring (and the real cost spills into
+            # whichever later stage triggers the first .item()).
+            self._sync()
+            self.timings["step_pre_computation"] += time.perf_counter() - t_pre
 
             # Compute residuals
             residuals, sampled_viewgraphs = self.compute_forward_step(
@@ -532,11 +619,16 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
             # Compute loss
             loss = self.compute_batched_loss(residuals, sampled_viewgraphs, debug=debug)
-            s_time = time.time()
+            s_time = time.perf_counter()
             loss.backward()
-            self.timings["gradients_computation"] += time.time() - s_time
+            self._sync()  # backward() returns before the GPU is done
+            self.timings["gradients_computation"] += time.perf_counter() - s_time
 
             self.optimizer_and_scheduler_step()
+
+            # Per-step visualization is lumped into `logging` so it doesn't
+            # leave an untimed gap between optimizer step and stat update.
+            logging_time_start = time.perf_counter()
 
             if use_rerun:
                 # Handle Rerun API variations
@@ -566,7 +658,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             # ============================================================
             # Logging
             # ============================================================
-            logging_time_start = time.time()
             self.loss_list.append(loss.detach().item())
             self.collect_lrs(len(self.loss_list) - 1)
 
@@ -594,11 +685,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                             rr.Scalars(self.auc_list["auc"][th][-1]),
                         )
 
-            self.timings["logging"] += time.time() - logging_time_start
+            self.timings["logging"] += time.perf_counter() - logging_time_start
             # ============================================================
             # Early stopping
             # ============================================================
-            early_stop_start = time.time()
+            early_stop_start = time.perf_counter()
 
             # collect pose changes for convergence evaluation
             current_poses = self.poses.get_all_matrices().detach().clone()
@@ -623,7 +714,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 )
                 if mlp_pose_convergence:
                     self.mlp_pose_convergence = True
-                    self.timings["pose_convergence_time"] = time.time() - time_start
+                    self.timings["pose_convergence_time"] = (
+                        time.perf_counter() - optimization_start
+                    )
                     if self.verbose:
                         print(f"Pose convergence reached at step {step}.")
 
@@ -631,7 +724,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     if not self.grad_z:
                         self.optim_convergence = True
                         self.timings["depth_convergence_time"] = (
-                            time.time() - time_start
+                            time.perf_counter() - optimization_start
                         )
 
             elif self.mlp_pose_convergence:
@@ -657,7 +750,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     # nothing to do in this case
                     pass
 
-            self.timings["early_stop_check"] += time.time() - early_stop_start
+            self.timings["early_stop_check"] += time.perf_counter() - early_stop_start
 
             if (
                 self.mlp_pose_convergence
@@ -671,7 +764,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
             self.completed_iterations += 1
 
-        self.timings["total_optimization"] += time.time() - time_start
+        self._sync()
+        self.timings["total_optimization"] = time.perf_counter() - optimization_start
 
         if use_rerun:
             rr_folder = os.path.join(rerun_save_path, "rerun")
@@ -682,7 +776,19 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             self.to_colmap(opt, save_points=False, verbose=False)
             self.compute_auc(opt, gt_path, step)
 
+        # `compute_mre` runs an extra (much larger) forward pass that writes
+        # to `prepare_batched_inputs` and `forward_pass`. Snapshot the
+        # accumulators before so we can attribute the delta to its own
+        # `mre` key — otherwise the per-iter averages get contaminated and
+        # the percentage column can exceed 100%.
+        _mre_pbi = self.timings["prepare_batched_inputs"]
+        _mre_fp = self.timings["forward_pass"]
+        _mre_t0 = time.perf_counter()
         self.compute_mre()
+        self._sync()
+        self.timings["mre"] = time.perf_counter() - _mre_t0
+        self.timings["prepare_batched_inputs"] = _mre_pbi
+        self.timings["forward_pass"] = _mre_fp
         self.print_summary() if self.verbose else print("=" * 70, end="\n\n")
 
     ### Forward and backward helpers ###
@@ -719,7 +825,14 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         return np.all(smoothed < tol)
 
     def compute_auc(self, opt, gt_path, step):
-        AUC_score_max, num_images, _ = eval_colmap_model(
+        """Evaluate the current reconstruction against ground truth and store AUC.
+
+        Args:
+            opt: Path to the reconstruction folder being evaluated.
+            gt_path: Path to the ground-truth COLMAP reconstruction.
+            step: Current optimization step (used as the x-axis when plotted).
+        """
+        AUC_score_max, _, _ = eval_colmap_model(
             opt, gt_path, return_df=False, thrs=self.auc_th
         )
         # store AUC
@@ -743,7 +856,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         """Perform optimizer step and scheduler step for all optimizers."""
         # Ideally each of them should be able to run independently until needed (reaching min lr),
         # but for now we keep them in sync for simplicity.
-        s_time = time.time()
+        s_time = time.perf_counter()
         if (
             self.grad_q is True
             or self.grad_t is True
@@ -759,7 +872,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         if self.grad_k:
             self.intrinsics.optimizer_and_scheduler_step()
 
-        self.timings["parameters_update"] += time.time() - s_time
+        # Adam moment updates etc. are CUDA-async; sync before reading the
+        # clock so this stage gets the GPU time it actually used.
+        self._sync()
+        self.timings["parameters_update"] += time.perf_counter() - s_time
 
     def collect_lrs(self, step):
         """Collect learning rates for all optimizers."""
@@ -914,12 +1030,14 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # i might want to process batches of same size and drop last batch
         for sampled_viewgraph in sampled_viewgraphs:
             # prepare batched inputs
-            s_time = time.time()
+            self._sync()
+            s_time = time.perf_counter()
             batch, pad_masks, dt_fields = self.create_batched_inputs(sampled_viewgraph)
-            self.timings["prepare_batched_inputs"] += time.time() - s_time
+            self._sync()
+            self.timings["prepare_batched_inputs"] += time.perf_counter() - s_time
 
             # actual inference
-            s_time = time.time()
+            s_time = time.perf_counter()
 
             # projection and sampling
             residuals, inside_mask = project_and_sample_logic(
@@ -964,7 +1082,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             # collect this batch's results
             residuals_list.append(mean_losses)
 
-            self.timings["forward_pass"] += time.time() - s_time
+            # `project_and_sample_logic` and the chunked Huber reduce are
+            # all CUDA-async; without this sync we'd just measure how fast
+            # the CPU could enqueue the kernels.
+            self._sync()
+            self.timings["forward_pass"] += time.perf_counter() - s_time
 
         # concatenate all collected batch results
         residuals = torch.cat(residuals_list, dim=0)  # (num_pairs,)
@@ -982,7 +1104,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         over pairs. The ``delta`` argument is kept for API compatibility but
         is no longer used here -- pass it through ``compute_forward_step``.
         """
-        s_time = time.time()
+        self._sync()
+        s_time = time.perf_counter()
 
         if residuals.numel() == 0:
             return torch.tensor(0.0, device=self.device)
@@ -1009,12 +1132,21 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # Mean over pairs
         loss = pair_losses.mean()
 
-        self.timings["loss_computation"] += time.time() - s_time
+        self._sync()
+        self.timings["loss_computation"] += time.perf_counter() - s_time
 
         return loss
 
     ### Helper functions for loading and preprocessing data ###
     def _read_cameras_from_reconstruction(self):
+        """Build :class:`CameraModule` and :class:`PoseModule` from the COLMAP
+        reconstruction loaded in ``self.recon``.
+
+        Reads the per-camera intrinsics and per-image extrinsics, optionally
+        fuses cameras that share a folder (``single_camera_per_folder``), and
+        stores the resulting submodules on ``self.intrinsics`` and
+        ``self.poses``.
+        """
         intrinsics = {}
 
         # Read cameras intrinsics
@@ -1126,6 +1258,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.intrinsics = intrinsics
 
     def _load_and_preprocess_images(self):
+        """Load all images into ``self.images`` (resized + optionally padded)."""
         self.images = load_and_preprocess_images(
             self.image_path_list,
             self.images_path,
@@ -1137,6 +1270,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         )
 
     def _load_and_preprocess_depths(self):
+        """Load depth maps into ``self.images`` and verify shapes are uniform."""
         self.images = load_and_preprocess_depths(
             self.depths_path,
             self.images,
@@ -1177,7 +1311,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 lines = f.readlines()
             viewgraph = []
             for line in lines:
-                i, j, m = line.strip().split()
+                # Each line is "img_i img_j num_matches"; we only need the pair.
+                i, j, _ = line.strip().split()
                 viewgraph.append((i, j))
             self.viewgraph = viewgraph
 
@@ -1246,19 +1381,28 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             self.adj_list.setdefault(i, []).append(j)
             self.adj_list.setdefault(j, []).append(i)
 
-        if self.verbose:
-            values = [len(v) for v in self.adj_list.values()]
-            if len(values) > 0:
-                print(
-                    f"Average degree: {np.mean(values):.2f}, min connection {min(values)}, less than 5 neighbors: {(np.array(values)<5).sum()} images"
-                )
-            else:
-                print("\n >>> No valid pairs in viewgraph, which is a BIG problem! <<<")
+        values = [len(v) for v in self.adj_list.values()]
+        if len(values) == 0:
+            warnings.warn(
+                "Viewgraph contains no valid pairs; optimization cannot proceed."
+            )
+        elif self.verbose:
+            print(
+                f"Average degree: {np.mean(values):.2f}, "
+                f"min connections {min(values)}, "
+                f"images with fewer than 5 neighbors: {(np.array(values) < 5).sum()}"
+            )
 
     ### Edges
     def _extract_edges(self, confidence_threshold=0.2):
+        """Run the edge detector on every image and store edge pixel coordinates.
+
+        Edges falling on pixels with confidence below ``confidence_threshold``
+        (when a per-pixel confidence map is available) are dropped. Results
+        are written into ``self.images[name]['edges_map']`` /
+        ``['edges_coords']``.
+        """
         tot_edges = 0
-        # for image_name in tqdm(self.images.keys(), desc=f"Extracting edges"):
         for image_name in self.images.keys():
             # Extract edge map
             img_tensor = self.images[image_name]["image"].unsqueeze(0)
@@ -1382,8 +1526,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
     @torch.no_grad()
     def _compute_distance_fields(self):
+        """Compute the per-image edge distance field used by the loss.
+
+        Stores ``dt_field`` in ``self.images[name]`` and the stacked
+        ``self.dt_fields`` tensor used by the batched forward pass.
+        """
         dt_fields_shapes = []
-        # for image_name in tqdm(self.images.keys(), desc="Computing distance fields"):
         for image_name in self.images.keys():
             edges_map = self.images[image_name]["edges_map"]
             dt_field = compute_distance_field_cv2(

@@ -1,10 +1,20 @@
+"""Learnable per-image depth correction.
+
+Stores a parametric depth correction ``z' = clamp(z * (1 + a) + b,
+min=min_depth)`` per image, with either one ``(a, b)`` pair shared across
+the depth map (``per_pixel=False``) or one pair per pixel
+(``per_pixel=True``). The original depth is kept frozen; only ``(a, b)``
+are learnable.
+"""
+
 import torch
 import torch.nn as nn
 from modules.base_module import BaseModule
 
 
-# depth as parametric z=z*a+b
 class DepthModule(BaseModule):
+    """Per-image (optionally per-pixel) parametric depth correction."""
+
     def __init__(
         self,
         image_id_map: dict,
@@ -83,9 +93,9 @@ class DepthModule(BaseModule):
         # clamp to keep depths in front of the camera (z > 0)
         return torch.clamp(z * (1 + a) + b, min=self.min_depth)
 
-    def get_all_parameters(self):
+    def get_all_parameters(self) -> torch.Tensor:
+        """Return corrected depth maps for every image, in storage order."""
         return self.get_parameters(list(self.image_to_tensor_idx.keys()))
 
-    def __repr__(self):
-        out = f"Depth" + f"parameters={len(self.params.data.detach().tolist()):,})"
-        return out
+    def __repr__(self) -> str:
+        return f"DepthModule(parameters={self.params.numel():,})"

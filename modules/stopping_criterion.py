@@ -1,3 +1,11 @@
+"""Convergence helpers for the optimization loop.
+
+Provides per-image rotation/translation error metrics and the
+:func:`evaluate_pose_changes` / :func:`evaluate_depth_changes` utilities
+the EPO loop uses to decide when to stop. Quaternion / rotation-matrix
+conversions follow COLMAP's convention.
+"""
+
 import torch
 
 
@@ -113,6 +121,16 @@ def rotmat2qvec(R):
 
 
 def evaluate_R_err(R_past, R_present, deg=True):
+    """Per-sample relative rotation error via quaternion inner product.
+
+    Args:
+        R_past: ``(..., 3, 3)`` previous rotation matrices.
+        R_present: ``(..., 3, 3)`` current rotation matrices.
+        deg: If True, return degrees; otherwise radians.
+
+    Returns:
+        ``(...,)`` tensor of rotation errors (always non-negative).
+    """
     eps = 1e-15
 
     # Make and normalize the quaternions.
@@ -134,6 +152,17 @@ def evaluate_R_err(R_past, R_present, deg=True):
 
 
 def evaluate_t_err(t_past, t_present, deg=True):
+    """Per-sample translation-direction error via normalised inner product.
+
+    Args:
+        t_past: ``(..., 3)`` or ``(..., 3, 1)`` previous translations.
+        t_present: ``(..., 3)`` or ``(..., 3, 1)`` current translations.
+        deg: If True, return degrees; otherwise radians.
+
+    Returns:
+        ``(...,)`` tensor with the angle between the (normalised) translation
+        directions. Translation magnitude is intentionally ignored.
+    """
     eps = 1e-15
 
     # Handle shapes (B, 3, 1) -> (B, 3)

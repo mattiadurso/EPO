@@ -1,4 +1,13 @@
+"""Build / filter / save ``pycolmap.Reconstruction`` objects.
+
+Provides :func:`build_reconstruction`, which assembles a full COLMAP
+reconstruction from an EPO instance (cameras, poses and the per-image
+unprojected edge points), and :func:`dbscan_filter`, an outlier-removal
+pass that keeps only the largest DBSCAN cluster of 3D points.
+"""
+
 import os
+import warnings
 import torch
 import pycolmap
 import numpy as np
@@ -6,7 +15,7 @@ from sklearn.cluster import DBSCAN
 
 
 @torch.no_grad()
-def dbscan_filter(reconstruction, eps=0.5, min_samples=20):
+def dbscan_filter(reconstruction, eps=0.5, min_samples=20, verbose: bool = False):
     """
     Filter 3D points in reconstruction using DBSCAN clustering.
     Keeps only the largest cluster to remove outliers.
@@ -15,9 +24,11 @@ def dbscan_filter(reconstruction, eps=0.5, min_samples=20):
         reconstruction: pycolmap.Reconstruction object
         eps: Maximum distance between two samples for DBSCAN
         min_samples: Minimum number of samples in a neighborhood for DBSCAN
+        verbose: If True, log cluster statistics.
 
     Returns:
-        pycolmap.Reconstruction: Filtered reconstruction
+        pycolmap.Reconstruction: Filtered reconstruction (the input is
+        returned unchanged when DBSCAN fails or finds no clusters).
     """
 
     if len(reconstruction.points3D) == 0:
@@ -39,7 +50,7 @@ def dbscan_filter(reconstruction, eps=0.5, min_samples=20):
         except MemoryError:
             n_jobs //= 2
         except Exception as e:
-            print(f"DBSCAN failed: {e}")
+            warnings.warn(f"DBSCAN failed: {e}; returning unfiltered reconstruction.")
             return reconstruction
 
     # Find largest cluster
@@ -47,7 +58,7 @@ def dbscan_filter(reconstruction, eps=0.5, min_samples=20):
     non_noise_indices = np.where(unique_labels != -1)
 
     if len(counts[non_noise_indices]) == 0:
-        print("Warning: DBSCAN found no clusters. Skipping filtering.")
+        warnings.warn("DBSCAN found no clusters; returning unfiltered reconstruction.")
         return reconstruction
 
     main_cluster_label = unique_labels[non_noise_indices][
@@ -58,9 +69,11 @@ def dbscan_filter(reconstruction, eps=0.5, min_samples=20):
     cluster_indices = np.where(labels == main_cluster_label)[0]
     ids_to_keep = set([point_ids[i] for i in cluster_indices])
 
-    print(
-        f"DBSCAN: Keeping largest cluster with {len(ids_to_keep):,} / {len(point_ids):,} points"
-    )
+    if verbose:
+        print(
+            f"DBSCAN: keeping largest cluster with "
+            f"{len(ids_to_keep):,} / {len(point_ids):,} points"
+        )
 
     # Create new reconstruction with only kept points
     filtered_reconstruction = pycolmap.Reconstruction()
@@ -160,7 +173,7 @@ def build_reconstruction(
         )
 
         if sample_image is None:
-            print(f"Warning: No images found for camera {cam_id}, skipping...")
+            warnings.warn(f"No images found for camera {cam_id}, skipping.")
             continue
 
         height, width = sample_image["hw"]
@@ -328,7 +341,10 @@ def build_reconstruction(
         if verbose:
             print("Running DBSCAN filtering...")
         reconstruction = dbscan_filter(
-            reconstruction, eps=dbscan_eps, min_samples=dbscan_min_samples
+            reconstruction,
+            eps=dbscan_eps,
+            min_samples=dbscan_min_samples,
+            verbose=verbose,
         )
 
     # 5. Save reconstruction

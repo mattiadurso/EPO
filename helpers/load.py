@@ -1,6 +1,13 @@
 # Helpers
+"""I/O helpers: image / depth loading and COLMAP intrinsics & pose unpacking.
+
+All loaders return tensors already on the requested device and dtype, with
+shapes matching the optional padding + resize convention used by EPO.
+"""
+
 import os
 import glob
+import warnings
 from typing import List
 import torch
 import pycolmap
@@ -15,15 +22,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 ### Loading and preprocessing images and depths
-def find_images(images_path: str) -> List[str]:
+def find_images(images_path: str, verbose: bool = False) -> List[str]:
     """
     Find all images in the given path, including subdirectories.
 
     Args:
         images_path: Path to directory containing images.
+        verbose: If True, log the number of images found.
 
     Returns:
-        List of image file paths.
+        Sorted list of image file paths.
     """
     valid_extensions = ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG"]
     image_paths = []
@@ -41,7 +49,8 @@ def find_images(images_path: str) -> List[str]:
             f"No images found in {images_path}. Path {images_path} is invalid or empty."
         )
 
-    print(f"Found {len(image_paths)} images in {images_path}")
+    if verbose:
+        print(f"Found {len(image_paths)} images in {images_path}")
     return image_paths
 
 
@@ -236,27 +245,9 @@ def _process_single_depth(
                 crop_left : crop_left + crop_w,
             ]
     else:
-        # # pad border such that depth map has same size as original image
-        # pad_h = max(orig_h - depth_h, 0)
-        # pad_w = max(orig_w - depth_w, 0)
-
-        # depth_tensor = F.pad(
-        #     depth_tensor,
-        #     (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2),
-        #     mode="constant",
-        #     value=float("nan"),
-        # )
-        # if confidence_tensor is not None:
-        #     confidence_tensor = F.pad(
-        #         confidence_tensor,
-        #         (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2),
-        #         mode="constant",
-        #         value=0.0,
-        #     )
+        # Depth map is smaller than (or equal to) the original image: leave it
+        # as-is here; the resize step below brings it to the target size.
         pass
-
-    # If depth map is smaller than original image, just use it as-is
-    # (it will be resized to match the image below)
 
     # Now depth_tensor should correspond to the original image content.
     # Resize it exactly the same way the image was resized.
@@ -351,15 +342,16 @@ def load_and_preprocess_depths(
     depth_path = Path(depth_path)
 
     if not depth_path.exists():
-        print(
-            f"Warning: Depth path {depth_path} does not exist. Skipping depth loading."
+        warnings.warn(
+            f"Depth path {depth_path} does not exist. Skipping depth loading.",
+            stacklevel=2,
         )
         return images_dict
 
-    # Process depths in
+    # Single-threaded on purpose: h5py file handles are not thread-safe and
+    # the per-file work is dominated by disk I/O rather than Python overhead.
     max_workers = 1
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
         futures = [
             executor.submit(
                 _process_single_depth,
@@ -372,16 +364,14 @@ def load_and_preprocess_depths(
             for image_name in images_dict.keys()
         ]
 
-        # Collect results as they complete
-        # for future in tqdm(
-        #     as_completed(futures), total=len(futures), desc="Loading depth maps"
-        # ):
         for future in as_completed(futures):
             try:
                 image_name, depth_tensor, confidence_tensor = future.result()
             except Exception as e:
-                print(f"Error processing depth for {image_name}: {e}")
-                # if confidence map is missing, set to ones
+                warnings.warn(
+                    f"Error processing depth for {image_name}: {e}", stacklevel=2
+                )
+                # Confidence map missing or unreadable: fall back to no confidence.
                 image_name, depth_tensor = future.result()
                 confidence_tensor = None
 
@@ -390,7 +380,9 @@ def load_and_preprocess_depths(
                     {"depth": depth_tensor.to(device, dtype=dtype)}
                 )
             else:
-                print(f"Warning: Depth map not found for {image_name}")
+                warnings.warn(
+                    f"Depth map not found for {image_name}", stacklevel=2
+                )
 
             if confidence_tensor is not None:
                 images_dict[image_name].update(
@@ -414,8 +406,13 @@ def load_reconstruction(recon_path):
     return recon, cams, imgs, id_to_name, path
 
 
-def process_camera(camera, load_with_pad=False, images_size=518):
-    # Convert a single pycolmap.Camera to torch tensor
+def process_camera(camera, load_with_pad: bool = False, images_size: int = 518):
+    """Convert a ``pycolmap.Camera`` into the layout expected by EPO.
+
+    Returns ``(cam_id, model, params)`` where ``params`` is a 1D tensor with
+    intrinsics rescaled to match the resized (and optionally padded-to-square)
+    image. Supports ``SIMPLE_PINHOLE`` and ``PINHOLE``.
+    """
     cam_id = camera.camera_id
     model = camera.model.name
     params = camera.params
@@ -446,14 +443,16 @@ def process_camera(camera, load_with_pad=False, images_size=518):
     cx = (cx + pad_x) * scale
     cy = (cy + pad_y) * scale
 
-    # print(f"DEBUG: f={f}, cx={cx}, cy={cy}")
     params = torch.cat([f.flatten(), torch.tensor([cx, cy])], dim=0)
     return cam_id, model, params
 
 
 def process_pose(image):
-    # Convert a single pycolmap.Image to torch tensor
-    # COLMAP's cam_from_world is already R_cw (world-to-camera rotation)
+    """Convert a ``pycolmap.Image`` into ``(R, t, cam_id)`` torch tensors.
+
+    ``R`` and ``t`` are world-to-camera (COLMAP's native convention); ``t`` is
+    returned with shape ``(3, 1)`` to match downstream stacking.
+    """
     R = torch.tensor(image.cam_from_world.rotation.matrix())
     t = torch.tensor(image.cam_from_world.translation).unsqueeze(1)
 

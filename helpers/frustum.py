@@ -1,3 +1,11 @@
+"""Frustum-overlap viewgraph construction.
+
+Builds a set of camera frustums from intrinsics + extrinsics, then enumerates
+candidate image pairs whose axis-aligned bounding boxes overlap, share a
+view direction (cosine threshold) and lie within a scaled distance of each
+other. Used to seed the EPO viewgraph when no precomputed pairs are given.
+"""
+
 import torch
 
 from pathlib import Path

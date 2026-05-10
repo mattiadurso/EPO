@@ -1,3 +1,5 @@
+"""Canny edge-detector wrapper used as the default detector for EPO."""
+
 import kornia
 import torch
 import torch.nn as nn
@@ -62,7 +64,15 @@ class CannyEdgeDetector(nn.Module):
         )
 
     @torch.no_grad()
-    def forward(self, images):
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        """Run Canny on a batch of images.
+
+        Args:
+            images: ``(B, C, H, W)`` or ``(C, H, W)`` image(s) in ``[0, 1]``.
+
+        Returns:
+            ``(B, 1, H, W)`` binary edge map in ``{0, 1}``.
+        """
         assert images.dim() in [
             4,
             3,
@@ -71,11 +81,6 @@ class CannyEdgeDetector(nn.Module):
             + "or (C, H, W)"
         )
 
-        # Move images to the specified device
         images = images.to(self.device).float()
-
-        # images: (B, C, H, W) in [0, 1]
         _, edges_binary = self.canny(images)
-
-        # return edges as (B, 1, H, W) in (0, 1)
         return edges_binary
