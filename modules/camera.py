@@ -1,10 +1,20 @@
+"""Learnable camera-intrinsics module.
+
+Stores intrinsics as a simple-pinhole tuple ``(f, cx, cy)`` per camera and
+optimizes a single scalar focal-length scale per camera (``f_eff = f *
+(1 + alpha)``). Principal points are kept fixed; ``PINHOLE`` cameras are
+collapsed to ``SIMPLE_PINHOLE`` by averaging ``fx`` and ``fy``.
+"""
+
 import torch
 import torch.nn as nn
 from modules.base_module import BaseModule
-from helpers.reprojection_compiled import invert_K
+from helpers.reprojection import invert_K
 
 
 class CameraModule(BaseModule):
+    """Per-camera learnable focal-length scale (simple-pinhole)."""
+
     def __init__(
         self,
         image_id_map: dict,
@@ -55,10 +65,12 @@ class CameraModule(BaseModule):
 
         self.update_all_matrices()  # Pre-compute all intrinsic matrices
 
-    def get_all_intrinsic_matrix(self):
+    def get_all_intrinsic_matrix(self) -> tuple[list[str], torch.Tensor]:
+        """Return (camera names, stacked 3x3 intrinsics) for all cameras."""
         return self.keys, self.get_intrinsic_matrix(self.keys)
 
     def get_intrinsic_matrix(self, indices) -> torch.Tensor:
+        """Return ``(B, 3, 3)`` intrinsic matrices for the given cameras."""
         if isinstance(indices[0], str):
             indices = self.map_names_to_indices(indices)
 
@@ -68,6 +80,7 @@ class CameraModule(BaseModule):
         return self._build_K(indices)
 
     def get_inverse_intrinsic_matrix(self, indices) -> torch.Tensor:
+        """Return ``(B, 3, 3)`` inverse intrinsic matrices for the given cameras."""
         if isinstance(indices[0], str):
             indices = self.map_names_to_indices(indices)
 
@@ -77,6 +90,7 @@ class CameraModule(BaseModule):
         return invert_K(self.get_intrinsic_matrix(indices))
 
     def _build_K(self, tensor_indices: torch.Tensor) -> torch.Tensor:
+        """Compose ``(B, 3, 3)`` intrinsic matrices from base params + ``alpha``."""
         params = self.k_params[tensor_indices]  # (B, 3): [f, cx, cy]
         alpha = self.params[tensor_indices]  # (B, 1)
 
@@ -93,7 +107,12 @@ class CameraModule(BaseModule):
         K[:, 2, 2] = 1.0
         return K
 
-    def get_camera_parameters(self, indices) -> tuple:
+    def get_camera_parameters(self, indices) -> tuple[str, torch.Tensor]:
+        """Return ``("SIMPLE_PINHOLE", params)`` for the requested cameras.
+
+        ``params`` is a ``(B, 3)`` tensor of effective ``[f, cx, cy]`` values
+        (i.e. with the learnable focal-length scale already applied).
+        """
         if isinstance(indices, str):
             indices = [indices]
         if isinstance(indices[0], str):
@@ -105,12 +124,13 @@ class CameraModule(BaseModule):
 
         return "SIMPLE_PINHOLE", params.squeeze()
 
-    def update_all_matrices(self):
+    def update_all_matrices(self) -> None:
+        """Refresh the cached intrinsic matrices after parameters change."""
         self.cameras = None
         self.cameras = self.get_intrinsic_matrix(self.keys)
         self.cameras_inv = None
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         s = "CameraModel:\n"
         limit = 5
         for i, params in enumerate(self.k_params[:limit]):

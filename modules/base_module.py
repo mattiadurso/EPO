@@ -1,15 +1,34 @@
+"""Shared base class for the per-image learnable modules (pose, camera, depth).
+
+Centralises the bookkeeping that all three submodules need: an
+image-name → tensor-row index map, optimizer/scheduler construction with
+warmup + cosine decay, and a uniform :py:meth:`get_parameters` API that
+accepts either string image names or integer indices.
+"""
+
 import torch
 import torch.nn as nn
 
 
 class BaseModule(nn.Module):
+    """Base for modules whose parameters are indexed by image name."""
+
     def __init__(
         self,
         image_id_map: dict[str, int],
-        parameters: [torch.Tensor | None] = None,
+        parameters: torch.Tensor | None = None,
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
     ):
+        """
+        Args:
+            image_id_map: Mapping from image name (str) to row index in the
+                parameter tensor.
+            parameters: Optional pre-allocated parameter tensor. Subclasses
+                normally allocate their own ``nn.Parameter`` instead.
+            device: Torch device for the parameters.
+            dtype: Floating-point dtype for the parameters.
+        """
         super(BaseModule, self).__init__()
 
         self.device = torch.device(device)
@@ -19,11 +38,12 @@ class BaseModule(nn.Module):
         self.image_to_tensor_idx = image_id_map
         self.tensor_idx_to_image = {v: k for k, v in image_id_map.items()}
 
-        # Initialize layers or parameters here | Not sure why it is needed, but it is
+        # Optional pre-supplied parameter tensor; subclasses usually allocate
+        # their own learnable nn.Parameter and overwrite this attribute.
         self.params = parameters.to(self.device) if parameters is not None else None
 
     def forward(self, x):
-        # Define the forward pass
+        """Subclasses must override; the base class does not define a forward pass."""
         raise NotImplementedError("Forward method not implemented yet.")
 
     def map_names_to_indices(self, indices) -> torch.LongTensor:
@@ -55,13 +75,15 @@ class BaseModule(nn.Module):
         return self.params[indices]
 
     def __repr__(self) -> str:
-        s = f"{self.__class__.__name__} ({self.num_items} items):\n"
+        """Return a short, truncated summary of the module contents."""
+        num_items = len(self.tensor_idx_to_image)
+        s = f"{self.__class__.__name__} ({num_items} items):\n"
         limit = 3
-        for i in range(min(limit, self.num_items)):
-            id_val = self.tensor_idx_to_id[i]
+        for i in range(min(limit, num_items)):
+            id_val = self.tensor_idx_to_image[i]
             s += f"  [{i}] ID: {id_val}\n"
-        if self.num_items > limit:
-            s += f"  ... {self.num_items - limit} more."
+        if num_items > limit:
+            s += f"  ... {num_items - limit} more."
         return s
 
     def parameters(self, recurse=True):  # Changed: match nn.Module signature

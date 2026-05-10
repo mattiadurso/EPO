@@ -1,3 +1,10 @@
+"""Mixin: reconstruction export, residual visualization, Rerun logging.
+
+Bound onto :class:`epo.EPO`; functions assume ``self`` is an EPO instance
+(uses ``self.images``, ``self.viewgraph``, ``self.verbose`` and the
+learnable submodules).
+"""
+
 import os
 import json
 import torch
@@ -10,13 +17,13 @@ import matplotlib.cm as cm
 
 from tqdm import tqdm
 from losses.dt_loss import sample_distance_field
-from helpers.reprojection_compiled import project_world_to_2D
+from helpers.reprojection import project_world_to_2D
 from helpers.reconstruction import build_reconstruction
 from matplotlib.colors import Normalize
 
 
 class ReconstructAndVizModule:
-    """Module for reconstruction export and visualization functions. Just to have less code in epo."""
+    """Mixin: reconstruction export and visualization helpers for :class:`epo.EPO`."""
 
     @torch.no_grad()
     def visualize_residuals(
@@ -51,7 +58,8 @@ class ReconstructAndVizModule:
                 else random.choices(self.viewgraph, k=max_images)
             )
         num_pairs = len(viewgraph)
-        print(f"Visualizing residuals for {num_pairs:,} image pairs...")
+        if self.verbose:
+            print(f"Visualizing residuals for {num_pairs:,} image pairs...")
 
         for pair_idx, (img_i, img_j) in enumerate(
             tqdm(viewgraph, desc="Computing residuals")
@@ -128,7 +136,12 @@ class ReconstructAndVizModule:
         pair_idx,
         percentile,
     ):
+        """Render a side-by-side residual figure for a single (i, j) pair.
 
+        Saves a PNG showing the two images, the projected edges colored by
+        residual, and the underlying edge maps. Used by
+        :meth:`visualize_residuals` to dump per-pair diagnostics.
+        """
         # Prepare filenames
         safe_img_i = img_i.replace("/", "_").replace("\\", "_")
         safe_img_j = img_j.replace("/", "_").replace("\\", "_")
@@ -244,16 +257,32 @@ class ReconstructAndVizModule:
 
     def to_colmap(
         self,
-        output_path="optimized_reconstruction_GD",
-        save_points=True,
-        verbose=False,
-        max_points_per_image=100_000,
-        final_dbscan_filtering=False,
-        dbscan_eps=0.05,
-        dbscan_min_samples=5,
-        gt_path=None,
-        save_depth=False,
+        output_path: str = "optimized_reconstruction_GD",
+        save_points: bool = True,
+        verbose: bool = False,
+        max_points_per_image: int = 100_000,
+        final_dbscan_filtering: bool = False,
+        dbscan_eps: float = 0.05,
+        dbscan_min_samples: int = 5,
+        gt_path: str | None = None,
+        save_depth: bool = False,
     ):
+        """Export the optimized reconstruction (and optionally depth maps) to COLMAP format.
+
+        Args:
+            output_path: Destination folder. Existing contents are removed.
+            save_points: If True, unproject edge points and write them as
+                a sparse point cloud.
+            verbose: If True, log per-step progress from the underlying
+                build / DBSCAN passes.
+            max_points_per_image: Cap on points exported per image.
+            final_dbscan_filtering: If True, run a final DBSCAN pass that
+                keeps only the largest cluster of 3D points.
+            dbscan_eps, dbscan_min_samples: DBSCAN hyperparameters.
+            gt_path: If given, align the exported reconstruction to this GT
+                model with ``colmap model_aligner``.
+            save_depth: If True, write per-image refined depth maps as ``.h5``.
+        """
         os.system(f"rm -rf {output_path}/*")
         recon = build_reconstruction(
             self,
@@ -278,7 +307,8 @@ class ReconstructAndVizModule:
             )
 
         if save_depth:
-            print("Saving depth maps...")
+            if self.verbose:
+                print("Saving depth maps...")
             # saving depth in same format as input
             import h5py
 
@@ -313,19 +343,31 @@ class ReconstructAndVizModule:
                 ) as f:
                     f.create_dataset("depth", data=hw_array.numpy(), compression="gzip")
 
-        # save loading time and optimization time in timings.txt in same folder as output_path
+        # Keep `total` consistent whether or not `forward()` has been called
+        # (e.g. if print_summary is skipped).  benchmark_plotting.py reads
+        # the last line of timings.txt as `total: <s>`, and benchmark.ipynb
+        # reads training_logs.json["timings"]["total"], so both files must
+        # have this key.
+        self.timings["total"] = (
+            self.timings.get("total_loading", 0.0)
+            + self.timings.get("total_optimization", 0.0)
+        )
+
         timings_path = os.path.join(output_path, "timings.txt")
         with open(timings_path, "w") as f:
+            # ── per-iteration accumulators + one-shot times ──────────
+            skip = {"total_loading", "total_optimization", "total"}
             for key, value in self.timings.items():
-                if "total" not in key:
+                if key in skip:
+                    continue
+                try:
                     f.write(f"{key}: {value:.4f} s\n")
-            # total at the end
-            total = 0.0
-            for key, value in self.timings.items():
-                if "total_" in key:
-                    total += value
+                except (TypeError, ValueError):
                     f.write(f"{key}: {value}\n")
-            f.write(f"total: {total}\n")
+            # ── totals (must end with `total:` for benchmark_plotting) ─
+            f.write(f"total_loading: {self.timings.get('total_loading', 0.0):.4f} s\n")
+            f.write(f"total_optimization: {self.timings.get('total_optimization', 0.0):.4f} s\n")
+            f.write(f"total: {self.timings['total']:.4f}\n")
 
         # save training data such metrics series too as dict
         training_logs = {
@@ -371,37 +413,59 @@ class ReconstructAndVizModule:
 
         return recon
 
-    def get_frustum_strips(self, scale=0.15, w=1.0, h=1.0):
-        # Normalize aspect to fit in scale
+    def get_frustum_strips(
+        self, scale: float = 0.15, w: float = 1.0, h: float = 1.0
+    ) -> list[list[list[float]]]:
+        """Return Rerun ``LineStrips3D`` describing a camera frustum.
+
+        Builds a unit pyramid in camera-local coordinates (right-down-forward)
+        with apex at the origin and an image plane at depth ``scale``,
+        rescaled to preserve the ``w:h`` aspect ratio.
+
+        Returns:
+            A list of 5 polylines: the image-plane rectangle plus the four
+            rays from the apex to its corners.
+        """
+        # Normalize aspect to fit within `scale`
         max_dim = max(w, h)
         w_sc = (w / max_dim) * scale * 0.5
         h_sc = (h / max_dim) * scale * 0.5
         z = scale
 
-        # Corners in Camera coords (Right, Down, Forward) -> (+X, +Y, +Z)
-        tr = [w_sc, h_sc, z]
-        br = [w_sc, -h_sc, z]
-        bl = [-w_sc, -h_sc, z]
-        tl = [-w_sc, h_sc, z]
-        o = [0, 0, 0]
+        # Corners in camera coords (right-down-forward): top-right, bottom-right, etc.
+        top_right = [w_sc, h_sc, z]
+        bot_right = [w_sc, -h_sc, z]
+        bot_left = [-w_sc, -h_sc, z]
+        top_left = [-w_sc, h_sc, z]
+        origin = [0, 0, 0]
 
         return [
-            [tr, br, bl, tl, tr],  # Image plane
-            [o, tr],
-            [o, br],
-            [o, bl],
-            [o, tl],  # Ray to corners
+            [top_right, bot_right, bot_left, top_left, top_right],  # image plane
+            [origin, top_right],
+            [origin, bot_right],
+            [origin, bot_left],
+            [origin, top_left],
         ]
 
     def log_reconstruction_rerun(
         self,
-        path,
-        entity,
-        static_cameras=False,
-        points3D=False,
-        static_points=False,
-        camera_color=[0, 255, 0],
-    ):
+        path: str,
+        entity: str,
+        static_cameras: bool = False,
+        points3D: bool = False,
+        static_points: bool = False,
+        camera_color: list[int] = [0, 255, 0],
+    ) -> None:
+        """Log a COLMAP reconstruction (cameras + optional point cloud) to Rerun.
+
+        Args:
+            path: Path to a COLMAP reconstruction folder.
+            entity: Top-level Rerun entity prefix (e.g. ``"gt"``, ``"opt"``).
+            static_cameras: If True, log camera transforms as time-static.
+            points3D: If True, also log the 3D point cloud.
+            static_points: If True, log points as time-static.
+            camera_color: RGB color used for the frustum line strips.
+        """
         recon = pycolmap.Reconstruction(path)
         for img_id, img in recon.images.items():
             # COLMAP stores world-to-cam (R, t)
@@ -433,7 +497,8 @@ class ReconstructAndVizModule:
 
         # Log GT Point Cloud
         if len(recon.points3D) > 0 and points3D:
-            print(f"Logging {len(recon.points3D)} GT points...")
+            if self.verbose:
+                print(f"Logging {len(recon.points3D)} GT points...")
             pts = []
             colors = []
             for p in recon.points3D.values():

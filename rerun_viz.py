@@ -1,3 +1,11 @@
+"""Standalone Rerun visualizer for an EPO run.
+
+Loads up to four COLMAP reconstructions (ground truth, EPO output, BA, BA
+refined), aligns them to GT with ``colmap model_aligner`` and logs them as
+camera frustums + point clouds in Rerun. Configure the paths at the bottom
+of the file before running.
+"""
+
 import os
 import torch
 import pycolmap
@@ -6,37 +14,54 @@ import rerun as rr
 import rerun.blueprint as rrb
 
 
-def get_frustum_strips(scale=0.15, w=1.0, h=1.0):
-    # Normalize aspect to fit in scale
+def get_frustum_strips(
+    scale: float = 0.15, w: float = 1.0, h: float = 1.0
+) -> list[list[list[float]]]:
+    """Return Rerun ``LineStrips3D`` describing a camera frustum.
+
+    Builds a unit pyramid in camera-local coordinates (right-down-forward)
+    with apex at the origin and an image plane at depth ``scale``, scaled
+    to preserve the ``w:h`` aspect ratio. The first polyline is the image
+    plane; the next four are rays from the apex to its corners.
+    """
     max_dim = max(w, h)
     w_sc = (w / max_dim) * scale * 0.5
     h_sc = (h / max_dim) * scale * 0.5
     z = scale
 
-    # Corners in Camera coords (Right, Down, Forward) -> (+X, +Y, +Z)
-    tr = [w_sc, h_sc, z]
-    br = [w_sc, -h_sc, z]
-    bl = [-w_sc, -h_sc, z]
-    tl = [-w_sc, h_sc, z]
-    o = [0, 0, 0]
+    top_right = [w_sc, h_sc, z]
+    bot_right = [w_sc, -h_sc, z]
+    bot_left = [-w_sc, -h_sc, z]
+    top_left = [-w_sc, h_sc, z]
+    origin = [0, 0, 0]
 
     return [
-        [tr, br, bl, tl, tr],  # Image plane
-        [o, tr],
-        [o, br],
-        [o, bl],
-        [o, tl],  # Ray to corners
+        [top_right, bot_right, bot_left, top_left, top_right],  # image plane
+        [origin, top_right],
+        [origin, bot_right],
+        [origin, bot_left],
+        [origin, top_left],
     ]
 
 
 def log_reconstruction_rerun(
-    path,
-    entity="",
-    static_cameras=False,
-    points3D=False,
-    static_points=False,
-    camera_color=[0, 255, 0],
-):
+    path: str,
+    entity: str = "",
+    static_cameras: bool = False,
+    points3D: bool = False,
+    static_points: bool = False,
+    camera_color: list[int] = [0, 255, 0],
+) -> None:
+    """Log a COLMAP reconstruction to Rerun under ``world/<entity>``.
+
+    Args:
+        path: Path to a COLMAP reconstruction folder.
+        entity: Sub-namespace under ``world/`` for these entities.
+        static_cameras: If True, log camera transforms as time-static.
+        points3D: If True, also log the 3D point cloud.
+        static_points: If True, log points as time-static.
+        camera_color: RGB color used for the frustum line strips.
+    """
     recon = pycolmap.Reconstruction(path)
     for img_id, img in recon.images.items():
         # COLMAP stores world-to-cam (R, t)

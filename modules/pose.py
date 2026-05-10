@@ -1,8 +1,15 @@
+"""Learnable camera-pose module (world-to-camera, ``T_cw``).
+
+Stores the per-image pose as a quaternion + translation and exposes either
+direct optimization of those parameters or, when ``use_mlp=True``, a fixed
+quaternion + translation refined by a small :class:`PoseRefinementMLP`
+residual plus a learnable per-image translation offset.
+"""
+
 import torch
 import torch.nn as nn
 import pypose as pp
 
-# import kornia.geometry.conversions as kgc  # maybe I can remove kornia
 from modules.mlp import PoseRefinementMLP
 from modules.base_module import BaseModule
 
@@ -56,11 +63,11 @@ class PoseModule(BaseModule):
         self.hw = hw  # (H, W)
         self.max_num_iterations = max_num_iterations
 
+        # When the MLP refines poses, the raw q/t parameters are frozen
+        # (the MLP residual + t_offset carry the optimization).
         if use_mlp:
-            print(f"When using MLP pose refinement, q and t gradients are disabled.")
-
-        grad_q = False if use_mlp else grad_q
-        grad_t = False if use_mlp else grad_t
+            grad_q = False
+            grad_t = False
         self.grad_t_offset = grad_t_offset
         self.t_lr = t_lr
         self.q_lr = q_lr
@@ -68,13 +75,8 @@ class PoseModule(BaseModule):
         num_cams = len(image_id_map)
 
         # --- Rotation Prep (Matrix -> Quat) ---
-        # # Kornia returns (w, x, y, z)
-        # q_init = kgc.rotation_matrix_to_quaternion(R)
-
-        # # PyPose expects (x, y, z, w) (scalar last). We roll -1 to move w from index 0 to index 3
-        # q_init = torch.roll(q_init, shifts=-1, dims=1)
-
-        q_init = pp.mat2SO3(R).tensor()  # Returns (x,y,z,w) directly
+        # PyPose returns quaternions in (x, y, z, w) order (scalar last).
+        q_init = pp.mat2SO3(R).tensor()
 
         # Store as Raw Parameter (requires normalization on usage)
         self.q_param = nn.Parameter(
@@ -226,7 +228,8 @@ class PoseModule(BaseModule):
 
         return R, t
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Return a short summary of the first few stored poses."""
         limit = 3
         s = f"PoseModel ({len(self.image_to_tensor_idx)} poses):\n"
         for i in range(min(limit, len(self.t_param))):
@@ -236,9 +239,11 @@ class PoseModule(BaseModule):
             # Fetch physical translation (scaled) for representation
             t_val = self.get_translation([i]).detach().cpu().numpy().flatten()
 
-            # s += f"  Image '{name}': R={q_val:.3e}, t={t_val:.3e}\n"
-            # print arrays with 3 decimal places signed, align them considering the sign too
-            s += f"  Image '{name}': q=[{q_val[0]:+.3e}, {q_val[1]:+.3e}, {q_val[2]:+.3e}, {q_val[3]:+.3e}], t=[{t_val[0]:+.3e}, {t_val[1]:+.3e}, {t_val[2]:+.3e}]\n"
+            s += (
+                f"  Image '{name}': "
+                f"q=[{q_val[0]:+.3e}, {q_val[1]:+.3e}, {q_val[2]:+.3e}, {q_val[3]:+.3e}], "
+                f"t=[{t_val[0]:+.3e}, {t_val[1]:+.3e}, {t_val[2]:+.3e}]\n"
+            )
 
         if len(self.t_param) > limit:
             s += f"  ... {len(self.t_param) - limit} more."

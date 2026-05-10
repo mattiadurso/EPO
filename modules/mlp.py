@@ -1,3 +1,11 @@
+"""Small MLP that refines a 3x4 pose matrix with a residual + orthonormalization.
+
+Architecture follows ACE Zero (supplementary material): six fully-connected
+layers, a residual connection between layers 1 and 3, and a final
+Gram-Schmidt step that re-orthonormalizes the rotation block of the output
+3x4 pose matrix.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,7 +22,13 @@ class PoseRefinementMLP(nn.Module):
     - Output: 3x4 pose matrix with orthonormalized rotation via Gram-Schmidt.
     """
 
-    def __init__(self, input_dim, output_dim, hidden_dim=128):
+    def __init__(self, input_dim: int, output_dim: int, hidden_dim: int = 128):
+        """
+        Args:
+            input_dim: Flattened input size (12 for a 3x4 pose matrix).
+            output_dim: Flattened output size (12 for a 3x4 pose matrix).
+            hidden_dim: Hidden width of the fully-connected stack.
+        """
         super().__init__()
         # The 6 layers
         self.fc1 = nn.Linear(input_dim, hidden_dim)

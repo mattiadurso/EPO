@@ -1,3 +1,10 @@
+"""Plotting / aggregation utilities for the benchmark notebooks.
+
+Reads pose-AUC and NVS results from on-disk JSON dumps produced by
+``benchmark_pose`` and ``test.py`` runs and renders the comparison plots
+used in the paper. Imported almost exclusively by ``benchmark.ipynb``.
+"""
+
 import os
 import json
 import numpy as np
@@ -14,7 +21,20 @@ from benchmark_pose import eval_colmap_model_all_scenes, eval_colmap_model
 def read_results(
     dataset, target_folder, models, thr=5, round_to=1, remove=[], full=False
 ):
+    """Aggregate per-scene pose-AUC results for a list of models on a dataset.
 
+    Args:
+        dataset: Dataset name (matches a subfolder under ``base_target``).
+        target_folder: Sub-path under each model's run directory.
+        models: List of model run names to compare.
+        thr: AUC threshold (degrees) to report.
+        round_to: Number of decimals to round results to.
+        remove: Scene names to exclude from aggregation.
+        full: If True, read from the ``benchmarks_full`` tree.
+
+    Returns:
+        ``pd.DataFrame`` with one column per model and one row per scene.
+    """
     base_target = f"/home/mattia/Desktop/datasets/{dataset}"
     if dataset == "imc":
         base_target = (
@@ -93,6 +113,16 @@ def read_results(
 
 
 def plot_auc5_with_time(df, dataset, models, thr, ignore_time=False):
+    """Render the AUC@thr-vs-runtime comparison figure used in the paper.
+
+    Args:
+        df: DataFrame produced by :func:`read_results`.
+        dataset: Dataset name (used as a plot title; recognised aliases:
+            ``"tt"`` → "Tanks & Temples", ``"scannetpp"`` → "Scannet++ v2").
+        models: Ordered list of model names to plot.
+        thr: AUC threshold whose columns to read.
+        ignore_time: If True, plot AUC only (no time axis).
+    """
     dataset = "Tanks & Temples" if dataset == "tt" else dataset
     dataset = "Scannet++ v2" if dataset == "scannetpp" else dataset
 

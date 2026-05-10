@@ -1,3 +1,11 @@
+"""Edge-distance-field loss building blocks.
+
+Provides two distance-field implementations (a fast OpenCV path and a pure
+PyTorch path), a bilinear sampler that reads the field at floating-point
+edge coordinates, and the per-chunk residual reduction used by the EPO
+forward pass (per-edge clamp → Huber → per-direction mean).
+"""
+
 import torch
 import cv2
 import numpy as np
@@ -84,7 +92,16 @@ def compute_distance_field_torch(
 def sample_distance_field(
     dt_field: torch.Tensor,
     edge_coords: torch.Tensor,
-):
+) -> torch.Tensor:
+    """Bilinearly sample a distance field at floating-point edge coordinates.
+
+    Args:
+        dt_field: ``(B, 1, H, W)`` distance field per image.
+        edge_coords: ``(B, N, 2)`` ``(x, y)`` pixel coordinates to sample.
+
+    Returns:
+        ``(B, N)`` sampled distance values.
+    """
     # Safely extract H and W from the last two dimensions of the (B, 1, H, W) tensor
     H, W = dt_field.shape[-2:]
     device = dt_field.device
