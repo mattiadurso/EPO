@@ -114,7 +114,7 @@ bicycle/
 
 ### Step 2 — Run a 3D Foundation Model
 
-Run a 3DFM (e.g., [VGGT](https://github.com/facebookresearch/vggt)) on your images and export the reconstruction in **COLMAP format** and the dense depth maps with the following layout:
+Run a 3DFM (e.g., [VGGT](https://github.com/mattiadurso/vggt)) on your images and export the reconstruction in **COLMAP format** and the dense depth maps with the following layout:
 
 ```
 bicycle/
