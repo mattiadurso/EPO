@@ -1,51 +1,80 @@
-<p align="center">
-  <h1 align="center">EPO: Boosting 3D Foundation Models with Featureless Pose Optimization</h1>
-  <p align="center">
-    <a href="https://scholar.google.com/citations?user=9FjTo3YAAAAJ&hl=en">Mattia D'Urso</a><sup>1</sup>
-    ·
-    <a href="https://scholar.google.com/citations?user=6uZVF04AAAAJ&hl=en">Christian Sormann</a><sup>2</sup>
-    ·
-    <a href="https://scholar.google.com/citations?user=DA3nSvgAAAAJ&hl=en">Mattia Rossi</a><sup>2</sup>
-    ·
-    <a href="https://scholar.google.com/citations?user=M0boL5kAAAAJ&hl=en">Friedrich Fraundorfer</a><sup>1</sup>
-  </p>
-  <p align="center">
-    <sup>1</sup>Graz University of Technology · <sup>2</sup> Sony Europe
-  </p>
-  <h2 align="center">
-    <p>👀 2026</p>
-    <a href="" align="center">Paper</a> | 
-    <a href="" align="center">Supplementary Material</a> | 
-    <a href="https://mattiadurso.github.io/epo/" align="center"> Project Page</a>
-  </h2>
+<div align="center">
+
+# Boosting 3D Foundation Models with Featureless Pose Optimization
+
+<p>
+  <a href="https://scholar.google.com/citations?user=9FjTo3YAAAAJ&hl=en">Mattia D'Urso</a><sup>1</sup>&ensp;·&ensp;
+  <a href="https://scholar.google.com/citations?user=6uZVF04AAAAJ&hl=en">Christian Sormann</a><sup>2</sup>&ensp;·&ensp;
+  <a href="https://scholar.google.com/citations?user=DA3nSvgAAAAJ&hl=en">Mattia Rossi</a><sup>2</sup>&ensp;·&ensp;
+  <a href="https://scholar.google.com/citations?user=M0boL5kAAAAJ&hl=en">Friedrich Fraundorfer</a><sup>1</sup>
 </p>
 
-<p align="center">
-  <img src="assets/townhall.gif" alt="ALIKED" width="400px">
-  <br>
-  <em>Visualization of three stages of our pose optimization method and the ground truth sparse point cloud for the Graz Town Hall scene (TerraSky3D). Starting from the initial optimization stage (a), provided by the VGGT output, we illustrate an intermediate state (b) and the final refined poses (c). The ground truth poses are shown in green and the optimized ones in red.</em>
+<p>
+  <sup>1</sup>Graz University of Technology&emsp;·&emsp;<sup>2</sup>Sony Europe
 </p>
+
+<p>
+  👀
+</p>
+
+<p>
+  <a href=""><img src="https://img.shields.io/badge/Paper-2026-blue?style=flat-square" alt="Paper"></a>
+  &nbsp;
+  <a href=""><img src="https://img.shields.io/badge/Supplementary-Material-green?style=flat-square" alt="Supplementary Material"></a>
+  &nbsp;
+  <a href="https://mattiadurso.github.io/epo/"><img src="https://img.shields.io/badge/Project-Page-orange?style=flat-square" alt="Project Page"></a>
+</p>
+
+
+
+<img src="assets/townhall.gif" alt="EPO Pose Optimization" width="480px">
+
+<p><em>
+  Visualization of three stages of EPO applied to the Graz Town Hall scene (TerraSky3D). Starting from the initial state <strong>(a)</strong> provided by VGGT output, we show an intermediate step <strong>(b)</strong> and the final refined poses <strong>(c)</strong>. Ground truth poses are shown in <span style="color:green">green</span>; optimized poses in <span style="color:red">red</span>.
+</em></p>
+
+</div>
+
+
+## Overview
+
+**EPO** (Edge-based Pose Optimization) is a featureless method for refining camera poses and depth produced by 3D Foundation Models (3DFMs) such as VGGT. Rather than relying on hand-crafted/learned feature matching, EPO directly optimizes camera poses using dense depth maps, improving reconstruction quality in a lightweight and generalizable manner.
+
+
+
+## Changelog
+
+| Version | Description |
+|---------|-------------|
+| **1.1** | Fixed a bug in the loss function. Outliers are now handled more robustly, resulting in slightly higher scores. |
+| **1.0** | Initial release. |
+
+
 
 ## Installation
 
-1. Clone the repository:
+### Prerequisites
+
+- [Conda](https://docs.conda.io/en/latest/) (recommended)
+- Python 3.10
+- CUDA-compatible GPU
+
+### Option A — Conda Environment File
+
 ```bash
 git clone https://github.com/mattiadurso/epo.git
 cd epo
-```
 
-2. Create and activate the conda environment:
-```bash
 conda env create -f environment.yml
 conda activate epo
 ```
-or
+
+### Option B — Manual Setup
+
 ```bash
-# 1. Create and activate the environment
 conda create -n epo python=3.10 -y
 conda activate epo
 
-# 2. Install all libraries 
 pip install h5py \
             kornia \
             matplotlib \
@@ -61,62 +90,80 @@ pip install h5py \
             git+https://github.com/mattiadurso/mylib.git
 ```
 
+---
 
-## How to run
+## Usage
 
-### Quick Start
+### Step 1 — Prepare Input Images
 
-Run a 3DFM (e.g., VGGT) on an unconstrained set of RGB images 
+> 📦 A demo scene can be downloaded [here](https://cloud.tugraz.at/index.php/s/dNfD96WNJ64kZCS).
+
+Organize your images using the following structure. Images can be grouped by camera if multiple camera rigs are used:
+
 ```
 bicycle/
-└── images/                     # Images folder
-    ├── 1/                      # Images for Camera Group 1
-    │   ├── _DSC8679.jpg         
+└── images/
+    ├── 1/                   # Images for Camera Group 1
+    │   ├── _DSC8679.jpg
     │   ├── _DSC8680.jpg
     │   └── ...
-    └── 2/                      # Images for Camera Group 2 (if applicable)
+    └── 2/                   # Images for Camera Group 2 (if more)
         ├── _DSC9001.jpg
         └── ...
 ```
 
-and save the input in COLMAP format with the following format. A demo scene can be downloaded <a href="https://cloud.tugraz.at/index.php/s/dNfD96WNJ64kZCS">here</a>.
+### Step 2 — Run a 3D Foundation Model
+
+Run a 3DFM (e.g., [VGGT](https://github.com/facebookresearch/vggt)) on your images and export the reconstruction in **COLMAP format** and the dense depth maps with the following layout:
 
 ```
 bicycle/
-└── sparse/                         # VGGT reconstruction (COLMAP format)
-    ├── cameras.bin                 # Camera intrinsics parameters
-    ├── images.bin                  # Camera poses and registration
-    ├── points3D.bin                # Sparse 3D point cloud data
-    └── depth_maps/                 # VGGT dense depth maps
-        ├── 1/                      # Depth maps for Camera Group 1
-        │   ├── _DSC8679.h5         # Per-pixel depth data (HDF5)
+└── sparse/
+    ├── cameras.bin          # Camera intrinsic parameters
+    ├── images.bin           # Camera extrinsics and image registration
+    ├── points3D.bin         # Sparse 3D point cloud
+    └── depth_maps/
+        ├── 1/               # Depth maps for Camera Group 1
+        │   ├── _DSC8679.h5
         │   ├── _DSC8680.h5
         │   └── ...
-        └── 2/                      # Depth maps for Camera Group 2 (if applicable)
+        └── 2/               # Depth maps for Camera Group 2 (if more)
             ├── _DSC9001.h5
             └── ...
 ```
 
-Then run with
+
+
+### Step 3 — Run EPO
+
 ```bash
 python epo.py \
-    --images_path <path> \    # Path to original source images
-    --rec_path ./sparse \     # COLMAP reconstruction folder (.bin files)
-    --depth_path ./depths \   # Folder containing the .h5 depth maps
-    --gt_path <path>          # (Optional) Ground truth data for evaluation
+    --images_path <path_to_images> \
+    --rec_path    ./sparse \
+    --depth_path  ./depths \
+    --gt_path     <path_to_ground_truth>   # Optional — enables quantitative evaluation
 ```
-Notice: 
-- Images and depth maps must mirror the same file system structure.
-- Ground truth must be in the same COLMAP format, including images names (e.g. cam/images.jpg)
+
+### Notes
+
+- Image and depth map directories must mirror the same folder structure.
+- Ground truth data must be provided in COLMAP format, with matching image names (e.g., `cam/images.jpg`).
 
 ## Citation
 
+If you find this work useful, please consider citing:
+
 ```bibtex
 @inproceedings{durso2026epo,
-  title={Boosting 3D Foundation Models with Featureless Pose Optimization},
-  author={Mattia D'Urso and Christian Sormann and Mattia Rossi and Friedrich Fraundorfer},
-  booktitle={},
-  year={2026},
-  url={}
-  }
+  title     = {Boosting 3D Foundation Models with Featureless Pose Optimization},
+  author    = {Mattia D'Urso and Christian Sormann and Mattia Rossi and Friedrich Fraundorfer},
+  booktitle = {👀},
+  year      = {2026},
+}
 ```
+
+---
+
+<div align="center">
+  <sub>Graz University of Technology · Sony Europe · 2026</sub>
+</div>
