@@ -117,7 +117,6 @@ dependencies:
       - poselib==2.0.5
       - pycolmap==3.11.0
       - pyparsing==3.3.2
-      - pypose==0.9.5
       - pytest==9.0.3
       - pytz==2026.1.post1
       - scikit-learn==1.7.2

@@ -1,16 +1,20 @@
 """Learnable camera-pose module (world-to-camera, ``T_cw``).
 
-Stores the per-image pose as a quaternion + translation and exposes either
-direct optimization of those parameters or, when ``use_mlp=True``, a fixed
-quaternion + translation refined by a small :class:`PoseRefinementMLP`
+Stores the per-image pose as a 3x3 rotation matrix + translation and exposes
+either direct optimization of those parameters or, when ``use_mlp=True``, a
+fixed rotation + translation refined by a small :class:`PoseRefinementMLP`
 residual plus a learnable per-image translation offset.
+
+The raw 3x3 rotation parameter is unconstrained during optimization; we
+re-orthonormalize on every fetch via :func:`gram_schmidt_rotation`, which is
+the same primitive the MLP uses internally to project its output back onto
+SO(3).
 """
 
 import torch
 import torch.nn as nn
-import pypose as pp
 
-from modules.mlp import PoseRefinementMLP
+from modules.mlp import PoseRefinementMLP, gram_schmidt_rotation
 from modules.base_module import BaseModule
 
 
@@ -22,8 +26,8 @@ class PoseModule(BaseModule):
         R: torch.Tensor,
         t: torch.Tensor,
         t_lr: float = 1e-3,
-        q_lr: float = 1e-4,
-        grad_q: bool = False,
+        R_lr: float = 1e-4,
+        grad_R: bool = False,
         grad_t: bool = False,
         grad_t_offset: bool = False,
         use_mlp: bool = True,
@@ -43,8 +47,8 @@ class PoseModule(BaseModule):
             R: (N, 3, 3) tensor of rotation matrices
             t: (N, 3) or (N, 3, 1) tensor of translation vectors
             t_lr: Learning rate for translation optimizer
-            q_lr: Learning rate for rotation optimizer
-            grad_q: Whether to compute gradients for rotation
+            R_lr: Learning rate for rotation optimizer
+            grad_R: Whether to compute gradients for rotation
             grad_t: Whether to compute gradients for translation
             grad_t_offset: Whether to compute gradients for translation offset
             use_mlp: Whether to use MLP for pose refinement
@@ -63,25 +67,24 @@ class PoseModule(BaseModule):
         self.hw = hw  # (H, W)
         self.max_num_iterations = max_num_iterations
 
-        # When the MLP refines poses, the raw q/t parameters are frozen
+        # When the MLP refines poses, the raw R/t parameters are frozen
         # (the MLP residual + t_offset carry the optimization).
         if use_mlp:
-            grad_q = False
+            grad_R = False
             grad_t = False
         self.grad_t_offset = grad_t_offset
         self.t_lr = t_lr
-        self.q_lr = q_lr
+        self.R_lr = R_lr
         self.mlp_lr = mlp_lr
         num_cams = len(image_id_map)
 
-        # --- Rotation Prep (Matrix -> Quat) ---
-        # PyPose returns quaternions in (x, y, z, w) order (scalar last).
-        q_init = pp.mat2SO3(R).tensor()
-
-        # Store as Raw Parameter (requires normalization on usage)
-        self.q_param = nn.Parameter(
-            q_init.clone().detach().to(self.device, dtype=self.dtype),
-            requires_grad=grad_q,
+        # --- Rotation Prep ---
+        # Stored as an unconstrained 3x3; Gram-Schmidt is applied on every
+        # fetch (see `get_rotation_matrix`) to project back onto SO(3).
+        R_init = R.reshape(num_cams, 3, 3).to(self.device, dtype=self.dtype)
+        self.R_param = nn.Parameter(
+            R_init.clone().detach(),
+            requires_grad=grad_R,
         )
 
         # --- Translation Prep ---
@@ -113,8 +116,8 @@ class PoseModule(BaseModule):
             self.init_optimizer(mlp_lr=mlp_lr)
         else:
             self.use_mlp = False
-            # Initialize optimizer with q and t parameters
-            self.init_optimizer(t_lr=self.t_lr, q_lr=self.q_lr)
+            # Initialize optimizer with R and t parameters
+            self.init_optimizer(t_lr=self.t_lr, R_lr=self.R_lr)
 
         # Initialize learning rate scheduler
         self.init_scheduler(warmup_steps, max_num_iterations)
@@ -123,7 +126,7 @@ class PoseModule(BaseModule):
         self.update_all_matrices()
 
     def init_optimizer(
-        self, t_lr: float = 1e-3, q_lr: float = 1e-4, mlp_lr: float = 3e-3
+        self, t_lr: float = 1e-3, R_lr: float = 1e-4, mlp_lr: float = 3e-3
     ):
         """Re-initialize optimizer with new learning rate."""
         if self.use_mlp:
@@ -150,7 +153,7 @@ class PoseModule(BaseModule):
             self.optimizer = torch.optim.AdamW(
                 [
                     {"params": [self.t_param], "lr": t_lr, "name": "t", "eps": 1e-10},
-                    {"params": [self.q_param], "lr": q_lr, "name": "q", "eps": 1e-10},
+                    {"params": [self.R_param], "lr": R_lr, "name": "R", "eps": 1e-10},
                     {
                         "params": [self.t_offset],
                         "lr": t_lr,
@@ -163,16 +166,10 @@ class PoseModule(BaseModule):
 
     def get_rotation_matrix(self, indices) -> torch.Tensor:
         """
-        Returns (B, 3, 3) Rotation Matrix for the requested images.
+        Returns (B, 3, 3) rotation matrices for the requested images,
+        re-orthonormalized via Gram-Schmidt so the result is always on SO(3).
         """
-        # 2. Get quaternions for batch
-        q_batch = self.q_param[indices]
-
-        # 1. Normalize all quaternions (important for stability)
-        q_norm = q_batch / (torch.norm(q_batch, dim=1, keepdim=True) + 1e-10)
-
-        # 3. Convert to Matrix via PyPose
-        return pp.SO3(q_norm).matrix()
+        return gram_schmidt_rotation(self.R_param[indices])
 
     def get_translation(self, indices) -> torch.Tensor:
         """Returns (B, 3) Translation vectors"""
@@ -234,14 +231,17 @@ class PoseModule(BaseModule):
         s = f"PoseModel ({len(self.image_to_tensor_idx)} poses):\n"
         for i in range(min(limit, len(self.t_param))):
             name = self.tensor_idx_to_image[i]
-            q_val = self.q_param[i].detach().cpu().numpy()
+            # Print the (orthonormalized) first row of R as a compact summary.
+            R_row0 = (
+                self.get_rotation_matrix([i])[0, 0].detach().cpu().numpy()
+            )
 
             # Fetch physical translation (scaled) for representation
             t_val = self.get_translation([i]).detach().cpu().numpy().flatten()
 
             s += (
                 f"  Image '{name}': "
-                f"q=[{q_val[0]:+.3e}, {q_val[1]:+.3e}, {q_val[2]:+.3e}, {q_val[3]:+.3e}], "
+                f"R[0]=[{R_row0[0]:+.3e}, {R_row0[1]:+.3e}, {R_row0[2]:+.3e}], "
                 f"t=[{t_val[0]:+.3e}, {t_val[1]:+.3e}, {t_val[2]:+.3e}]\n"
             )
 
@@ -249,22 +249,29 @@ class PoseModule(BaseModule):
             s += f"  ... {len(self.t_param) - limit} more."
         return s
 
-    def parameters(self, t=False, q=False, mlp=False, recurse: bool = True):
+    def parameters(self, t=False, R=False, mlp=False, recurse: bool = True):
         """Return list of trainable parameters - only leaf tensors"""
 
         params = []
 
-        if mlp and self.use_mlp:  # no q and t when mlp is used
+        if mlp and self.use_mlp:  # no R and t when mlp is used
             params.extend([p for p in self.mlp.parameters() if p.requires_grad])
         else:
-            if q and self.q_param.requires_grad:
-                params.append(self.q_param)
+            if R and self.R_param.requires_grad:
+                params.append(self.R_param)
             if t and self.t_param.requires_grad:
                 params.append(self.t_param)
         return params
 
-    def get_image_qt(self, indices):
-        """Get quaternion and translation for given image names."""
+    def get_image_Rt(self, indices):
+        """Get rotation matrix and physical translation for given image names.
+
+        Returns:
+            R: ``(B, 3, 3)`` orthonormal rotation matrices (or ``(3, 3)`` if a
+               single image was requested).
+            t: ``(B, 3)`` translations rescaled to the original physical units
+               (or ``(3,)`` for a single image).
+        """
         indices = (
             self.map_names_to_indices(indices)
             if isinstance(indices[0], str)
@@ -277,11 +284,9 @@ class PoseModule(BaseModule):
         if self.use_mlp:
             R, t = self.apply_mlp(R, t, indices)
 
-        # Convert R to quaternion
-        q = pp.mat2SO3(R).tensor()  # Returns (x,y,z,w) directly
         t = self.t_scale * t + self.t_mean  # Rescale to physical units
 
-        return q.squeeze(), t.squeeze()
+        return R.squeeze(), t.squeeze()
 
     def update_all_matrices(self):
         """Init/Update all extrinsic matrices for all images and store them internally."""

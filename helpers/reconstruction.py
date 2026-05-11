@@ -217,21 +217,21 @@ def build_reconstruction(
 
         # Convert cam_id to int for COLMAP
         cam_id_int = epo.intrinsics.image_to_tensor_idx[cam_id]
-        # Get rotation matrix and translation
-        q, t = epo.poses.get_image_qt([image_name])
-        q = q.detach().cpu().numpy()
-        t = t.detach().cpu().numpy()
+        # Get rotation matrix and translation (R is already orthonormal)
+        R, t = epo.poses.get_image_Rt([image_name])
+        R = R.detach().cpu().numpy().astype(np.float64)
+        t = t.detach().cpu().numpy().astype(np.float64)
 
         # Apply inverse scaling to translation (scale back to original)
         t = t / scale
 
-        # Create image
+        # Create image — pycolmap.Rotation3d accepts a 3x3 matrix directly.
         img = pycolmap.Image(
             id=image_id,
             name=image_name,
             camera_id=cam_id_int,
             cam_from_world=pycolmap.Rigid3d(
-                rotation=pycolmap.Rotation3d(q), translation=t
+                rotation=pycolmap.Rotation3d(R), translation=t
             ),
         )
         reconstruction.add_image(img)

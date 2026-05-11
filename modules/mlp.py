@@ -4,11 +4,44 @@ Architecture follows ACE Zero (supplementary material): six fully-connected
 layers, a residual connection between layers 1 and 3, and a final
 Gram-Schmidt step that re-orthonormalizes the rotation block of the output
 3x4 pose matrix.
+
+The Gram-Schmidt primitive is exposed at module level as
+:func:`gram_schmidt_rotation` so it can be reused by other modules (e.g. the
+:class:`PoseModule`, which stores its rotation as a learnable 3x3 matrix and
+needs to re-orthonormalize on every fetch).
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def gram_schmidt_rotation(R: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Re-orthonormalize a batch of (approximately) rotation matrices.
+
+    Uses the standard 6D representation: keep rows 1 and 2, normalize r1,
+    project r2 onto the plane orthogonal to r1, normalize r2, then set
+    r3 = r1 x r2 to guarantee a right-handed orthonormal frame.
+
+    Args:
+        R: ``(..., 3, 3)`` tensor whose row-vectors are treated as the rotation
+           basis (world-to-camera convention is unaffected — we only
+           orthonormalize).
+        eps: Numerical floor passed to :func:`F.normalize`.
+
+    Returns:
+        ``(..., 3, 3)`` orthonormal rotation matrix with ``det(R) = +1``.
+    """
+    r1 = R[..., 0, :]
+    r2 = R[..., 1, :]
+
+    r1 = F.normalize(r1, p=2, dim=-1, eps=eps)
+    # Project r2 onto r1 and subtract; (...,1) dot product
+    dot = torch.sum(r1 * r2, dim=-1, keepdim=True)
+    r2 = F.normalize(r2 - dot * r1, p=2, dim=-1, eps=eps)
+    r3 = torch.cross(r1, r2, dim=-1)
+
+    return torch.stack([r1, r2, r3], dim=-2)
 
 
 class PoseRefinementMLP(nn.Module):
@@ -63,9 +96,10 @@ class PoseRefinementMLP(nn.Module):
         nn.init.constant_(self.fc6.bias, 0)
 
     def gram_schmidt(self, poses):
-        """
-        Applies Gram-Schmidt orthonormalization to the 3x3 rotation parts
-        of the 3x4 pose matrices.
+        """Orthonormalize the rotation block of (B, 3, 4) pose matrices.
+
+        Thin wrapper around :func:`gram_schmidt_rotation` that keeps the
+        translation column untouched.
 
         Args:
             poses: Tensor of shape (B, 3, 4)
@@ -73,37 +107,8 @@ class PoseRefinementMLP(nn.Module):
         Returns:
             poses: Tensor of shape (B, 3, 4) with orthonormalized rotations.
         """
-        # Split into Rotation (3x3) and Translation (3x1)
-        R = poses[:, :3, :3]
-        t = poses[:, :3, 3:]
-
-        # Extract row vectors (assuming standard World-to-Cam convention)
-        r1 = R[:, 0, :]
-        r2 = R[:, 1, :]
-        # r3 is re-computed via cross product
-
-        # Normalize first vector
-        r1 = F.normalize(r1, p=2, dim=1, eps=1e-8)
-
-        # Project r2 onto r1 and subtract to make orthogonal
-        # dot product shape: (B, 1)
-        dot = torch.sum(r1 * r2, dim=1, keepdim=True)
-        r2 = r2 - dot * r1
-
-        # Normalize second vector
-        r2 = F.normalize(r2, p=2, dim=1, eps=1e-8)
-
-        # Compute third vector via cross product (ensures right-handed system)
-        r3 = torch.cross(r1, r2, dim=1)
-
-        # Stack back into rotation matrix
-        # Stack dim=1 results in (B, 3, 3)
-        R_ortho = torch.stack([r1, r2, r3], dim=1)
-
-        # Recombine with translation
-        poses_ortho = torch.cat([R_ortho, t], dim=2)
-
-        return poses_ortho
+        R_ortho = gram_schmidt_rotation(poses[:, :3, :3])
+        return torch.cat([R_ortho, poses[:, :3, 3:]], dim=2)
 
     def forward(self, x):
         """

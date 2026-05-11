@@ -397,7 +397,7 @@ class ReconstructAndVizModule:
             "lr_mlp_pose": self.mlp_pose_lr,
             "lr_k": self.k_lr,
             "lr_z": self.z_lr,
-            "lr_q": self.q_lr,
+            "lr_R": self.R_lr,
             "lr_t": self.t_lr,
             "matcher_type": self.matcher_type,
         }

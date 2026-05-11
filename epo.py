@@ -114,13 +114,14 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             (``"outdoor"`` / ``"indoor"`` / ``"object_centric"``).
         use_depth_confidence: If True, weight residuals by per-pixel depth
             confidence (when available).
-        q_lr, t_lr: Learning rates for raw rotation / translation parameters.
+        R_lr, t_lr: Learning rates for raw rotation / translation parameters.
         k_lr: Learning rate for camera intrinsics.
         z_lr: Learning rate for depth scale/shift.
         mlp_pose_lr: Learning rate for the pose-refinement MLP and its
             translation offset.
-        grad_q, grad_t: Whether to optimize raw quaternions / translations.
-            Both are forced to False when ``use_mlp_pose_refinement`` is True.
+        grad_R, grad_t: Whether to optimize raw rotation matrices /
+            translations. Both are forced to False when
+            ``use_mlp_pose_refinement`` is True.
         grad_t_offset: Whether to optimize the per-image translation offset.
         grad_k: Whether to optimize camera intrinsics.
         grad_z: Whether to optimize per-pixel depth.
@@ -163,12 +164,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         sequential_matcher_window=5,  # only for sequential matcher
         scene_type="outdoor",  # or "indoor", "object_centric" (not used yet)
         use_depth_confidence=False,
-        q_lr=1e-4,
+        R_lr=1e-4,
         t_lr=1e-3,
         k_lr=1e-3,
         z_lr=3e-3,
         mlp_pose_lr=3e-3,
-        grad_q=False,
+        grad_R=False,
         grad_t=False,
         grad_t_offset=True,
         grad_k=True,
@@ -273,12 +274,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             raise ValueError(f"Unknown detector: {detector}")
 
         # what to train
-        self.q_lr = q_lr
+        self.R_lr = R_lr
         self.t_lr = t_lr
         self.k_lr = k_lr
         self.z_lr = z_lr
         self.mlp_pose_lr = mlp_pose_lr
-        self.grad_q = grad_q
+        self.grad_R = grad_R
         self.grad_t = grad_t
         self.grad_t_offset = grad_t_offset
         self.grad_k = grad_k
@@ -858,7 +859,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # but for now we keep them in sync for simplicity.
         s_time = time.perf_counter()
         if (
-            self.grad_q is True
+            self.grad_R is True
             or self.grad_t is True
             or self.use_mlp_pose_refinement is True
         ):
@@ -1242,9 +1243,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             hw=self.images[image_name]["hw"],
             R=torch.stack(R_tensor),
             t=torch.stack(t_tensor),
-            q_lr=self.q_lr,
+            R_lr=self.R_lr,
             t_lr=self.t_lr,
-            grad_q=self.grad_q,
+            grad_R=self.grad_R,
             grad_t=self.grad_t,
             grad_t_offset=self.grad_t_offset,
             mlp_lr=self.mlp_pose_lr,
