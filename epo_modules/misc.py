@@ -58,27 +58,22 @@ class MiscModule:
         num_iters = len(getattr(self, "loss_list", []))
 
         # ── column geometry ───────────────────────────────────────────
-        KW = 32   # key column
-        VW = 10   # total-time column
-        PW = 7    # percentage column (incl. %)
-        AW = 14   # avg/iter column
-        W  = KW + VW + PW + AW + 2
+        KW = 32  # key column
+        VW = 10  # total-time column
+        PW = 7  # percentage column (incl. %)
+        AW = 14  # avg/iter column
+        W = KW + VW + PW + AW + 2
 
-        sep  = "=" * W
+        sep = "=" * W
         thin = "-" * W
 
         def row(label, secs, perc=None, avg=None, indent=0):
-            pad  = "  " * indent
-            lbl  = f"{pad}{label}"
-            s_t  = _fmt_seconds(secs)
+            pad = "  " * indent
+            lbl = f"{pad}{label}"
+            s_t = _fmt_seconds(secs)
             perc_s = f"{perc:5.1f}%" if perc is not None else ""
-            avg_s  = f"{_fmt_seconds(avg)}/it" if avg is not None else ""
-            return (
-                f"{lbl:<{KW}}"
-                f"{s_t:>{VW}}"
-                f"{perc_s:>{PW}}"
-                f"{avg_s:>{AW}}"
-            )
+            avg_s = f"{_fmt_seconds(avg)}/it" if avg is not None else ""
+            return f"{lbl:<{KW}}" f"{s_t:>{VW}}" f"{perc_s:>{PW}}" f"{avg_s:>{AW}}"
 
         def pct(val, base):
             return (val / base * 100) if base > 0 else 0.0
@@ -88,20 +83,20 @@ class MiscModule:
 
         # ── Loading ──────────────────────────────────────────────────
         total_loading = t.get("total_loading", 0.0)
-        total_opt     = t.get("total_optimization", 0.0)
-        grand_total   = total_loading + total_opt
+        total_opt = t.get("total_optimization", 0.0)
+        grand_total = total_loading + total_opt
 
         print(thin)
         print(f"{'LOADING':^{W}}")
         print(thin)
 
         loading_sub_keys = [
-            ("load_images",             "images"),
-            ("load_depth_maps",         "depth maps"),
-            ("load_poses_and_intrinsics","poses & intrinsics"),
-            ("extract_edges",           "edges"),
+            ("load_images", "images"),
+            ("load_depth_maps", "depth maps"),
+            ("load_poses_and_intrinsics", "poses & intrinsics"),
+            ("extract_edges", "edges"),
             ("compute_distance_fields", "distance fields"),
-            ("compute_viewgraph",       "viewgraph"),
+            ("compute_viewgraph", "viewgraph"),
         ]
         sub_sum = 0.0
         for key, label in loading_sub_keys:
@@ -112,8 +107,14 @@ class MiscModule:
 
         other_loading = total_loading - sub_sum
         if other_loading > 0.01:
-            print(row("other (extractor load, GC…)", other_loading,
-                      pct(other_loading, total_loading), indent=1))
+            print(
+                row(
+                    "other (extractor load, GC…)",
+                    other_loading,
+                    pct(other_loading, total_loading),
+                    indent=1,
+                )
+            )
 
         print(row("total loading", total_loading, pct(total_loading, grand_total)))
 
@@ -132,14 +133,14 @@ class MiscModule:
         print(thin)
 
         per_iter_keys = [
-            ("step_pre_computation",  "pre-compute  (unproject)"),
-            ("prepare_batched_inputs","batch inputs"),
-            ("forward_pass",          "forward  (project+Huber)"),
-            ("loss_computation",      "loss aggregation"),
+            ("step_pre_computation", "pre-compute  (unproject)"),
+            ("prepare_batched_inputs", "batch inputs"),
+            ("forward_pass", "forward  (project+Huber)"),
+            ("loss_computation", "loss aggregation"),
             ("gradients_computation", "backward"),
-            ("parameters_update",     "optimizer step"),
-            ("logging",               "logging  (+ AUC, rerun)"),
-            ("early_stop_check",      "convergence check"),
+            ("parameters_update", "optimizer step"),
+            ("logging", "logging  (+ AUC, rerun)"),
+            ("early_stop_check", "convergence check"),
         ]
         accounted = 0.0
         for key, label in per_iter_keys:
@@ -152,7 +153,9 @@ class MiscModule:
         # use_rerun, sync overhead etc.)
         unaccounted = total_opt - accounted
         if abs(unaccounted) > 0.001:
-            print(row("unaccounted", unaccounted, pct(unaccounted, total_opt), indent=1))
+            print(
+                row("unaccounted", unaccounted, pct(unaccounted, total_opt), indent=1)
+            )
 
         print(thin)
         it_per_s = (num_iters / total_opt) if total_opt > 0 else 0.0
@@ -205,10 +208,10 @@ class MiscModule:
             print(thin)
 
             initial_loss = self.loss_list[0]
-            final_loss   = self.loss_list[-1]
-            delta        = initial_loss - final_loss
-            perc_imp     = (delta / initial_loss * 100) if initial_loss != 0 else 0.0
-            sign         = "-" if perc_imp >= 0 else "+"
+            final_loss = self.loss_list[-1]
+            delta = initial_loss - final_loss
+            perc_imp = (delta / initial_loss * 100) if initial_loss != 0 else 0.0
+            sign = "-" if perc_imp >= 0 else "+"
 
             print(f"  {'initial loss':<{KW - 2}}{initial_loss:>{VW}.6f}")
             print(f"  {'final loss':<{KW - 2}}{final_loss:>{VW}.6f}")
@@ -294,8 +297,8 @@ class MiscModule:
 
         if len(self.loss_list) >= 2:
             initial_loss = self.loss_list[0]
-            final_loss   = self.loss_list[-1]
-            delta        = initial_loss - final_loss
+            final_loss = self.loss_list[-1]
+            delta = initial_loss - final_loss
             perc_improvement = (
                 (delta / initial_loss) * 100 if initial_loss != 0 else 0.0
             )
@@ -309,13 +312,13 @@ class MiscModule:
     # ------------------------------------------------------------------
 
     def _collect_parameters_to_optimize(self) -> dict:
-        """Group every learnable parameter tensor by submodule key (q/t/mlp/k/z)."""
+        """Group every learnable parameter tensor by submodule key (R/t/mlp/k/z)."""
         return {
-            "q":   self.poses.parameters(q=True),
-            "t":   self.poses.parameters(t=True),
+            "R": self.poses.parameters(R=True),
+            "t": self.poses.parameters(t=True),
             "mlp": self.poses.parameters(mlp=True),
-            "k":   self.intrinsics.parameters(),
-            "z":   self.sampled_depth.parameters(),
+            "k": self.intrinsics.parameters(),
+            "z": self.sampled_depth.parameters(),
         }
 
     def _print_params_summary(self, params_to_optimize: dict) -> None:

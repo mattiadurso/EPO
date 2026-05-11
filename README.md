@@ -82,7 +82,6 @@ pip install h5py \
             opencv-python \
             pandas \
             pycolmap==3.11 \
-            pypose \
             scikit-learn \
             torch \
             torchvision \
@@ -90,13 +89,11 @@ pip install h5py \
             git+https://github.com/mattiadurso/mylib.git
 ```
 
----
-
 ## Usage
 
 ### Step 1 — Prepare Input Images
 
-> 📦 A few demo scene can be downloaded [here](https://cloud.tugraz.at/index.php/s/dNfD96WNJ64kZCS).
+> 📦 A few demo scenes can be downloaded [here](https://cloud.tugraz.at/index.php/s/dNfD96WNJ64kZCS).
 
 Organize your images using the following structure. Images can be grouped by camera if multiple camera rigs are used:
 
