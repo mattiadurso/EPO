@@ -96,7 +96,7 @@ pip install h5py \
 
 ### Step 1 — Prepare Input Images
 
-> 📦 A demo scene can be downloaded [here](https://cloud.tugraz.at/index.php/s/dNfD96WNJ64kZCS).
+> 📦 A few demo scene can be downloaded [here](https://cloud.tugraz.at/index.php/s/dNfD96WNJ64kZCS).
 
 Organize your images using the following structure. Images can be grouped by camera if multiple camera rigs are used:
 
