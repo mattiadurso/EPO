@@ -220,7 +220,14 @@ def load_and_preprocess_images(
                 "hw": (img_tensor.shape[-2], img_tensor.shape[-1]),
             }
 
-    return images_dict
+    # ``as_completed`` returns futures in completion order — non-deterministic
+    # across runs (depends on OS thread scheduling). Several downstream sites
+    # iterate ``self.images.keys()`` and consume from a shared RNG (e.g.
+    # ``_pad_edges`` does ``torch.randperm(...)`` per image, advancing the
+    # generator). If dict order varies run-to-run, each image gets a different
+    # permutation and the initial loss + convergence step count drift by ~1e-4
+    # / ±10s of steps. Sort here so all downstream iteration is deterministic.
+    return {k: images_dict[k] for k in sorted(images_dict.keys())}
 
 
 def _process_single_depth(

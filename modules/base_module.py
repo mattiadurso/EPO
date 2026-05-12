@@ -92,7 +92,7 @@ class BaseModule(nn.Module):
 
     def init_optimizer(self, lr: float, w_decay: float = 1e-2, eps: float = 1e-10):
         """Initialize optimizer."""
-        args = {"lr": lr, "weight_decay": w_decay, "eps": eps}
+        args = {"lr": lr, "weight_decay": w_decay, "eps": eps, "fused": True}
         self.optimizer = torch.optim.AdamW(
             [self.params],
             **args,
