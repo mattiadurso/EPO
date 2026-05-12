@@ -726,12 +726,50 @@ def project_and_sample_logic(
     P1: torch.Tensor,
     img1_shape: torch.Tensor,
     dt_fields: torch.Tensor,
+    dt_indices: torch.Tensor | None = None,
     border: int = 0,
+    backend: str = "torch",
 ):
     """
     Fused operation: Projection -> 2D -> Sampling.
     Guarantees no NaNs are produced. Invalid points are zeroed out and tracked via outside_mask.
+
+    Args:
+        dt_fields: Either the *source* ``(N_img, 1, H, W)`` distance-field
+            tensor (when ``dt_indices`` is provided), or a pre-gathered
+            per-batch ``(B, 1, H, W)`` tensor (when ``dt_indices`` is ``None``,
+            legacy path).
+        dt_indices: Optional ``(B,)`` int64 — for each batch row, the image
+            index in ``dt_fields``. When provided, the Triton backend reads
+            ``dt_fields`` lazily and **never materialises a per-batch copy**;
+            the torch backend gathers internally to feed ``F.grid_sample``.
+        backend: ``"torch"`` (default) uses the PyTorch chain
+            ``project_world_to_2D → sample_distance_field``. ``"triton"``
+            calls a fused Triton kernel with an analytical PyTorch backward;
+            it requires ``border == 0``, CUDA tensors, and assumes
+            ``dt_fields`` does not require gradients (true for EPO).
     """
+    if backend == "triton":
+        assert border == 0, "Triton backend currently supports border=0 only"
+        assert dt_indices is not None, (
+            "Triton backend requires dt_indices (the (B,) image-index "
+            "lookup into the source dt_fields tensor)."
+        )
+        # Local import keeps Triton off the import path for CPU-only setups.
+        from helpers.triton_ops import project_and_sample_triton
+        return project_and_sample_triton(
+            xyz_world, K1, P1, dt_fields, dt_indices
+        )
+
+    if backend != "torch":
+        raise ValueError(f"Unknown backend {backend!r}; expected 'torch' or 'triton'")
+
+    # Torch backend: F.grid_sample needs (B, C, H, W). If we were given the
+    # source + indices, materialise the per-batch view here. (The Triton
+    # backend avoids this copy entirely.)
+    if dt_indices is not None:
+        dt_fields = dt_fields[dt_indices]
+
     # 1. Project World Points to 2D
     # uv_proj contains safe values (0.0) where points are outside
     uv_proj, outside_mask = project_world_to_2D(xyz_world, P1, K1, img1_shape, border)

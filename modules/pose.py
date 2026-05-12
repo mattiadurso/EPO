@@ -32,6 +32,7 @@ class PoseModule(BaseModule):
         grad_t_offset: bool = False,
         use_mlp: bool = True,
         mlp_lr: float = 3e-3,
+        use_amp: bool = False,
         device: str = "cuda",
         max_num_iterations: int = 2048,
         warmup_steps: int = 25,
@@ -53,6 +54,10 @@ class PoseModule(BaseModule):
             grad_t_offset: Whether to compute gradients for translation offset
             use_mlp: Whether to use MLP for pose refinement
             mlp_lr: Learning rate for MLP optimizer
+            use_amp: If True, run the pose-refinement MLP's linear layers in
+                BF16 via ``torch.autocast``. The Gram-Schmidt orthonormalisation
+                stays in FP32 (precision-sensitive). No ``GradScaler`` is
+                needed for BF16. Default False (FP32 throughout).
             device: Device to run the module on
             dtype: Data type for the tensors
         Note:
@@ -75,6 +80,8 @@ class PoseModule(BaseModule):
         self.grad_t_offset = grad_t_offset
         self.t_lr = t_lr
         self.R_lr = R_lr
+        # Per-call autocast switch — only relevant when use_mlp=True.
+        self.use_amp = use_amp
         self.mlp_lr = mlp_lr
         num_cams = len(image_id_map)
 
@@ -211,18 +218,24 @@ class PoseModule(BaseModule):
         if not self.use_mlp:
             return R, t
 
-        # Build 3x4 pose matrices and apply MLP
-        P_3x4 = torch.cat([R, t.unsqueeze(2)], dim=2)  # (B, 3, 4)
+        P_3x4 = torch.cat([R, t.unsqueeze(2)], dim=2)  # (B, 3, 4) — FP32
 
-        # adding mlp residual and orthonormalization
+        # BF16 autocast only for the linear stack, and only when use_amp=True.
+        # ``MLP.forward`` opts the Gram-Schmidt orthonormalisation back out to
+        # FP32 internally (cross products / normalisations there lose ~2 digits
+        # in BF16 and would distort the rotation noticeably).
         with torch.autocast(
-            device_type="cuda", dtype=torch.bfloat16, enabled=False
-        ):  # MLP might be sensitive to precision, disable autocast
+            device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp,
+        ):
             P_3x4_refined = self.mlp(P_3x4)
+
+        # Autocast only forces matmul/conv inputs into BF16; the output dtype is
+        # whatever the last op produced. Cast back explicitly so the Triton kernel
+        # downstream (which expects FP32) is never handed a BF16 tensor.
+        P_3x4_refined = P_3x4_refined.float()
 
         R = P_3x4_refined[:, :3, :3]
         t = P_3x4_refined[:, :3, 3] + self.get_translation_offset(indices)
-
         return R, t
 
     def __repr__(self) -> str:
@@ -232,9 +245,7 @@ class PoseModule(BaseModule):
         for i in range(min(limit, len(self.t_param))):
             name = self.tensor_idx_to_image[i]
             # Print the (orthonormalized) first row of R as a compact summary.
-            R_row0 = (
-                self.get_rotation_matrix([i])[0, 0].detach().cpu().numpy()
-            )
+            R_row0 = self.get_rotation_matrix([i])[0, 0].detach().cpu().numpy()
 
             # Fetch physical translation (scaled) for representation
             t_val = self.get_translation([i]).detach().cpu().numpy().flatten()

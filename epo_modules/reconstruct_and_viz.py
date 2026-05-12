@@ -64,8 +64,25 @@ class ReconstructAndVizModule:
         for pair_idx, (img_i, img_j) in enumerate(
             tqdm(viewgraph, desc="Computing residuals")
         ):
-            sampled_vg = [(img_i, img_j)]
-            batch, pad_masks, dt_fields = self.create_batched_inputs(sampled_vg)
+            # ``create_batched_inputs`` consumes the integer viewgraph tensor
+            # ``(img_i, img_j, cam_i, cam_j)`` rows — convert the string pair
+            # here. (It also returns the DT source + per-batch image indices
+            # rather than a pre-gathered DT tensor; we materialise the (1,1,H,W)
+            # view this code path needs below.)
+            cam_i = self.intrinsics.map_names_to_indices(self.images[img_i]["cam_id"])
+            cam_j = self.intrinsics.map_names_to_indices(self.images[img_j]["cam_id"])
+            sampled_vg = torch.tensor(
+                [[
+                    self.image_id_map[img_i], self.image_id_map[img_j],
+                    int(cam_i), int(cam_j),
+                ]],
+                dtype=torch.long, device=self.device,
+            )
+            batch, pad_masks, dt_fields_src, dt_indices = (
+                self.create_batched_inputs(sampled_vg)
+            )
+            # Materialise the per-batch DT view for sample_distance_field.
+            dt_fields = dt_fields_src[dt_indices]
             # Project edges and compute residuals
             edges_reprojected, _ = project_world_to_2D(**batch)
             residuals = sample_distance_field(dt_fields, edges_reprojected).squeeze(1)
