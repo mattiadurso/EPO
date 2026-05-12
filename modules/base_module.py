@@ -125,3 +125,10 @@ class BaseModule(nn.Module):
             self.params = torch.cat([self.params, new_params], dim=0) 
      
         return
+
+    def pop(self, image_name, image_id):
+        """Remove the last element from the list"""
+        self.image_to_tensor_idx.pop(image_name, None)
+        self.tensor_idx_to_image.pop(image_id, None)
+        if self.params is not None:
+            self.params = self.params[:-1]

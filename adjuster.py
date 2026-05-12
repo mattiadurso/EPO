@@ -10,7 +10,7 @@ import warnings
 import random
 import torch.nn.functional as F
 from torchvision import transforms as TF
-
+from collections import deque
 
 from itertools import combinations
 import glob
@@ -1618,28 +1618,49 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         traj_est = file_interface.read_tum_trajectory_file(opt)
         traj_ref, traj_est = sync.associate_trajectories(traj_ref, traj_est)
 
-    def add_frame(
+    def get_constant_speed_P(self, poses = None):
+        if(poses is None): #get last poses
+            sorted_keys = sorted(self.images.keys())
+            rev_iter = reversed(sorted_keys)
+            prev_image_name_1 = next(rev_iter)
+            prev_idx = self.image_id_map[prev_image_name_1]
+
+            prev_image_name_2 = next(rev_iter)
+            prev_idx_2 = self.image_id_map[prev_image_name_2]
+
+
+            P_1  = self.poses.poses[prev_idx].detach()
+            P_2 = self.poses.poses[prev_idx_2].detach()
+
+
+        else : P_1, P_2 = poses 
+        R_prev  = P_1[:3, :3]
+        R_prev2 = P_2[:3, :3]
+        R_delta = R_prev @ R_prev2.T
+        R_init  = R_delta @ R_prev
+        R_init = R_prev
+
+        t_prev_physical  = P_1[:3, 3]
+        t_prev2_physical = P_2[:3, 3]
+        alpha = 1  # fraction of velocity step to apply (0 = copy last pose, 1 = full constant velocity)
+        t_pred_physical = t_prev_physical + alpha * (t_prev_physical - t_prev2_physical)
+        t_init_norm = (t_pred_physical - self.poses.t_mean.squeeze()) / self.poses.t_scale
+
+        return R_init, t_init_norm
+        
+    def _create_frame(
             self, 
             images_path, 
             depths_path, 
             image_name, 
             camera, 
             image, 
-            window_size = 10,
-            dtype=torch.float32, 
+            poses,
+            dtype = torch.float32, 
             device="cuda"
         ):
-        """Add an image to the adjuster and estimate its pose starting from the initial guess K."""
-       
-        # TODO: 
-        # 1- add image,depth and K to self      DONE
-        # 2- compute edge and distance field    DONE
-        # 3- update viewgraph                   DONE
-        
-        # ------------------------------------------------------------------ #
-        # 1. Add image, depth and K to self                                   #
-        # ------------------------------------------------------------------ #
-        
+
+          
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1651,16 +1672,16 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
 
         # Last frame index
-        sorted_keys = sorted(self.images.keys())
+        #sorted_keys = sorted(self.images.keys())
 
         if image_name in self.images.keys(): return
 
-        rev_iter = reversed(sorted_keys)
-        prev_image_name_1 = next(rev_iter)
-        prev_idx = self.image_id_map[prev_image_name_1]
+        # rev_iter = reversed(sorted_keys)
+        # prev_image_name_1 = next(rev_iter)
+        # prev_idx = self.image_id_map[prev_image_name_1]
 
-        prev_image_name_2 = next(rev_iter)
-        prev_idx_2 = self.image_id_map[prev_image_name_2]
+        # prev_image_name_2 = next(rev_iter)
+        # prev_idx_2 = self.image_id_map[prev_image_name_2]
 
 
         image_path = os.path.join(images_path, image_name)
@@ -1706,12 +1727,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         # --- Camera params ---
 
         # === Camera ===
-        _, model, new_params = process_camera(
-            camera,
-            self.load_with_pad,
-            images_size=self.images_size,
-            rescale=self.rescale,
-        )
+        # _, model, new_params = process_camera(
+        #     camera,
+        #     self.load_with_pad,
+        #     images_size=self.images_size,
+        #     rescale=self.rescale,
+        # )
 
         # cam_id is inferred from the folder component of the image name (e.g. "cam0/frame.png")
         cam_id = image.name.split("/")[0]
@@ -1721,31 +1742,12 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
 
         # === Pose ===
 
-        # ---- LAST FRAME ----
-        # P_prev = self.poses.poses[prev_idx].detach() 
-
-        # R_init = P_prev[:3, :3].clone()
-        # t_init_physical = P_prev[:3, 3].clone()
-
-        # t_init_norm = (t_init_physical - self.poses.t_mean.squeeze()) / self.poses.t_scale
-
-
         # ---- CONSTANT SPEED ----
 
-        P_prev  = self.poses.poses[prev_idx].detach()
-        P_prev2 = self.poses.poses[prev_idx_2].detach()
+        # P_prev  = self.poses.poses[prev_idx].detach()
+        # P_prev2 = self.poses.poses[prev_idx_2].detach()
 
-        R_prev  = P_prev[:3, :3]
-        R_prev2 = P_prev2[:3, :3]
-        R_delta = R_prev @ R_prev2.T
-        R_init  = R_delta @ R_prev
-        R_init = R_prev
-
-        t_prev_physical  = P_prev[:3, 3]
-        t_prev2_physical = P_prev2[:3, 3]
-        alpha = 1  # fraction of velocity step to apply (0 = copy last pose, 1 = full constant velocity)
-        t_pred_physical = t_prev_physical + alpha * (t_prev_physical - t_prev2_physical)
-        t_init_norm = (t_pred_physical - self.poses.t_mean.squeeze()) / self.poses.t_scale
+        R_init, t_init_norm =  self.get_constant_speed_P((poses[-1], poses[0]))
 
 
         self.poses.add_element(
@@ -1833,7 +1835,21 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         self.sampled_depth.add_element(image_name, new_idx, sampled_depth.squeeze(), lr = self.z_lr)
 
 
-        # New pairs: connect the new frame to every existing frame it overlaps with.
+         # Keep images_cams_ids in sync
+        images_cams_ids = [
+            (
+                self.image_id_map[n],
+                self.intrinsics.map_names_to_indices(self.images[n]["cam_id"]),
+            )
+            for n in sorted(self.images.keys())
+        ]
+        self.images_cams_ids = torch.tensor(images_cams_ids).long().to(self.device)       
+
+    def _update_viewgraph(
+            self,
+            image_name,
+            window_size=10):
+         # New pairs: connect the new frame to every existing frame it overlaps with.
         existing_names = [n for n in sorted(self.images.keys()) if n != image_name]
         existing_names = existing_names[-window_size:]
         candidate_pairs = list([(image_name, n) for n in existing_names])
@@ -1843,9 +1859,9 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             images = self.images,
             intrinsics = self.intrinsics,
             poses = self.poses,
-            min_points = 200,
+            min_points = 50,
             sampling_factor = 5,
-            reprojection_error = 3.0,        # looser threshold: pose is still rough
+            reprojection_error = 5.0,        # looser threshold: pose is still rough 5.0 / 10.0
             border = 10,
             device = self.device,
             verbose = self.verbose,
@@ -1875,41 +1891,75 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
         ]
         self.viewgraph_ids = torch.tensor(viewgraph_ids).long().to(self.device)
 
-        # Keep images_cams_ids in sync
-        images_cams_ids = [
-            (
-                self.image_id_map[n],
-                self.intrinsics.map_names_to_indices(self.images[n]["cam_id"]),
-            )
-            for n in sorted(self.images.keys())
-        ]
-        self.images_cams_ids = torch.tensor(images_cams_ids).long().to(self.device)
+    def add_frame(
+            self, 
+            images_path, 
+            depths_path, 
+            image_name, 
+            camera, 
+            image, 
+            poses,
+            window_size = 10
+        ):
+        """Add an image to the adjuster and estimate its pose starting from the initial guess K."""
 
-        # ~~~~~~~~~~~~~ EVERITHNG WORK TILL HERE! ~~~~~~~~~~~~~~~
+        self._create_frame(   
+            images_path, 
+            depths_path, 
+            image_name, 
+            camera, 
+            image, 
+            poses,
+            dtype=torch.float32, 
+            device="cuda")
+
+        self._update_viewgraph(image_name, window_size=window_size)
+
+       
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def _remove_last_frame(self, image_name, new_idx):
+        self.images.pop(image_name)
+        self.num_images -= 1
+        self.poses.pop(image_name, new_idx)
+
+        self.edges_padded.pop(image_name, new_idx)
+        self.pad_masks.pop(image_name, new_idx)
+        self.dt_fields.pop(image_name, new_idx)
+        self.images_hw.pop(image_name, new_idx)
+        self.sampled_depth.pop(image_name, new_idx)
+
+        self.images_cams_ids = self.images_cams_ids[:-1]
 
     def forward_frame(
         self,
         image_name,
         refinement_iteration=50,
-        window_pose=10,
-        convergence_tol_pose=0.5,
-        quantile=0.95,
+        viewgraph_override= None,
         q_lr= 3e-3,
         t_lr = 3e-3
-    ):
+    ):  
         new_frame_idx = self.image_id_map[image_name]
-        new_frame_mask = (
-            (self.viewgraph_ids[:, 0] == new_frame_idx) |
-            (self.viewgraph_ids[:, 1] == new_frame_idx)
-        )
-        local_viewgraph = self.viewgraph_ids[new_frame_mask]
 
-        #print(local_viewgraph)
-        local_viewgraph = torch.cat([local_viewgraph, local_viewgraph[:, [1, 0, 2, 3]]], dim=0)
+        if(viewgraph_override is None):
+
+            new_frame_mask = (
+                (self.viewgraph_ids[:, 0] == new_frame_idx) |
+                (self.viewgraph_ids[:, 1] == new_frame_idx)
+            )
+            local_viewgraph = self.viewgraph_ids[new_frame_mask]
+
+            #print(local_viewgraph)
+            local_viewgraph = torch.cat([local_viewgraph, local_viewgraph[:, [1, 0, 2, 3]]], dim=0)
+        else:
+            local_viewgraph = viewgraph_override
+
 
         if local_viewgraph.numel() == 0:
             print(f"Warning: No overlapping frames found for {image_name}.")
-            return image_name
+            return None, None
 
         q_frame = nn.Parameter(
             self.poses.q_param[new_frame_idx].detach().clone(),
@@ -1938,11 +1988,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
                 q_override=q_frame, 
                 t_override=t_frame)
             self.intrinsics.update_all_matrices()
-            self.unproject_edge_to_3D(image_name)    
-
-            
-
-                                                            
+            self.unproject_edge_to_3D(image_name)                                                               
 
             residuals, sampled_viewgraphs = self.compute_forward_step(
                 local_viewgraph,
@@ -1969,7 +2015,7 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             self.poses.t_param.data[new_frame_idx] = t_frame.detach()
         self.poses.update_matrix_direct(new_frame_idx)
 
-        return loss
+        return loss, self.poses.poses[new_frame_idx].detach()
         
     def unproject_edge_to_3D(self, image_name):
         """Unproject 2D edges to 3D points for the given frame and update edges_3D in-place."""
@@ -1996,13 +2042,61 @@ class Adjuster(nn.Module, MiscModule, ReconstructAndVizModule):
             old[image_id + 1:],
         ], dim=0)
 
+    def build_pairs_tensor(self, image_name: str, neighbor_names: list) -> torch.Tensor:
+        new_idx = self.image_id_map[image_name]
+        new_cam_idx = self.intrinsics.map_names_to_indices(
+            self.images[image_name]["cam_id"]
+        ).item()
+        rows = []
+        for n in neighbor_names:
+            j = self.image_id_map[n]
+            cam_j = self.intrinsics.map_names_to_indices(self.images[n]["cam_id"]).item()
+            rows.append((new_idx, j, new_cam_idx, cam_j))
+            rows.append((j, new_idx, cam_j, new_cam_idx))
+        return torch.tensor(rows, device=self.device, dtype=torch.long)
+
+    def localize_frame(
+        self,
+        images_path, 
+        depths_path, 
+        image_name,
+        camera, 
+        image,
+        poses,
+        window_size = 10,
+        dtype=torch.float32, 
+        device="cuda"):
+        
+       
+        self._create_frame(   
+            images_path, 
+            depths_path, 
+            image_name, 
+            camera, 
+            image,
+            poses,
+            dtype=torch.float32, 
+            device="cuda")
+
+
+        new_idx = self.image_id_map[image_name]
+        neighbor_names = [n for n in sorted(self.images.keys()) if n != image_name][-window_size:]
+        local_vg = self.build_pairs_tensor(image_name, neighbor_names)
+
+        loss, new_pose = self.forward_frame(image_name, viewgraph_override=local_vg)
+
+        self._remove_last_frame(image_name, new_idx)  # pop last row from all tensors
+        return loss, new_pose
+
 class FrameOptimizer:
     def __init__(self, 
             adjuster, 
             window_size=10, 
             refinement_interval=350,
             frame_lr=3e-3, 
-            refinement_iterations=500):
+            refinement_iterations=500,
+            #keyframe_range = 10
+            ):
         
         self.adj = adjuster
         self.window_size = window_size
@@ -2010,29 +2104,70 @@ class FrameOptimizer:
         self.frame_lr = frame_lr
         self.refinement_iterations = refinement_iterations
         self.frame_count = 0
-   
+
+        # Keep the last 2 pose matrices (oldest→newest) for constant-speed init
+        sorted_keys = sorted(self.adj.images.keys())
+        rev_iter = reversed(sorted_keys)
+        name_1 = next(rev_iter)   # most recent
+        name_2 = next(rev_iter)   # second most recent
+        idx_1 = self.adj.image_id_map[name_1]
+        idx_2 = self.adj.image_id_map[name_2]
+        self.pose_history: deque = deque(
+            [self.adj.poses.poses[idx_2].detach(),
+             self.adj.poses.poses[idx_1].detach()],
+            maxlen=2
+        )
+      
     def track(self, images_path, depths_path, image_name, camera, image):
-        start = time.time()
+  
 
+        if(self.frame_count%10==0 and self.frame_count!=0): # add keyframe 
+            start = time.time()
+            self.adj.add_frame(images_path, 
+                depths_path, 
+                image_name, 
+                camera, 
+                image,
+                poses = self.pose_history,
+                window_size=self.window_size)
 
-        self.adj.add_frame(images_path, 
-                           depths_path, 
-                           image_name, 
-                           camera, image,
-                           window_size=self.window_size)
+            end_add = time.time()
 
-        end_add = time.time()
+            loss, new_pose = self.adj.forward_frame(image_name, 
+                                refinement_iteration=self.refinement_iterations,
+                                q_lr=self.frame_lr, 
+                                t_lr=self.frame_lr)
+            
 
-        loss = self.adj.forward_frame(image_name, 
-                               refinement_iteration=self.refinement_iterations,
-                               q_lr=self.frame_lr, 
-                               t_lr=self.frame_lr)
-        
-        end_opt = time.time()
+            if new_pose is None: return 0, 0, 0, 0
+            
+            end_opt = time.time()
+
+        else: 
+            start = 0
+            loss, new_pose = self.adj.localize_frame(
+                images_path, 
+                depths_path, 
+                image_name, 
+                camera, 
+                image,
+                poses = self.pose_history,
+                window_size=self.window_size)
+            
+
+            if new_pose is None: return 0, 0, 0, 0
+            
+            end_opt = 0
+            end_add = 0
+
         self.frame_count += 1
 
+        self.pose_history.append(new_pose)
+
+
+        #if(self.frame_count%300==0 and self.frame_count!=0): self._global_refinement
+
         return  loss, end_opt-start, end_opt-end_add, end_add-start
-   
 
     
         #Update 

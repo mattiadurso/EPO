@@ -69,8 +69,8 @@ def _process_single_image(
     # Get original dimensions
     width, height = img.size
 
-    scale = 1
-   
+    scale = 1 
+
 
 
     if load_with_pad:
@@ -230,7 +230,7 @@ def _process_single_depth(
     # Get original dimensions
     h, w = depth_tensor.shape[-2:]
 
-    scale = 1
+    scale = 1 
 
 
     if load_with_pad:

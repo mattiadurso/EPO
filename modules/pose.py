@@ -477,7 +477,18 @@ class PoseModule(BaseModule):
         self.refresh_after_addition()
         self.update_matrix_direct(new_idx) # ! Important to ensure the detachment from the MLP
 
-     
+    def pop(self, image_name, image_id):
+        self.image_to_tensor_idx.pop(image_name)
+        self.tensor_idx_to_image.pop(image_id)
+        
+        self.t_offset = nn.Parameter(self.t_offset.data[:-1], requires_grad=self.t_offset.requires_grad)
+        self.q_param  = nn.Parameter(self.q_param.data[:-1],  requires_grad=self.q_param.requires_grad)
+        self.t_param  = nn.Parameter(self.t_param.data[:-1],  requires_grad=self.t_param.requires_grad)
+
+        if self.poses is not None:
+            self.poses = self.poses[:-1].detach()
+
+        self.refresh_after_addition() 
         
     def get_parameters_idx(self, indices, t=False, q=False, mlp=False):
         """Return list of trainable parameters - only leaf tensors"""

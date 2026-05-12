@@ -115,54 +115,9 @@ class DepthModule(BaseModule):
     
 
 
-# # depth class to use for test with Z optimized as free variable
-# class DepthModule(BaseModule):
-#     def __init__(
-#         self,
-#         image_id_map: dict,
-#         depth: torch.Tensor,
-#         lr: float = 5e-3,
-#         grad: bool = True,
-#         warmup_steps: int = 25,
-#         max_num_iterations: int = 1000,
-#         device="cuda",
-#         dtype=torch.float32,
-#     ):
-#         """Depth module to hold depth parameters"""
-#         super().__init__(
-#             image_id_map=image_id_map,
-#             device=device,
-#             dtype=dtype,
-#         )
-#         self.lr = float(lr)
 
-#         # ID Mappings
-#         self.image_to_tensor_idx = image_id_map
-#         self.tensor_idx_to_image = {v: k for k, v in image_id_map.items()}
-
-#         # storing as inverse depth for better numerical stability
-#         depth = depth.pow(-1)
-
-#         self.params = nn.Parameter(
-#             depth.clone().detach().to(device=self.device, dtype=self.dtype),
-#             requires_grad=grad,
-#         )
-
-#         if grad:
-#             self.init_optimizer(lr=self.lr)
-#             self.init_scheduler(warmup_steps, max_num_iterations)
-
-#     def get_parameters(self, ids):
-#         """Return depth parameters - ensures gradient flow"""
-#         indices = self.map_names_to_indices(ids) if isinstance(ids[0], str) else ids
-#         # Need to return depth, not inverse depth
-#         z = self.params[indices].pow(-1)
-
-#         return z
-
-#     def get_all_parameters(self):
-#         return self.get_parameters(list(self.image_to_tensor_idx.keys()))
-
-#     def __repr__(self):
-#         out = f"Depth" + f"parameters={len(self.params.data.detach().tolist()):,})"
-#         return out
+    def pop(self, image_name, image_id):
+        self.image_to_tensor_idx.pop(image_name, None)
+        self.tensor_idx_to_image.pop(image_id, None)
+        self.depth = self.depth[:-1]
+        self.params = nn.Parameter(self.params.data[:-1], requires_grad=self.params.requires_grad)
