@@ -127,6 +127,14 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         grad_z: Whether to optimize per-pixel depth.
         use_mlp_pose_refinement: If True, refine poses via an MLP residual
             instead of the raw q/t parameters.
+        project_sample_backend: ``"torch"`` (default) uses the reference
+            PyTorch chain for the per-batch project + DT-sample step.
+            ``"triton"`` swaps in a fused CUDA kernel with an analytical
+            backward (numerically equivalent up to fp32 accumulation noise).
+        use_amp: If True, run the pose-refinement MLP's linear layers in BF16
+            via ``torch.autocast``. Gram-Schmidt orthonormalisation stays in
+            FP32 (precision-sensitive). No ``GradScaler`` needed for BF16.
+            Default False (FP32 throughout — historical behaviour).
         auc_saving_freq: Iterations between AUC checkpoints when ground truth
             is available.
         max_num_iterations: Hard cap on optimization steps.
@@ -175,6 +183,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         grad_k=True,
         grad_z=True,
         use_mlp_pose_refinement=True,
+        project_sample_backend="torch",
+        use_amp=False,
         auc_saving_freq=50,
         max_num_iterations=2000,
         verbose=False,
@@ -228,6 +238,14 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.min_points = min_points
         self.sampling_factor = sampling_factor
         self.reprojection_error = reprojection_error
+        # Backend for the per-batch project+DT-sample (forward + custom bwd).
+        # "torch" = reference PyTorch chain; "triton" = fused kernel (~CUDA-only).
+        if project_sample_backend not in ("torch", "triton"):
+            raise ValueError(
+                f"project_sample_backend must be 'torch' or 'triton', got "
+                f"{project_sample_backend!r}"
+            )
+        self.project_sample_backend = project_sample_backend
 
         # Edge extractor
         if detector == "canny":
@@ -285,6 +303,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.grad_k = grad_k
         self.grad_z = grad_z
         self.use_mlp_pose_refinement = use_mlp_pose_refinement
+        # BF16 autocast for the pose-refinement MLP's linear stack.
+        # Gram-Schmidt stays in FP32 (precision-sensitive). No GradScaler is
+        # needed for BF16. Default False ⇒ FP32 everywhere, byte-for-byte the
+        # historical behaviour.
+        self.use_amp = use_amp
 
         # Loading
         ## Load Reconstruction
@@ -451,7 +474,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
     def forward(
         self,
         batch_size=256,
-        residuals_chunk_size=2048,
         quantile=0.95,
         window_pose=25,
         window_depth=50,
@@ -982,9 +1004,15 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         batch["K1"] = self.intrinsics.get_intrinsic_matrix(cam_ids)
         batch["P1"] = self.poses.get_projection_matrix(images_names_ji)
         batch["img1_shape"] = self.images_hw.get_parameters(images_names_ji[:1])
-        dt_fields = self.dt_fields.get_parameters(images_names_ji)
+        # Pass the *source* DT tensor (N_img, 1, H, W) + per-batch image
+        # indices. The Triton backend reads lazily from the source — avoids
+        # a ~550 MB per-batch gather on 518² fields. The torch backend
+        # materialises the per-batch view internally (since F.grid_sample
+        # needs (B, 1, H, W)).
+        dt_fields_src = self.dt_fields.params
+        dt_indices = images_names_ji
 
-        return batch, pad_masks, dt_fields
+        return batch, pad_masks, dt_fields_src, dt_indices
 
     def compute_forward_step(
         self,
@@ -1030,7 +1058,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             # prepare batched inputs
             self._sync()
             s_time = time.perf_counter()
-            batch, pad_masks, dt_fields = self.create_batched_inputs(sampled_viewgraph)
+            batch, pad_masks, dt_fields_src, dt_indices = self.create_batched_inputs(
+                sampled_viewgraph
+            )
             self._sync()
             self.timings["prepare_batched_inputs"] += time.perf_counter() - s_time
 
@@ -1043,8 +1073,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 batch["K1"],
                 batch["P1"],
                 batch["img1_shape"],
-                dt_fields,
+                dt_fields_src,
+                dt_indices=dt_indices,
                 border=0,
+                backend=self.project_sample_backend,
             )
 
             # compute loss over all residuals at once (no chunking)
@@ -1234,6 +1266,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             grad_t_offset=self.grad_t_offset,
             mlp_lr=self.mlp_pose_lr,
             use_mlp=self.use_mlp_pose_refinement,
+            use_amp=self.use_amp,
             max_num_iterations=self.max_num_iterations,
             device=self.device,
             dtype=self.dtype,

@@ -131,7 +131,15 @@ class PoseRefinementMLP(nn.Module):
 
         x6 = self.fc6(x5) + x0  # P = MLP(P) + P
 
-        return self.gram_schmidt(x6.view(B, H, W))
+        # Orthonormalisation in FP32. The caller may have us inside a BF16
+        # autocast scope (see PoseModule.apply_mlp with use_amp=True); the
+        # cross products and per-vector normalisations inside Gram-Schmidt are
+        # precision-sensitive and lose ~2 digits in BF16, which distorts R
+        # enough to slow / destabilise the rotation refinement. We unconditionally
+        # disable autocast here and upcast the input — a no-op when the outer
+        # scope is already FP32.
+        with torch.autocast(device_type="cuda", enabled=False):
+            return self.gram_schmidt(x6.view(B, H, W).float())
 
 
 if __name__ == "__main__":
