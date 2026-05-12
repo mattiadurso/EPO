@@ -111,7 +111,7 @@ for dataset in datasets:
             reprojection_error=3,
             auc_saving_freq=100,
             use_amp=True,  # Whether to run the pose-refinement MLP's linear layers in BF16 via torch.autocast. Gram-Schmidt stays in FP32 (precision-sensitive). No GradScaler needed for BF16. Default False (FP32 throughout — historical behaviour).
-            project_sample_backend="triton",  # much faster than the PyTorch implementation, especially for large numbers of points (e.g. 12k edges points and 4k viewgraph pairs
+            backend="triton",  # fused Triton kernels for both project+sample and unproject (fwd + analytical bwd). Much faster than the PyTorch path on large viewgraphs / many edges.
         )
 
         epo(
