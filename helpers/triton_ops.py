@@ -1,16 +1,22 @@
-"""Fused Triton kernel for project-world-to-pixel + bilinear DT sampling.
+"""Fused Triton kernels for the EPO geometric hot paths.
 
-Replaces the chain
-    ``xyz_world @ R^T + t  →  K @ xyz_cam / z  →  F.grid_sample(dt_field, uv)``
-with a single Triton kernel for the forward and an analytical PyTorch backward.
+This module hosts two custom autograd ops:
 
-Why custom autograd:
-  * The reference path expands into ~6 PyTorch ops, each adding an autograd
-    node + an intermediate tensor allocation. The custom Function collapses
-    this to one node.
-  * ``dt_fields`` does not require gradients, so the bilinear backward is a
-    pure gather (4 corner reads per point) — no scatter / atomic accumulation
-    into the DT field is needed.
+1. **project + bilinear-DT-sample** — used in the per-step forward batch.
+   Replaces the chain ``xyz_world @ R^T + t → K @ xyz_cam / z →
+   F.grid_sample(dt_field, uv)`` with a single Triton kernel and an
+   analytical backward.
+2. **unproject (pixel → world)** — used once per iteration in
+   ``unproject_edges_to_3D``. Replaces
+   ``K_inv @ [u, v, 1] · depth → R_inv @ xyz_cam + t_inv`` with one fused
+   kernel and an analytical backward.
+
+Why custom autograd in both cases:
+  * Each reference chain expands into 4–6 PyTorch ops, every one adding an
+    autograd node + intermediate tensor allocation. The custom Function
+    collapses each chain to one node.
+  * The non-grad inputs (``dt_fields``, ``xy0``) become pure gathers in the
+    backward — no scatter / atomic accumulation needed.
 """
 
 from __future__ import annotations
@@ -475,3 +481,317 @@ def project_and_sample_triton(
     return _ProjectAndSampleTriton.apply(
         xyz_world, K1, P1, dt_fields_src, dt_indices
     )
+
+
+# ===========================================================================
+# Fused unproject kernel: (xy, K, depth, P)  →  xyz_world
+# ===========================================================================
+#
+# Reference math (per point, fixed pixel coords ``(u, v)``, learnable
+# ``K, depth, P``):
+#
+#   xyz_cam = depth · K_inv · [u, v, 1]
+#           = ( depth · (u - cx) / fx,
+#               depth · (v - cy) / fy,
+#               depth )
+#
+#   xyz_world = R^T · (xyz_cam - t)      where (R, t) = (P[:3,:3], P[:3,3])
+#
+# ``K_inv`` is the closed-form pinhole inverse; the reference's
+# :func:`invert_K` only touches ``fx, fy, cx, cy`` so autograd only emits
+# gradients for those four entries — we match exactly. ``invert_P`` uses
+# ``R_inv = R^T`` and ``t_inv = -R^T t`` so the gradient flows to ``R, t``
+# of the original ``P``.
+#
+# Tensor shapes (B = N_images, N = max_edges per image):
+#   xy0    (B, N, 2)   pixel coords — *no grad*
+#   depth  (B, N)      depth values — grad through depth-scale/shift
+#   K      (B, 3, 3)   intrinsics   — grad on (0,0), (1,1), (0,2), (1,2)
+#   P      (B, 4, 4)   extrinsics   — grad on the top-left 3×4 block
+#   out    (B, N, 3)   xyz_world
+
+
+@triton.jit
+def _unproject_fwd_kernel(
+    XY_ptr,      # (B, N, 2) — pixel coords
+    DEPTH_ptr,   # (B, N)    — corrected depth (already a·z+b·)
+    K_ptr,      # (B, 3, 3) — intrinsics (only fx, fy, cx, cy read)
+    P_ptr,      # (B, 4, 4) — extrinsics
+    XYZW_ptr,   # (B, N, 3) — output xyz_world
+    XYZC_ptr,   # (B, N, 3) — saved xyz_cam (used by backward reductions)
+    B, N,
+    s_xy_b, s_xy_n,
+    s_d_b,
+    s_K_b, s_P_b,
+    s_xyzw_b, s_xyzw_n,
+    BLOCK_N: tl.constexpr,
+):
+    """Pixel → world: collapses the four-op chain into one kernel.
+
+    Grid layout ``(B, ceil(N / BLOCK_N))`` — one program per image and tile.
+    """
+    pid_b = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = n_offs < N
+
+    # ---- Load xy0 (u, v) ------------------------------------------------
+    xy_row = pid_b * s_xy_b + n_offs * s_xy_n
+    u = tl.load(XY_ptr + xy_row + 0, mask=n_mask, other=0.0)
+    v = tl.load(XY_ptr + xy_row + 1, mask=n_mask, other=0.0)
+
+    # ---- Load depth -----------------------------------------------------
+    z = tl.load(DEPTH_ptr + pid_b * s_d_b + n_offs, mask=n_mask, other=0.0)
+
+    # ---- Load K (only the 4 entries pinhole uses) -----------------------
+    Kb = K_ptr + pid_b * s_K_b
+    fx = tl.load(Kb + 0)  # K[0,0]
+    cx = tl.load(Kb + 2)  # K[0,2]
+    fy = tl.load(Kb + 4)  # K[1,1]
+    cy = tl.load(Kb + 5)  # K[1,2]
+
+    # ---- Load P (R 3×3 + t) --------------------------------------------
+    Pb = P_ptr + pid_b * s_P_b
+    R00 = tl.load(Pb + 0); R01 = tl.load(Pb + 1); R02 = tl.load(Pb + 2);  t0 = tl.load(Pb + 3)
+    R10 = tl.load(Pb + 4); R11 = tl.load(Pb + 5); R12 = tl.load(Pb + 6);  t1 = tl.load(Pb + 7)
+    R20 = tl.load(Pb + 8); R21 = tl.load(Pb + 9); R22 = tl.load(Pb + 10); t2 = tl.load(Pb + 11)
+
+    # ---- xyz_cam = depth · K_inv · [u, v, 1] ---------------------------
+    # K_inv = [[1/fx, 0, -cx/fx],
+    #          [0, 1/fy, -cy/fy],
+    #          [0,    0,    1   ]]
+    inv_fx = 1.0 / fx
+    inv_fy = 1.0 / fy
+    xc = z * (u - cx) * inv_fx
+    yc = z * (v - cy) * inv_fy
+    zc = z
+
+    # ---- xyz_world = R^T · (xyz_cam - t) -------------------------------
+    Yx = xc - t0
+    Yy = yc - t1
+    Yz = zc - t2
+    # R^T row-i, col-k uses R[k, i]; here we accumulate per output component.
+    xw = R00 * Yx + R10 * Yy + R20 * Yz
+    yw = R01 * Yx + R11 * Yy + R21 * Yz
+    zw = R02 * Yx + R12 * Yy + R22 * Yz
+
+    # ---- Store outputs --------------------------------------------------
+    out_off = pid_b * s_xyzw_b + n_offs * s_xyzw_n
+    tl.store(XYZW_ptr + out_off + 0, xw, mask=n_mask)
+    tl.store(XYZW_ptr + out_off + 1, yw, mask=n_mask)
+    tl.store(XYZW_ptr + out_off + 2, zw, mask=n_mask)
+    # Save xyz_cam for the small bmm/sum reductions performed in PyTorch.
+    tl.store(XYZC_ptr + out_off + 0, xc, mask=n_mask)
+    tl.store(XYZC_ptr + out_off + 1, yc, mask=n_mask)
+    tl.store(XYZC_ptr + out_off + 2, zc, mask=n_mask)
+
+
+@triton.jit
+def _unproject_bwd_kernel(
+    XY_ptr,      # (B, N, 2)
+    DEPTH_ptr,   # (B, N)
+    K_ptr,       # (B, 3, 3)
+    P_ptr,       # (B, 4, 4) — only R is used here
+    GXYZW_ptr,   # (B, N, 3) — upstream gradient
+    GXYZC_ptr,   # (B, N, 3) — output: grad_xyz_cam (used for grad_K in PyTorch)
+    GDEPTH_ptr,  # (B, N)    — output: grad_depth (per-point)
+    B, N,
+    s_xy_b, s_xy_n,
+    s_d_b,
+    s_K_b, s_P_b,
+    s_gxyzw_b, s_gxyzw_n,
+    BLOCK_N: tl.constexpr,
+):
+    """Per-point backward: emits grad_xyz_cam and grad_depth.
+
+    grad_R, grad_t and grad_K are produced by small PyTorch reductions
+    outside the kernel using the saved ``xyz_cam`` from the forward.
+    """
+    pid_b = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = n_offs < N
+
+    # ---- Re-load static inputs -----------------------------------------
+    xy_row = pid_b * s_xy_b + n_offs * s_xy_n
+    u = tl.load(XY_ptr + xy_row + 0, mask=n_mask, other=0.0)
+    v = tl.load(XY_ptr + xy_row + 1, mask=n_mask, other=0.0)
+    z = tl.load(DEPTH_ptr + pid_b * s_d_b + n_offs, mask=n_mask, other=0.0)
+
+    Kb = K_ptr + pid_b * s_K_b
+    fx = tl.load(Kb + 0); cx = tl.load(Kb + 2)
+    fy = tl.load(Kb + 4); cy = tl.load(Kb + 5)
+    inv_fx = 1.0 / fx
+    inv_fy = 1.0 / fy
+
+    Pb = P_ptr + pid_b * s_P_b
+    R00 = tl.load(Pb + 0); R01 = tl.load(Pb + 1); R02 = tl.load(Pb + 2)
+    R10 = tl.load(Pb + 4); R11 = tl.load(Pb + 5); R12 = tl.load(Pb + 6)
+    R20 = tl.load(Pb + 8); R21 = tl.load(Pb + 9); R22 = tl.load(Pb + 10)
+
+    # ---- Upstream gradient ---------------------------------------------
+    g_row = pid_b * s_gxyzw_b + n_offs * s_gxyzw_n
+    gxw = tl.load(GXYZW_ptr + g_row + 0, mask=n_mask, other=0.0)
+    gyw = tl.load(GXYZW_ptr + g_row + 1, mask=n_mask, other=0.0)
+    gzw = tl.load(GXYZW_ptr + g_row + 2, mask=n_mask, other=0.0)
+
+    # ---- grad through xyz_world = R^T · Y -------------------------------
+    # ∂xyz_world[k] / ∂Y[j] = R[j, k]
+    # grad_Y[j] = Σ_k R[j, k] · grad_xyz_world[k]
+    gYx = R00 * gxw + R01 * gyw + R02 * gzw
+    gYy = R10 * gxw + R11 * gyw + R12 * gzw
+    gYz = R20 * gxw + R21 * gyw + R22 * gzw
+
+    # ---- grad through Y = xyz_cam - t -----------------------------------
+    # Per-point: grad_xyz_cam = grad_Y. (grad_t is a per-batch reduction
+    # done in PyTorch.)
+    grad_xc = gYx
+    grad_yc = gYy
+    grad_zc = gYz
+
+    # ---- grad through xyz_cam = depth · K_inv · [u, v, 1] ---------------
+    # ∂xc_cam/∂z = (u - cx) / fx   ;  ∂yc_cam/∂z = (v - cy) / fy
+    # ∂zc_cam/∂z = 1
+    grad_z = grad_xc * (u - cx) * inv_fx + grad_yc * (v - cy) * inv_fy + grad_zc
+
+    # ---- Store outputs --------------------------------------------------
+    tl.store(GXYZC_ptr + g_row + 0, grad_xc, mask=n_mask)
+    tl.store(GXYZC_ptr + g_row + 1, grad_yc, mask=n_mask)
+    tl.store(GXYZC_ptr + g_row + 2, grad_zc, mask=n_mask)
+    tl.store(GDEPTH_ptr + pid_b * s_d_b + n_offs, grad_z, mask=n_mask)
+
+
+class _UnprojectTriton(torch.autograd.Function):
+    """Fused unproject with analytical gradients.
+
+    Forward: ``xyz_world`` from ``(xy0, depth, K, P)``.
+    Backward: ``grad_depth, grad_K, grad_P`` (``xy0`` has no grad).
+    """
+
+    @staticmethod
+    def forward(ctx, xy0, depth, K, P):
+        assert xy0.is_cuda and depth.is_cuda and K.is_cuda and P.is_cuda
+        assert xy0.dim() == 3 and xy0.shape[-1] == 2, \
+            f"xy0 must be (B, N, 2), got {xy0.shape}"
+        assert depth.dim() == 2, f"depth must be (B, N), got {depth.shape}"
+
+        xy_c = xy0.contiguous()
+        d_c = depth.contiguous()
+        K_c = K.contiguous()
+        P_c = P.contiguous()
+
+        B, N, _ = xy_c.shape
+        device, dtype = xy_c.device, xy_c.dtype
+
+        xyz_world = torch.empty((B, N, 3), device=device, dtype=dtype)
+        xyz_cam = torch.empty((B, N, 3), device=device, dtype=dtype)
+
+        BLOCK_N = 256
+        grid = (B, triton.cdiv(N, BLOCK_N))
+        _unproject_fwd_kernel[grid](
+            xy_c, d_c, K_c, P_c,
+            xyz_world, xyz_cam,
+            B, N,
+            xy_c.stride(0), xy_c.stride(1),
+            d_c.stride(0),
+            K_c.stride(0), P_c.stride(0),
+            xyz_world.stride(0), xyz_world.stride(1),
+            BLOCK_N=BLOCK_N,
+        )
+
+        ctx.save_for_backward(xy_c, d_c, K_c, P_c, xyz_cam)
+        return xyz_world
+
+    @staticmethod
+    def backward(ctx, grad_xyz_world):
+        xy0, depth, K, P, xyz_cam = ctx.saved_tensors
+        B, N, _ = xy0.shape
+        device, dtype = xy0.device, xy0.dtype
+
+        gr = grad_xyz_world.contiguous()
+
+        grad_xyz_cam = torch.empty_like(xyz_cam)
+        grad_depth = torch.empty_like(depth)
+
+        BLOCK_N = 256
+        grid = (B, triton.cdiv(N, BLOCK_N))
+        _unproject_bwd_kernel[grid](
+            xy0, depth, K, P,
+            gr, grad_xyz_cam, grad_depth,
+            B, N,
+            xy0.stride(0), xy0.stride(1),
+            depth.stride(0),
+            K.stride(0), P.stride(0),
+            gr.stride(0), gr.stride(1),
+            BLOCK_N=BLOCK_N,
+        )
+
+        # ---- Reductions over N (small, well-optimised PyTorch bmm/sum) --
+        R = P[:, :3, :3]
+        t = P[:, :3, 3]
+        # Y = xyz_cam - t (broadcast t over N)
+        Y = xyz_cam - t.unsqueeze(1)  # (B, N, 3)
+
+        # grad_R[b, i, k] = Σ_n Y[b, n, i] · grad_xyz_world[b, n, k]
+        grad_R = torch.bmm(Y.transpose(-1, -2), gr)        # (B, 3, 3)
+
+        # grad_t[b, i] = -Σ_n Σ_k R[b, i, k] · grad_xyz_world[b, n, k]
+        total_gxyzw = gr.sum(dim=1)                         # (B, 3)
+        grad_t = -torch.bmm(R, total_gxyzw.unsqueeze(-1)).squeeze(-1)
+
+        grad_P = torch.zeros_like(P)
+        grad_P[:, :3, :3] = grad_R
+        grad_P[:, :3, 3] = grad_t
+
+        # ---- grad_K: only fx, fy, cx, cy (autograd through invert_K
+        #              would emit zero for off-diagonals; we match it). ----
+        # xc_cam = z · (u - cx) / fx  ⇒
+        #   ∂xc_cam/∂fx = -xc_cam / fx     ;  ∂xc_cam/∂cx = -z / fx
+        # similar for yc_cam / fy / cy.
+        fx_b = K[:, 0, 0]                                   # (B,)
+        fy_b = K[:, 1, 1]
+        inv_fx_b = 1.0 / fx_b
+        inv_fy_b = 1.0 / fy_b
+
+        gxc = grad_xyz_cam[:, :, 0]
+        gyc = grad_xyz_cam[:, :, 1]
+        xc = xyz_cam[:, :, 0]
+        yc = xyz_cam[:, :, 1]
+
+        grad_fx = -(gxc * xc).sum(dim=1) * inv_fx_b         # (B,)
+        grad_fy = -(gyc * yc).sum(dim=1) * inv_fy_b
+        grad_cx = -(gxc * depth).sum(dim=1) * inv_fx_b
+        grad_cy = -(gyc * depth).sum(dim=1) * inv_fy_b
+
+        grad_K = torch.zeros_like(K)
+        grad_K[:, 0, 0] = grad_fx
+        grad_K[:, 1, 1] = grad_fy
+        grad_K[:, 0, 2] = grad_cx
+        grad_K[:, 1, 2] = grad_cy
+
+        # xy0 is fixed (no grad).
+        return None, grad_depth, grad_K, grad_P
+
+
+def unproject_2D_to_world_triton(
+    xy0: torch.Tensor,
+    K0: torch.Tensor,
+    depth0: torch.Tensor,
+    P0: torch.Tensor,
+) -> torch.Tensor:
+    """Fused pixel → world projection (Triton).
+
+    Drop-in replacement for :func:`helpers.reprojection.unproject_2D_to_world`.
+
+    Args:
+        xy0: ``(B, N, 2)`` pixel coordinates (no grad).
+        K0: ``(B, 3, 3)`` intrinsics (only the pinhole entries are read).
+        depth0: ``(B, N)`` per-pixel depth.
+        P0: ``(B, 4, 4)`` world-to-camera extrinsics.
+
+    Returns:
+        ``(B, N, 3)`` 3D points in world coordinates.
+    """
+    return _UnprojectTriton.apply(xy0, depth0, K0, P0)

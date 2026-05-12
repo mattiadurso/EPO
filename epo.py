@@ -127,10 +127,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         grad_z: Whether to optimize per-pixel depth.
         use_mlp_pose_refinement: If True, refine poses via an MLP residual
             instead of the raw q/t parameters.
-        project_sample_backend: ``"torch"`` (default) uses the reference
-            PyTorch chain for the per-batch project + DT-sample step.
-            ``"triton"`` swaps in a fused CUDA kernel with an analytical
-            backward (numerically equivalent up to fp32 accumulation noise).
+        backend: ``"torch"`` (default) uses the reference PyTorch chains
+            for both geometric hot paths (per-batch project + DT-sample and
+            once-per-iter unproject). ``"triton"`` swaps in fused CUDA
+            kernels with analytical backwards for *both* paths (numerically
+            equivalent up to fp32 accumulation noise; requires CUDA + the
+            ``triton`` package). Toggles forward and backward in lockstep.
         use_amp: If True, run the pose-refinement MLP's linear layers in BF16
             via ``torch.autocast``. Gram-Schmidt orthonormalisation stays in
             FP32 (precision-sensitive). No ``GradScaler`` needed for BF16.
@@ -183,7 +185,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         grad_k=True,
         grad_z=True,
         use_mlp_pose_refinement=True,
-        project_sample_backend="torch",
+        backend="torch",
         use_amp=False,
         auc_saving_freq=50,
         max_num_iterations=2000,
@@ -238,14 +240,15 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.min_points = min_points
         self.sampling_factor = sampling_factor
         self.reprojection_error = reprojection_error
-        # Backend for the per-batch project+DT-sample (forward + custom bwd).
-        # "torch" = reference PyTorch chain; "triton" = fused kernel (~CUDA-only).
-        if project_sample_backend not in ("torch", "triton"):
+        # Single backend switch — controls both fused Triton ops
+        # (project+DT-sample and unproject) for both forward and backward.
+        # "torch" = reference PyTorch chains; "triton" = fused CUDA kernels
+        # with analytical backwards (numerically equivalent up to fp32 noise).
+        if backend not in ("torch", "triton"):
             raise ValueError(
-                f"project_sample_backend must be 'torch' or 'triton', got "
-                f"{project_sample_backend!r}"
+                f"backend must be 'torch' or 'triton', got {backend!r}"
             )
-        self.project_sample_backend = project_sample_backend
+        self.backend = backend
 
         # Edge extractor
         if detector == "canny":
@@ -947,7 +950,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             P0 = P_batch[i : i + batch_size]
 
             pts3d = unproject_2D_to_world(
-                xy0=xy0, K0=K0, depth0=depth0, P0=P0
+                xy0=xy0, K0=K0, depth0=depth0, P0=P0,
+                backend=self.backend,
             )  # (bs, N, 3)
             points_3D_list.append(pts3d)
 
@@ -1076,7 +1080,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 dt_fields_src,
                 dt_indices=dt_indices,
                 border=0,
-                backend=self.project_sample_backend,
+                backend=self.backend,
             )
 
             # compute loss over all residuals at once (no chunking)

@@ -582,7 +582,11 @@ def invert_P(P: Tensor, return_Rt=False) -> Tensor:
 
 
 def unproject_2D_to_world(
-    xy0: Tensor, K0: Tensor, depth0: Tensor, P0: Tensor
+    xy0: Tensor,
+    K0: Tensor,
+    depth0: Tensor,
+    P0: Tensor,
+    backend: str = "torch",
 ) -> Tensor:
     """unproject points to world coordinates
     Args:
@@ -594,10 +598,25 @@ def unproject_2D_to_world(
             B,n
         P: camera extrinsics matrix
             B,4,4
+        backend: ``"torch"`` (default) uses the closed-form PyTorch chain
+            ``invert_K → unproject_to_3D → R_inv @ xyz_cam + t_inv``.
+            ``"triton"`` swaps in a fused CUDA kernel with an analytical
+            backward (numerically equivalent up to fp32 noise; requires
+            CUDA tensors).
     Returns:
         xyz_world: unprojected 3D points in the world reference system
             B,n,3
     """
+    if backend == "triton":
+        # Local import so CPU-only setups don't need triton installed.
+        from helpers.triton_ops import unproject_2D_to_world_triton
+        return unproject_2D_to_world_triton(xy0, K0, depth0, P0)
+
+    if backend != "torch":
+        raise ValueError(
+            f"Unknown backend {backend!r}; expected 'torch' or 'triton'"
+        )
+
     # invert K and P
     K0_inv = invert_K(K0)
     R_inv, t_inv = invert_P(P0, return_Rt=True)
