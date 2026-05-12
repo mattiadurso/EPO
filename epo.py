@@ -474,7 +474,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         Main optimization loop.
         Args:
             batch_size (int, optional): Number of viewgraph pairs to process per batch. Default is 256.
-            residuals_chunk_size (int, optional): Chunk size for residual computation. Default is 2048.
             quantile (float, optional): Quantile for evaluating pose changes. Default is 0.95.
             window_pose (int, optional): Window size for pose convergence evaluation. Default is 25.
             window_depth (int, optional): Window size for depth convergence evaluation. Default is 25.
@@ -615,7 +614,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 self.viewgraph_ids,
                 batch_size=batch_size,
                 drop_last=drop_last,
-                residuals_chunk_size=residuals_chunk_size,
             )
 
             # Compute loss
@@ -992,7 +990,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self,
         sampled_viewgraph,
         batch_size=1024,
-        residuals_chunk_size=1024,
         drop_last=True,
         huber_delta=1.0,
         clamp_max=10.0,
@@ -1050,30 +1047,17 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 border=0,
             )
 
-            # chunked computation of loss over residuals
+            # compute loss over all residuals at once (no chunking)
             valid_mask = pad_masks & inside_mask
 
-            B, N = residuals.shape
-            total_sum = torch.zeros(B, device=self.device, dtype=self.dtype)
-            total_count = torch.zeros(B, device=self.device, dtype=torch.long)
+            total_sum, total_count = compute_chunk_loss_logic(
+                residuals,
+                valid_mask,
+                clamp_max=clamp_max,
+                huber_delta=huber_delta,
+            )
 
-            for i in range(0, N, residuals_chunk_size):
-                r_chunk = residuals[:, i : i + residuals_chunk_size]
-                m_chunk = valid_mask[:, i : i + residuals_chunk_size]
-
-                # Per-sample clamp + Huber are applied inside the chunk logic so
-                # that outlier edges get capped before the per-pair mean reduction.
-                s_chunk, c_chunk = compute_chunk_loss_logic(
-                    r_chunk,
-                    m_chunk,
-                    clamp_max=clamp_max,
-                    huber_delta=huber_delta,
-                )
-
-                total_sum += s_chunk
-                total_count += c_chunk
-
-            zero = torch.tensor(0.0, device=self.device, dtype=self.dtype)
+            zero = residuals.new_zeros(())
             mean_losses = torch.where(
                 total_count > 0,
                 total_sum / total_count.to(self.dtype).clamp(min=1.0),
@@ -1578,7 +1562,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             self.viewgraph_ids,
             batch_size=10_000,
             drop_last=False,
-            residuals_chunk_size=10_000,
         )
 
         sampled_viewgraphs = sampled_viewgraphs[0][:, :2].tolist()
@@ -1643,7 +1626,6 @@ if __name__ == "__main__":
 
     epo(
         batch_size=256,
-        residuals_chunk_size=2048,
         window_pose=25,
         window_depth=50,
         gt_path=gt_path,
