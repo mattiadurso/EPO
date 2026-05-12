@@ -136,6 +136,10 @@ class PoseModule(BaseModule):
         self, t_lr: float = 1e-3, R_lr: float = 1e-4, mlp_lr: float = 3e-3
     ):
         """Re-initialize optimizer with new learning rate."""
+        # ``fused=True`` enables PyTorch's fused AdamW kernel (single CUDA
+        # launch for the moment update + parameter step instead of one per
+        # parameter group). Requires CUDA tensors of matching dtype, which
+        # all our params satisfy. Matches the convention in BaseModule.
         if self.use_mlp:
             self.optimizer = torch.optim.AdamW(
                 [
@@ -153,7 +157,8 @@ class PoseModule(BaseModule):
                         "weight_decay": 0.1,  # more aggressive decay
                         "eps": 1e-10,
                     },
-                ]
+                ],
+                fused=True,
             )
 
         else:
@@ -169,6 +174,7 @@ class PoseModule(BaseModule):
                         "eps": 1e-10,
                     },
                 ],
+                fused=True,
             )
 
     def get_rotation_matrix(self, indices) -> torch.Tensor:
@@ -225,7 +231,9 @@ class PoseModule(BaseModule):
         # FP32 internally (cross products / normalisations there lose ~2 digits
         # in BF16 and would distort the rotation noticeably).
         with torch.autocast(
-            device_type="cuda", dtype=torch.bfloat16, enabled=self.use_amp,
+            device_type="cuda",
+            dtype=torch.bfloat16,
+            enabled=self.use_amp,
         ):
             P_3x4_refined = self.mlp(P_3x4)
 

@@ -167,7 +167,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             "kernel_size": 9,
             "sigma": 2,
         },
-        seed=0,
+        seed=42,
         max_edges_points=16_384,  # hard constraint due to memory on 24GB
         max_viewgraph_pairs=8_192,  # hard constraint due to memory on 24GB
         matcher_type="exhaustive",  # or "sequential"
@@ -245,9 +245,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # "torch" = reference PyTorch chains; "triton" = fused CUDA kernels
         # with analytical backwards (numerically equivalent up to fp32 noise).
         if backend not in ("torch", "triton"):
-            raise ValueError(
-                f"backend must be 'torch' or 'triton', got {backend!r}"
-            )
+            raise ValueError(f"backend must be 'torch' or 'triton', got {backend!r}")
         self.backend = backend
 
         # Edge extractor
@@ -533,10 +531,17 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # `pose_convergence_time` / `depth_convergence_time` are overwritten,
         # producing an incoherent summary).
         for k in (
-            "total_optimization", "setup_visualization", "step_pre_computation",
-            "prepare_batched_inputs", "forward_pass", "loss_computation",
-            "gradients_computation", "parameters_update", "logging",
-            "early_stop_check", "mre",
+            "total_optimization",
+            "setup_visualization",
+            "step_pre_computation",
+            "prepare_batched_inputs",
+            "forward_pass",
+            "loss_computation",
+            "gradients_computation",
+            "parameters_update",
+            "logging",
+            "early_stop_check",
+            "mre",
         ):
             self.timings[k] = 0.0
         self.timings.pop("pose_convergence_time", None)
@@ -950,7 +955,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             P0 = P_batch[i : i + batch_size]
 
             pts3d = unproject_2D_to_world(
-                xy0=xy0, K0=K0, depth0=depth0, P0=P0,
+                xy0=xy0,
+                K0=K0,
+                depth0=depth0,
+                P0=P0,
                 backend=self.backend,
             )  # (bs, N, 3)
             points_3D_list.append(pts3d)
@@ -1448,9 +1456,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             # Chunk to keep peak memory bounded on big scenes / large images.
             outs = []
             for s in range(0, stacked.shape[0], edge_batch_size):
-                outs.append(
-                    self.edge_extractor(stacked[s:s + edge_batch_size])
-                )
+                outs.append(self.edge_extractor(stacked[s : s + edge_batch_size]))
             batched = torch.cat(outs, dim=0)  # (G, 1, H, W) — binary edges
             # squeeze the channel dim, cast once for the whole batch
             batched = batched.squeeze(1).to(self.device, dtype=self.dtype)
