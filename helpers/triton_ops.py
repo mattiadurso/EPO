@@ -38,18 +38,20 @@ def _project_sample_fwd_kernel(
     P_ptr,      # (B, 4, 4) float
     DT_ptr,     # (N_img, H, W) float — *source* DT tensor (not gathered)
     DT_IDX_ptr, # (B,) int64 — maps batch row → image index in DT_ptr
+    IMG_HW_ptr, # (B, 2) int32 — per-row real (H, W) of the target image
     OUT_ptr,    # (B, N) float — residuals
     MASK_ptr,   # (B, N) uint8 — 1 if inside
     # Saved intermediates for backward
     XC_ptr, YC_ptr, ZC_ptr,
     U_ptr, V_ptr,
-    # Sizes
+    # Sizes — H, W here are the *padded* canvas (DT memory layout)
     B, N, H, W,
     # Strides (all element-wise)
     s_xyz_b, s_xyz_n,
     s_K_b,
     s_P_b,
     s_dt_b, s_dt_h,
+    s_hw_b,
     s_out_b,
     BLOCK_N: tl.constexpr,
 ):
@@ -100,12 +102,20 @@ def _project_sample_fwd_kernel(
     v = fy * yc * inv_z + cy
 
     # ---- Bounds + numerical-validity check ---------------------------
-    # Inside iff u, v are inside the image *and* zc > 0 *and* u/v are finite.
-    # The finiteness check guards against zc ⇒ 0⁺ producing ±Inf/NaN in u, v
-    # (which the comparison-based bounds test alone would reject, but only by
-    # accident — being explicit makes the intent obvious).
-    Wf = tl.cast(W, tl.float32)
-    Hf = tl.cast(H, tl.float32)
+    # Inside iff u, v are inside the *real* (unpadded) target image *and*
+    # zc > 0 *and* u/v are finite. The finiteness check guards against
+    # zc ⇒ 0⁺ producing ±Inf/NaN in u, v (which the comparison-based bounds
+    # test alone would reject, but only by accident — being explicit makes
+    # the intent obvious).
+    #
+    # IMG_HW_ptr is (B, 2) int32 with (H_real, W_real) per row. Using the
+    # padded canvas H, W here would let projections that land in the padded
+    # zone count as "inside" on mixed-resolution datasets (mipnerf360).
+    hw_off = pid_b * s_hw_b
+    H_real = tl.load(IMG_HW_ptr + hw_off + 0)
+    W_real = tl.load(IMG_HW_ptr + hw_off + 1)
+    Wf = tl.cast(W_real, tl.float32)
+    Hf = tl.cast(H_real, tl.float32)
     finite_uv = (u == u) & (v == v) & (u * 0.0 == 0.0) & (v * 0.0 == 0.0)
     inside = (
         (u >= 0.0) & (u < Wf) & (v >= 0.0) & (v < Hf) & (zc > 0.0) & finite_uv
@@ -309,7 +319,7 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, xyz_world, K, P, dt_fields_src, dt_indices):
+    def forward(ctx, xyz_world, K, P, dt_fields_src, dt_indices, img_hw):
         """Args
             xyz_world: (B, N, 3)
             K: (B, 3, 3), P: (B, 4, 4)
@@ -317,9 +327,14 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 DT tensor (not gathered per batch).
             dt_indices: (B,) int64 — for each batch row, the image index to
                 read from in ``dt_fields_src``.
+            img_hw: (B, 2) — per-row real (H, W) of the target image, used
+                to gate the inside-mask against the unpadded image extent
+                rather than the padded DT canvas. Accepts any numeric dtype;
+                cast to int32 internally.
         """
         assert xyz_world.is_cuda and K.is_cuda and P.is_cuda
         assert dt_fields_src.is_cuda and dt_indices.is_cuda
+        assert img_hw.is_cuda
         if dt_fields_src.dim() == 4:
             dt_fields_src = dt_fields_src.squeeze(1)
         assert dt_fields_src.dim() == 3, (
@@ -338,6 +353,10 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
         assert idx_c.shape == (B,), (
             f"dt_indices must be shape ({B},), got {idx_c.shape}"
         )
+        assert img_hw.shape == (B, 2), (
+            f"img_hw must be shape ({B}, 2), got {tuple(img_hw.shape)}"
+        )
+        hw_c = img_hw.contiguous().to(torch.int32)
         device = xyz_c.device
         dtype = xyz_c.dtype
 
@@ -352,7 +371,7 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
         BLOCK_N = 256
         grid = (B, triton.cdiv(N, BLOCK_N))
         _project_sample_fwd_kernel[grid](
-            xyz_c, K_c, P_c, dt_c, idx_c,
+            xyz_c, K_c, P_c, dt_c, idx_c, hw_c,
             residuals, mask,
             xc, yc, zc, u, v,
             B, N, H, W,
@@ -360,6 +379,7 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
             K_c.stride(0),
             P_c.stride(0),
             dt_c.stride(0), dt_c.stride(1),
+            hw_c.stride(0),
             residuals.stride(0),
             BLOCK_N=BLOCK_N,
         )
@@ -450,8 +470,8 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
             dim=1,
         )  # (B, 3, 3)
 
-        # dt_fields_src and dt_indices do not require gradients.
-        return grad_xyz_world, grad_K, grad_P, None, None
+        # dt_fields_src, dt_indices, img_hw do not require gradients.
+        return grad_xyz_world, grad_K, grad_P, None, None, None
 
 
 def project_and_sample_triton(
@@ -460,6 +480,7 @@ def project_and_sample_triton(
     P1: torch.Tensor,
     dt_fields_src: torch.Tensor,
     dt_indices: torch.Tensor,
+    img_hw: torch.Tensor,
 ):
     """Fused project + bilinear DT sample (no per-batch DT gather).
 
@@ -473,13 +494,17 @@ def project_and_sample_triton(
         dt_indices: ``(B,)`` int64 — for each batch row, the image index to
             sample from in ``dt_fields_src``. Avoids materialising the
             ``(B, H, W)`` gather PyTorch would otherwise produce.
+        img_hw: ``(B, 2)`` — per-row real ``(H, W)`` of the target image.
+            Gates the inside-mask against the unpadded image extent so
+            projections that land in the padded zone of the DT canvas are
+            correctly rejected on mixed-resolution datasets.
 
     Returns:
         ``(residuals, inside_mask)`` of shapes ``(B, N)`` and ``(B, N)`` bool.
         Outside points get residual ``0.0``; the mask is ``True`` for inside.
     """
     return _ProjectAndSampleTriton.apply(
-        xyz_world, K1, P1, dt_fields_src, dt_indices
+        xyz_world, K1, P1, dt_fields_src, dt_indices, img_hw
     )
 
 

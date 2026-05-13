@@ -1015,7 +1015,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # 3D world points to the second image of the pair
         batch["K1"] = self.intrinsics.get_intrinsic_matrix(cam_ids)
         batch["P1"] = self.poses.get_projection_matrix(images_names_ji)
-        batch["img1_shape"] = self.images_hw.get_parameters(images_names_ji[:1])
+        # Per-row target H/W (not just the first row): on mixed-aspect datasets
+        # like mipnerf360 every target image has its own real shape, and reusing
+        # row 0's H/W for the whole batch makes the inside-mask geometrically
+        # wrong. The torch backend's filter_outside_safe already handles (B, 2);
+        # the Triton kernel takes its own per-row img_hw input (see triton_ops).
+        batch["img1_shape"] = self.images_hw.get_parameters(images_names_ji)
         # Pass the *source* DT tensor (N_img, 1, H, W) + per-batch image
         # indices. The Triton backend reads lazily from the source — avoids
         # a ~550 MB per-batch gather on 518² fields. The torch backend

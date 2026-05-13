@@ -85,6 +85,7 @@ pip install h5py \
             scikit-learn \
             torch \
             torchvision \
+            triton \
             tqdm \
             git+https://github.com/mattiadurso/mylib.git
 ```
