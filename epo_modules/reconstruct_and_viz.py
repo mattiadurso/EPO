@@ -40,9 +40,13 @@ class ReconstructAndVizModule:
         Args:
             output_dir (str): Directory to save residual visualization maps
             percentile (float): Percentile for colormap scaling (default 95 to avoid outliers)
+            max_images: Cap on number of viewgraph pairs to visualise. Negative
+                values process the full viewgraph; otherwise pairs are sampled
+                uniformly at random. Ignored if ``custom_viewgraph`` is given.
+            custom_viewgraph: Explicit list of ``(img_i, img_j)`` pairs to
+                process instead of sampling from ``self.viewgraph``.
         """
         import os
-
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -70,14 +74,19 @@ class ReconstructAndVizModule:
             cam_i = self.intrinsics.map_names_to_indices(self.images[img_i]["cam_id"])
             cam_j = self.intrinsics.map_names_to_indices(self.images[img_j]["cam_id"])
             sampled_vg = torch.tensor(
-                [[
-                    self.image_id_map[img_i], self.image_id_map[img_j],
-                    int(cam_i), int(cam_j),
-                ]],
-                dtype=torch.long, device=self.device,
+                [
+                    [
+                        self.image_id_map[img_i],
+                        self.image_id_map[img_j],
+                        int(cam_i),
+                        int(cam_j),
+                    ]
+                ],
+                dtype=torch.long,
+                device=self.device,
             )
-            batch, pad_masks, dt_fields_src, dt_indices = (
-                self.create_batched_inputs(sampled_vg)
+            batch, pad_masks, dt_fields_src, dt_indices = self.create_batched_inputs(
+                sampled_vg
             )
             # Materialise the per-batch DT view for sample_distance_field.
             dt_fields = dt_fields_src[dt_indices]
@@ -272,7 +281,7 @@ class ReconstructAndVizModule:
 
     def to_colmap(
         self,
-        output_path: str = "optimized_reconstruction_GD",
+        output_path: str = "optimized_reconstruction",
         save_points: bool = True,
         verbose: bool = False,
         max_points_per_image: int = 100_000,
@@ -293,7 +302,8 @@ class ReconstructAndVizModule:
             max_points_per_image: Cap on points exported per image.
             final_dbscan_filtering: If True, run a final DBSCAN pass that
                 keeps only the largest cluster of 3D points.
-            dbscan_eps, dbscan_min_samples: DBSCAN hyperparameters.
+            dbscan_eps: DBSCAN ``eps`` (max neighbour distance).
+            dbscan_min_samples: DBSCAN ``min_samples`` (core-point threshold).
             gt_path: If given, align the exported reconstruction to this GT
                 model with ``colmap model_aligner``.
             save_depth: If True, write per-image refined depth maps as ``.h5``.
@@ -363,10 +373,9 @@ class ReconstructAndVizModule:
         # the last line of timings.txt as `total: <s>`, and benchmark.ipynb
         # reads training_logs.json["timings"]["total"], so both files must
         # have this key.
-        self.timings["total"] = (
-            self.timings.get("total_loading", 0.0)
-            + self.timings.get("total_optimization", 0.0)
-        )
+        self.timings["total"] = self.timings.get(
+            "total_loading", 0.0
+        ) + self.timings.get("total_optimization", 0.0)
 
         timings_path = os.path.join(output_path, "timings.txt")
         with open(timings_path, "w") as f:
@@ -381,7 +390,9 @@ class ReconstructAndVizModule:
                     f.write(f"{key}: {value}\n")
             # ── totals (must end with `total:` for benchmark_plotting) ─
             f.write(f"total_loading: {self.timings.get('total_loading', 0.0):.4f} s\n")
-            f.write(f"total_optimization: {self.timings.get('total_optimization', 0.0):.4f} s\n")
+            f.write(
+                f"total_optimization: {self.timings.get('total_optimization', 0.0):.4f} s\n"
+            )
             f.write(f"total: {self.timings['total']:.4f}\n")
 
         # save training data such metrics series too as dict
@@ -485,7 +496,7 @@ class ReconstructAndVizModule:
         if camera_color is None:
             camera_color = [0, 255, 0]
         recon = pycolmap.Reconstruction(path)
-        for img_id, img in recon.images.items():
+        for _img_id, img in recon.images.items():
             # COLMAP stores world-to-cam (R, t)
             # Rerun needs cam-to-world for the transform
             R_gt = torch.from_numpy(img.cam_from_world.rotation.matrix())

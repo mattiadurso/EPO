@@ -158,8 +158,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         max_workers=-1,
         detector_params=None,
         seed=42,
-        max_edges_points=16_384,  # hard constraint due to memory on 24GB
-        max_viewgraph_pairs=8_192,  # hard constraint due to memory on 24GB
+        max_edges_points=1024 * 12,  # hard constraint due to memory on 24GB
+        max_viewgraph_pairs=1024 * 4,  # hard constraint due to memory on 24GB
         matcher_type="exhaustive",  # or "sequential"
         sequential_matcher_window=5,  # only for sequential matcher
         scene_type="outdoor",  # or "indoor", "object_centric" (not used yet)
@@ -491,7 +491,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         spawn_rerun=True,
         rerun_save_path=".",
         scene_name="data",
-        opt="optimized_reconstruction_GD/_current_test",
+        opt="optimized_reconstruction/_current_test",
     ):
         """Main optimization loop.
 
@@ -514,7 +514,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             spawn_rerun (bool, optional): Whether to spawn a new Rerun instance. Default is True.
             rerun_save_path (str, optional): Path to save Rerun logs. Default is ".".
             scene_name (str, optional): Name of the scene. Default is "data".
-            opt (str, optional): Path to the optimization output. Default is "optimized_reconstruction_GD/_current_test".
+            opt (str, optional): Path to the optimization output. Default is "optimized_reconstruction/_current_test".
 
         """
         assert early_stop in ["none", "pose", "loss"]
@@ -703,7 +703,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     auc5=(
                         f"{self.auc_list['auc'][5][-1]:.4f}"
                         if len(self.auc_list["auc"][5]) > 0
-                        else 0
+                        else "n/a"
                     ),
                 )
 
@@ -1707,7 +1707,7 @@ if __name__ == "__main__":
 
     # Saving
     save_points = True  # recall to set mean track len = 0 in colmap gui
-    opt = "optimized_reconstruction_GD/_current_test"
+    opt = "optimized_reconstruction/_current_test"
 
     epo.to_colmap(
         opt,
