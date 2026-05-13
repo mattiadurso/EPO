@@ -14,18 +14,25 @@ from losses.dt_loss import sample_distance_field
 
 
 def normalize_pixel_coordinates(xy: Tensor, shape: tuple[int, int] | Tensor) -> Tensor:
-    """normalize pixel coordinates from -1 to +1. Being (-1,-1) the exact top left corner of the image
-    the coordinates must be given in a way that the center of pixel is at .float() coordinates (0.5,0.5)
-    xy ordered as (x, y) and shape ordered as (H, W)
+    """Normalize integer pixel indices to ``[-1, +1]`` with ``align_corners=True``
+    semantics: pixel 0 maps to -1 and pixel ``size-1`` maps to +1, so the pixel
+    *center* sits at integer coordinates (the same convention used by the
+    Triton kernels in ``helpers/triton_ops.py`` and by ``sample_distance_field``
+    in ``losses/dt_loss.py``). Edges produced by ``edges_map.nonzero()`` are
+    integer indices, so callers should pass them without a ``+0.5`` offset.
+
+    xy ordered as (x, y) and shape ordered as (H, W).
+
     Args:
-        xy: input coordinates in order (x,y) with the convention top-left pixel center is at coordinates (0.5, 0.5)
+        xy: input coordinates in order (x, y), integer pixel indices in
+            ``[0, W-1] x [0, H-1]``.
             ...x2
-        shape: shape of the image in the order (H, W)
+        shape: shape of the image in the order (H, W).
     Returns:
-        xy_norm: normalized coordinates between [-1, 1]
+        xy_norm: normalized coordinates between [-1, 1].
     """
-    xy_norm_x = 2 * xy[..., 0] / shape[1] - 1
-    xy_norm_y = 2 * xy[..., 1] / shape[0] - 1
+    xy_norm_x = 2 * xy[..., 0] / (shape[1] - 1) - 1
+    xy_norm_y = 2 * xy[..., 1] / (shape[0] - 1) - 1
     xy_norm = torch.stack([xy_norm_x, xy_norm_y], dim=-1)
     return xy_norm
 
@@ -36,7 +43,10 @@ def grid_sample_nan(xy: Tensor, img: Tensor, mode="nearest") -> tuple[Tensor, Te
     xy point that fall outside the image are treated as nan (those which are really close are interpolated using
     border padding mode)
     Args:
-        xy: input coordinates (with the convention top-left pixel center at (0.5, 0.5))
+        xy: input coordinates with integer-pixel-center convention (pixel 0
+            center at (0, 0), pixel (W-1) center at (W-1, 0)). Matches the
+            ``align_corners=True`` semantics used by ``normalize_pixel_coordinates``
+            and the Triton kernels.
             B,n,2 or B,n0,n1,2
         img: the image where the sampling is done
             BxCxHxW or BxHxW
@@ -68,7 +78,7 @@ def grid_sample_nan(xy: Tensor, img: Tensor, mode="nearest") -> tuple[Tensor, Te
         sampled = F.grid_sample(
             img,
             xy_norm[:, :, None, ...],
-            align_corners=False,
+            align_corners=True,
             mode=mode,
             padding_mode="border",
         ).view(
@@ -76,7 +86,7 @@ def grid_sample_nan(xy: Tensor, img: Tensor, mode="nearest") -> tuple[Tensor, Te
         )  # BxCxN
     else:
         sampled = F.grid_sample(
-            img, xy_norm, align_corners=False, mode=mode, padding_mode="border"
+            img, xy_norm, align_corners=True, mode=mode, padding_mode="border"
         )  # BxCxN0xN1
     # ? points xy that are not nan and have nan img. The sum is just to squash the channel dimension
     mask_img_nan = torch.isnan(sampled.sum(1))  # BxN or BxN0xN1
@@ -777,7 +787,7 @@ def project_and_sample_logic(
         # Local import keeps Triton off the import path for CPU-only setups.
         from helpers.triton_ops import project_and_sample_triton
         return project_and_sample_triton(
-            xyz_world, K1, P1, dt_fields, dt_indices
+            xyz_world, K1, P1, dt_fields, dt_indices, img1_shape
         )
 
     if backend != "torch":

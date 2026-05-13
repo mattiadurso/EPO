@@ -44,18 +44,21 @@ def _make_inputs(B=4, N=128, H=64, W=80, dtype=torch.float32, seed=0, device="cu
     # exactly the same per-batch DT as a manual gather would.
     dt = 5.0 * torch.rand(B, 1, H, W, device=device, dtype=dtype, generator=g)
     dt_idx = torch.arange(B, device=device, dtype=torch.int64)
-    return xyz, K, P, dt, dt_idx
+    # Uniform per-row real H/W (every row uses the full DT canvas — the
+    # degenerate case where padded == real and the kernel matches the
+    # pre-fix behavior).
+    img_hw = torch.tensor([H, W], device=device, dtype=torch.int32).expand(B, 2).contiguous()
+    return xyz, K, P, dt, dt_idx, img_hw
 
 
 def test_forward_matches_reference():
     """Forward residuals + mask agree with the reference path."""
-    xyz, K, P, dt, dt_idx = _make_inputs(B=4, N=256, H=64, W=80)
-    img_shape = torch.tensor([dt.shape[-2], dt.shape[-1]], device=dt.device)
+    xyz, K, P, dt, dt_idx, img_hw = _make_inputs(B=4, N=256, H=64, W=80)
 
     res_ref, mask_ref = project_and_sample_logic(
-        xyz, K, P, img_shape, dt, dt_indices=dt_idx, border=0
+        xyz, K, P, img_hw, dt, dt_indices=dt_idx, border=0
     )
-    res_tri, mask_tri = project_and_sample_triton(xyz, K, P, dt, dt_idx)
+    res_tri, mask_tri = project_and_sample_triton(xyz, K, P, dt, dt_idx, img_hw)
 
     # Masks should match exactly
     assert torch.equal(mask_ref, mask_tri), "inside-mask mismatch"
@@ -68,15 +71,14 @@ def test_forward_matches_reference():
 
 def test_backward_matches_reference():
     """Autograd through ref ≡ analytical backward of Triton op."""
-    xyz, K, P, dt, dt_idx = _make_inputs(B=3, N=200, H=48, W=64)
-    img_shape = torch.tensor([dt.shape[-2], dt.shape[-1]], device=dt.device)
+    xyz, K, P, dt, dt_idx, img_hw = _make_inputs(B=3, N=200, H=48, W=64)
 
     # Reference path with autograd
     xyz_a = xyz.clone().requires_grad_(True)
     K_a = K.clone().requires_grad_(True)
     P_a = P.clone().requires_grad_(True)
     res_a, mask_a = project_and_sample_logic(
-        xyz_a, K_a, P_a, img_shape, dt, dt_indices=dt_idx, border=0
+        xyz_a, K_a, P_a, img_hw, dt, dt_indices=dt_idx, border=0
     )
     # Use a fixed-but-non-trivial scalar loss
     loss_a = (res_a * mask_a.to(res_a.dtype)).sum()
@@ -86,7 +88,7 @@ def test_backward_matches_reference():
     xyz_b = xyz.clone().requires_grad_(True)
     K_b = K.clone().requires_grad_(True)
     P_b = P.clone().requires_grad_(True)
-    res_b, mask_b = project_and_sample_triton(xyz_b, K_b, P_b, dt, dt_idx)
+    res_b, mask_b = project_and_sample_triton(xyz_b, K_b, P_b, dt, dt_idx, img_hw)
     loss_b = (res_b * mask_b.to(res_b.dtype)).sum()
     loss_b.backward()
 
@@ -111,8 +113,7 @@ def test_backward_matches_reference():
 
 def test_backward_random_upstream():
     """Cross-check with a non-uniform upstream gradient (more demanding)."""
-    xyz, K, P, dt, dt_idx = _make_inputs(B=3, N=200, H=48, W=64, seed=7)
-    img_shape = torch.tensor([dt.shape[-2], dt.shape[-1]], device=dt.device)
+    xyz, K, P, dt, dt_idx, img_hw = _make_inputs(B=3, N=200, H=48, W=64, seed=7)
     g = torch.Generator(device=dt.device).manual_seed(11)
     grad_up = torch.randn(3, 200, device=dt.device, generator=g)  # (B, N)
 
@@ -123,7 +124,7 @@ def test_backward_random_upstream():
         P.clone().requires_grad_(True),
     )
     ra, ma = project_and_sample_logic(
-        xa, ka, pa, img_shape, dt, dt_indices=dt_idx, border=0
+        xa, ka, pa, img_hw, dt, dt_indices=dt_idx, border=0
     )
     (ra * ma.to(ra.dtype) * grad_up).sum().backward()
 
@@ -133,7 +134,7 @@ def test_backward_random_upstream():
         K.clone().requires_grad_(True),
         P.clone().requires_grad_(True),
     )
-    rb, mb = project_and_sample_triton(xb, kb, pb, dt, dt_idx)
+    rb, mb = project_and_sample_triton(xb, kb, pb, dt, dt_idx, img_hw)
     (rb * mb.to(rb.dtype) * grad_up).sum().backward()
 
     print("Random upstream grad:")
@@ -167,23 +168,23 @@ def test_nonidentity_indices_match_gather():
     dt_idx = torch.randint(0, N_img, (B,), device="cuda", generator=g)
     dt_gather = dt_src[dt_idx]  # (B, 1, H, W) — what the old API produced
 
-    xyz, K, P, _, _ = _make_inputs(B=B, N=N, H=H, W=W, seed=21)
-    img_shape = torch.tensor([H, W], device="cuda")
+    xyz, K, P, _, _, _ = _make_inputs(B=B, N=N, H=H, W=W, seed=21)
+    img_hw = torch.tensor([H, W], device="cuda", dtype=torch.int32).expand(B, 2).contiguous()
 
     # 1) torch backend with the source+indices path
     res_a, mask_a = project_and_sample_logic(
-        xyz, K, P, img_shape, dt_src, dt_indices=dt_idx, border=0,
+        xyz, K, P, img_hw, dt_src, dt_indices=dt_idx, border=0,
         backend="torch",
     )
     # 2) torch backend with the pre-gathered tensor (no indices)
     res_b, mask_b = project_and_sample_logic(
-        xyz, K, P, img_shape, dt_gather, border=0, backend="torch",
+        xyz, K, P, img_hw, dt_gather, border=0, backend="torch",
     )
     assert torch.equal(mask_a, mask_b)
     assert torch.allclose(res_a, res_b), "torch source+idx ≠ torch gather"
 
     # 3) triton backend with source+indices
-    res_c, mask_c = project_and_sample_triton(xyz, K, P, dt_src, dt_idx)
+    res_c, mask_c = project_and_sample_triton(xyz, K, P, dt_src, dt_idx, img_hw)
     assert torch.equal(mask_a, mask_c)
     d = (res_a - res_c)[mask_a].abs()
     print(
@@ -202,7 +203,7 @@ def test_no_nan_when_points_behind_camera():
     state and the loss would collapse / explode. This is the failure mode
     reported on real scenes.
     """
-    xyz, K, P, dt, dt_idx = _make_inputs(B=4, N=512, H=64, W=80, seed=3)
+    xyz, K, P, dt, dt_idx, img_hw = _make_inputs(B=4, N=512, H=64, W=80, seed=3)
 
     # Force ~30% of the points to land behind the camera (zc ≤ 0) and a few
     # to land at zc ≈ 0 (so inv_z → ±Inf).
@@ -219,7 +220,7 @@ def test_no_nan_when_points_behind_camera():
     K_t = K.clone().requires_grad_(True)
     P_t = P.clone().requires_grad_(True)
 
-    res, mask = project_and_sample_triton(xyz_t, K_t, P_t, dt, dt_idx)
+    res, mask = project_and_sample_triton(xyz_t, K_t, P_t, dt, dt_idx, img_hw)
     assert torch.isfinite(res).all(), "forward produced non-finite residuals"
     # Outside points must have residual exactly 0.
     assert (res[~mask] == 0).all(), "non-zero residual at outside points"
@@ -248,6 +249,81 @@ def test_no_nan_when_points_behind_camera():
     )
 
 
+def test_per_row_img_hw_gates_padded_region():
+    """Mixed per-row real H/W: projections into the padded zone must be rejected.
+
+    Regression test for the bug where the Triton inside-check used the padded
+    DT canvas H, W instead of each row's real image extent. On mixed-resolution
+    datasets (e.g. mipnerf360) this let projections land in the padded zone
+    and contribute spurious DT values to the loss.
+
+    Setup: padded canvas is 80×80; rows alternate between real shape (80, 80)
+    (uses full canvas) and (40, 40) (only the top-left quadrant is "real").
+    Construct points that project into the (40, 80) × (40, 80) padded zone of
+    the small rows — those must be outside under the fix and inside under
+    the old behavior, so torch and triton must agree (both correct) and
+    differ from a buggy "use padded H, W" reference.
+    """
+    device = "cuda"
+    B, N, H_pad, W_pad = 4, 256, 80, 80
+    H_small, W_small = 40, 40
+
+    g = torch.Generator(device=device).manual_seed(31)
+    xyz = torch.randn(B, N, 3, device=device, generator=g)
+    xyz[..., 2] = xyz[..., 2].abs() + 1.5
+    # Force the projected u, v to span the entire padded canvas (so plenty
+    # of points fall into the padded zone of the small rows).
+    K = torch.zeros(B, 3, 3, device=device)
+    K[:, 0, 0] = 30.0
+    K[:, 1, 1] = 30.0
+    K[:, 0, 2] = W_pad / 2.0
+    K[:, 1, 2] = H_pad / 2.0
+    K[:, 2, 2] = 1.0
+    P = torch.eye(4, device=device).expand(B, 4, 4).contiguous().clone()
+
+    dt = 5.0 * torch.rand(B, 1, H_pad, W_pad, device=device, generator=g)
+    dt_idx = torch.arange(B, device=device, dtype=torch.int64)
+
+    # Per-row real H/W: rows 0, 2 use the full canvas; rows 1, 3 are small.
+    img_hw = torch.tensor(
+        [[H_pad, W_pad], [H_small, W_small], [H_pad, W_pad], [H_small, W_small]],
+        device=device, dtype=torch.int32,
+    )
+
+    res_torch, mask_torch = project_and_sample_logic(
+        xyz, K, P, img_hw, dt, dt_indices=dt_idx, border=0, backend="torch",
+    )
+    res_tri, mask_tri = project_and_sample_triton(xyz, K, P, dt, dt_idx, img_hw)
+
+    assert torch.equal(mask_torch, mask_tri), (
+        "per-row img_hw: torch and triton disagree on inside-mask"
+    )
+
+    diff = (res_torch - res_tri)[mask_torch].abs()
+    print(
+        f"  per-row H/W: mask matches, "
+        f"max|Δres|={diff.max().item():.3e} on {mask_torch.sum().item()} inside points"
+    )
+    assert diff.max().item() < 1e-3
+
+    # Sanity: the small-canvas rows must have STRICTLY fewer inside points
+    # than a buggy "use padded H, W" check would yield. Equivalent to: at
+    # least one projection lands in the padded zone of a small row.
+    img_hw_buggy = torch.tensor(
+        [[H_pad, W_pad]] * B, device=device, dtype=torch.int32,
+    )
+    _, mask_buggy = project_and_sample_triton(xyz, K, P, dt, dt_idx, img_hw_buggy)
+    extra_inside = (mask_buggy & ~mask_tri).sum().item()
+    print(
+        f"  buggy 'use padded H, W' would mark {extra_inside} extra points as inside "
+        f"(must be > 0 for this test to be meaningful)"
+    )
+    assert extra_inside > 0, (
+        "test is vacuous: no projection landed in the padded zone — "
+        "adjust K / xyz so the bug case actually triggers"
+    )
+
+
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "CUDA required for the Triton op"
     print("== Forward parity ==")
@@ -260,4 +336,6 @@ if __name__ == "__main__":
     test_nonidentity_indices_match_gather()
     print("\n== Stability: points behind camera / zc≈0 ==")
     test_no_nan_when_points_behind_camera()
+    print("\n== Per-row img_hw gates padded region ==")
+    test_per_row_img_hw_gates_padded_region()
     print("\nAll tests passed.")
