@@ -8,16 +8,16 @@ pass that keeps only the largest DBSCAN cluster of 3D points.
 
 import os
 import warnings
-import torch
-import pycolmap
+
 import numpy as np
+import pycolmap
+import torch
 from sklearn.cluster import DBSCAN
 
 
 @torch.no_grad()
 def dbscan_filter(reconstruction, eps=0.5, min_samples=20, verbose: bool = False):
-    """
-    Filter 3D points in reconstruction using DBSCAN clustering.
+    """Filter 3D points in reconstruction using DBSCAN clustering.
     Keeps only the largest cluster to remove outliers.
 
     Args:
@@ -30,7 +30,6 @@ def dbscan_filter(reconstruction, eps=0.5, min_samples=20, verbose: bool = False
         pycolmap.Reconstruction: Filtered reconstruction (the input is
         returned unchanged when DBSCAN fails or finds no clusters).
     """
-
     if len(reconstruction.points3D) == 0:
         return reconstruction
 
@@ -115,8 +114,7 @@ def build_reconstruction(
     dbscan_min_samples=5,
     bin=False,
 ):
-    """
-    Create a pycolmap.Reconstruction from images and intrinsics dictionaries.
+    """Create a pycolmap.Reconstruction from images and intrinsics dictionaries.
 
     Args:
         epo: epo instance with images, poses, and intrinsics
@@ -327,7 +325,7 @@ def build_reconstruction(
                     pt_world, pycolmap.Track(), rgb_val
                 )
                 track = reconstruction.point3D(point3D_id).track
-                track.add_element(image_id, int(0))  # dummy keypoint index
+                track.add_element(image_id, 0)  # dummy keypoint index
 
             total_points += len(valid_3D)
             if verbose:

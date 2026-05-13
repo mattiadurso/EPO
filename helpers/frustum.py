@@ -6,9 +6,9 @@ view direction (cosine threshold) and lie within a scaled distance of each
 other. Used to seed the EPO viewgraph when no precomputed pairs are given.
 """
 
-import torch
-
 from pathlib import Path
+
+import torch
 from tqdm.auto import tqdm
 
 from .load import load_reconstruction
@@ -52,8 +52,7 @@ def build_view_graph_from_frustums(
     images_with_depth=None,
     dtype=torch.float32,
 ):
-    """
-    Compute view-graph image pairs by frustum intersection,
+    """Compute view-graph image pairs by frustum intersection,
     with tighter geometric filtering. On average finds 90% (median is 95%) of the original COLMAP pairs,
     with at least 30 geometric inliers. Measured on mydataset (90 scenes).
 
@@ -65,7 +64,6 @@ def build_view_graph_from_frustums(
         max_view_angle_deg: maximum allowed view-direction angle difference between cameras. (To reduce pairs: lower the value (e.g., 20°)
         distance_factor: maximum allowed distance between camera centers as a factor of scene size (To reduce pairs: set to 1.0-1.5, to increase pairs: set to 3.0-4.0.)
     """
-
     recon, cams, imgs, id_to_name, recon_path = load_reconstruction(recon)
     device = "cpu"
 

@@ -11,8 +11,8 @@ import torch
 
 ### Pose changes ###
 def qvec2rotmat(qvec):
-    """
-    From COLMAP implementation.
+    """From COLMAP implementation.
+
     Args:
         qvec: (..., 4) tensor
     Returns:
@@ -54,8 +54,8 @@ def qvec2rotmat(qvec):
 
 
 def rotmat2qvec(R):
-    """
-    From COLMAP implementation.
+    """From COLMAP implementation.
+
     Args:
         R: (..., 3, 3) tensor
     Returns:
@@ -185,8 +185,7 @@ def evaluate_t_err(t_past, t_present, deg=True):
 
 
 def evaluate_R_err_fast(R_past, R_present, deg=True):
-    """
-    Computes rotation error directly from Rotation Matrices using the trace.
+    """Computes rotation error directly from Rotation Matrices using the trace.
     Formula: theta = arccos( (tr(R_diff) - 1) / 2 )
     """
     # R_diff = R_past^T @ R_present
@@ -210,11 +209,12 @@ def evaluate_R_err_fast(R_past, R_present, deg=True):
 
 
 def evaluate_pose_changes(P_past, P_present, quantile=0.95, deg=True):
-    """
-    Evaluate the rotation and translation errors between two poses.
+    """Evaluate the rotation and translation errors between two poses.
+
     Args:
         P_past: Past relative pose matrix.
         P_present: Present relative pose matrix.
+
     Returns:
         err_q: Rotation error in degrees (or radians).
         err_t: Translation error in degrees (or radians).
@@ -238,11 +238,12 @@ def evaluate_pose_changes(P_past, P_present, quantile=0.95, deg=True):
 
 ### depth changes ###
 def evaluate_depth_changes(depth_past, depth_present, pad_masks, quantile=0.95):
-    """
-    Evaluate the relative depth changes between two depth maps.
+    """Evaluate the relative depth changes between two depth maps.
+
     Args:
         depth_past: Past depth map. (N,)
         depth_present: Present depth map. (N,)
+
     Returns:
         qd: Quantile of relative depth changes.
     """

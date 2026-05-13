@@ -25,7 +25,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 # ---------------------------------------------------------------------------
 # Triton forward kernel
 # ---------------------------------------------------------------------------
@@ -321,16 +320,16 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
     @staticmethod
     def forward(ctx, xyz_world, K, P, dt_fields_src, dt_indices, img_hw):
         """Args
-            xyz_world: (B, N, 3)
-            K: (B, 3, 3), P: (B, 4, 4)
-            dt_fields_src: (N_img, 1, H, W) or (N_img, H, W) — the *source*
-                DT tensor (not gathered per batch).
-            dt_indices: (B,) int64 — for each batch row, the image index to
-                read from in ``dt_fields_src``.
-            img_hw: (B, 2) — per-row real (H, W) of the target image, used
-                to gate the inside-mask against the unpadded image extent
-                rather than the padded DT canvas. Accepts any numeric dtype;
-                cast to int32 internally.
+        xyz_world: (B, N, 3)
+        K: (B, 3, 3), P: (B, 4, 4)
+        dt_fields_src: (N_img, 1, H, W) or (N_img, H, W) — the *source*
+            DT tensor (not gathered per batch).
+        dt_indices: (B,) int64 — for each batch row, the image index to
+            read from in ``dt_fields_src``.
+        img_hw: (B, 2) — per-row real (H, W) of the target image, used
+            to gate the inside-mask against the unpadded image extent
+            rather than the padded DT canvas. Accepts any numeric dtype;
+            cast to int32 internally.
         """
         assert xyz_world.is_cuda and K.is_cuda and P.is_cuda
         assert dt_fields_src.is_cuda and dt_indices.is_cuda
@@ -391,6 +390,11 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_residuals, grad_mask_unused):
+        """Analytical backward for the fused project+sample op.
+
+        Returns gradients w.r.t. ``(xyz_world, K, P)``; the DT field, dt
+        indices, and ``img_hw`` are non-grad inputs and yield ``None``.
+        """
         xyz_world, K, P, dt, idx, xc, yc, zc, u, v, mask = ctx.saved_tensors
         B, N, _ = xyz_world.shape
         _, H, W = dt.shape
@@ -697,6 +701,17 @@ class _UnprojectTriton(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, xy0, depth, K, P):
+        """Forward: lift pixel coords + depth to world via ``K`` and ``P``.
+
+        Args:
+            xy0: ``(B, N, 2)`` pixel coordinates (integer-center convention).
+            depth: ``(B, N)`` per-pixel depth.
+            K: ``(B, 3, 3)`` intrinsics.
+            P: ``(B, 4, 4)`` world-to-cam extrinsics.
+
+        Returns:
+            ``(B, N, 3)`` world-space points.
+        """
         assert xy0.is_cuda and depth.is_cuda and K.is_cuda and P.is_cuda
         assert xy0.dim() == 3 and xy0.shape[-1] == 2, \
             f"xy0 must be (B, N, 2), got {xy0.shape}"
@@ -731,6 +746,11 @@ class _UnprojectTriton(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_xyz_world):
+        """Analytical backward for the fused unproject op.
+
+        Returns gradients w.r.t. ``(depth, K, P)``; ``xy0`` is a non-grad
+        input and yields ``None``.
+        """
         xy0, depth, K, P, xyz_cam = ctx.saved_tensors
         B, N, _ = xy0.shape
         device, dtype = xy0.device, xy0.dtype

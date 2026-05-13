@@ -8,15 +8,14 @@ Checks:
 
 from __future__ import annotations
 
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
 from helpers.reprojection import unproject_2D_to_world
-from helpers.triton_ops import unproject_2D_to_world_triton
 
 
 def _make_inputs(B=4, N=512, dtype=torch.float32, seed=0, device="cuda"):
@@ -52,6 +51,7 @@ def _make_inputs(B=4, N=512, dtype=torch.float32, seed=0, device="cuda"):
 
 
 def test_forward_matches_reference():
+    """Triton forward must match the reference unproject within fp32 noise."""
     xy0, K, depth0, P = _make_inputs(B=4, N=512)
 
     ref = unproject_2D_to_world(xy0, K, depth0, P, backend="torch")
@@ -66,6 +66,7 @@ def test_forward_matches_reference():
 
 
 def test_backward_matches_reference():
+    """Triton analytical grads must match autograd through the reference path."""
     xy0, K, depth0, P = _make_inputs(B=3, N=400, seed=1)
 
     # Reference

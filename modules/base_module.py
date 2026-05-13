@@ -20,16 +20,15 @@ class BaseModule(nn.Module):
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
     ):
+        """Args:
+        image_id_map: Mapping from image name (str) to row index in the
+            parameter tensor.
+        parameters: Optional pre-allocated parameter tensor. Subclasses
+            normally allocate their own ``nn.Parameter`` instead.
+        device: Torch device for the parameters.
+        dtype: Floating-point dtype for the parameters.
         """
-        Args:
-            image_id_map: Mapping from image name (str) to row index in the
-                parameter tensor.
-            parameters: Optional pre-allocated parameter tensor. Subclasses
-                normally allocate their own ``nn.Parameter`` instead.
-            device: Torch device for the parameters.
-            dtype: Floating-point dtype for the parameters.
-        """
-        super(BaseModule, self).__init__()
+        super().__init__()
 
         self.device = torch.device(device)
         self.dtype = dtype
@@ -65,8 +64,7 @@ class BaseModule(nn.Module):
         return torch.tensor(indices, dtype=torch.long, device=self.device)
 
     def get_parameters(self, ids) -> torch.Tensor:
-        """
-        Returns parameters for the requested IDs.
+        """Returns parameters for the requested IDs.
 
         Args:
             ids: Single ID (str/int), list, tuple, or tensor of IDs
@@ -100,7 +98,6 @@ class BaseModule(nn.Module):
 
     def init_scheduler(self, warmup_steps: int, max_num_iterations: int):
         """Initialize learning rate scheduler."""
-
         # Linearly increase learning rate
         warmup = torch.optim.lr_scheduler.LinearLR(
             self.optimizer,

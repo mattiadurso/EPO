@@ -12,9 +12,10 @@ Typical usage::
     epo.to_colmap("out/sparse")  # export refined COLMAP model
 """
 
-import os
 import gc
 import math
+import os
+import sys
 import time
 import warnings
 from itertools import combinations
@@ -27,6 +28,39 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from epo_modules import MiscModule, ReconstructAndVizModule
+from helpers.frustum import build_view_graph_from_frustums
+from helpers.load import (
+    find_images,
+    load_and_preprocess_depths,
+    load_and_preprocess_images,
+    process_camera,
+    process_pose,
+)
+from helpers.reprojection import (
+    filter_viewgraph_by_reprojection_batched,
+    grid_sample_nan,
+    project_and_sample_logic,
+    unproject_2D_to_world,
+)
+from losses.dt_loss import compute_chunk_loss_logic, compute_distance_field_cv2
+from modules import BaseModule, CameraModule, DepthModule, PoseModule
+from modules.stopping_criterion import evaluate_pose_changes
+
+# `posebench` is a sibling repo not pip-installable; allow callers to point
+# at it via $EPO_POSEBENCH_PATH. Falls back to the historical hard-coded
+# location for backward compatibility. The import below is the only one that
+# legitimately follows a statement (sys.path mutation), hence the noqa.
+_POSEBENCH_PATH = os.environ.get(
+    "EPO_POSEBENCH_PATH",
+    "/home/mattia/Desktop/Repos/posebench/benchmarks_3D",
+)
+if _POSEBENCH_PATH not in sys.path:
+    sys.path.append(_POSEBENCH_PATH)
+from benchmark_pose import eval_colmap_model  # noqa: E402
+
+# NOTE: these env writes only affect subprocesses; ``import torch`` above has
+# already initialised MKL/cuBLAS for *this* process. Kept for spawned workers.
 os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
 os.environ["MKL_THREADING_LAYER"] = "GNU"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -42,33 +76,6 @@ warnings.filterwarnings(
     "ignore",
     message=".*IProgress not found.*",
 )
-
-from helpers.load import (
-    find_images,
-    process_pose,
-    process_camera,
-    load_and_preprocess_images,
-    load_and_preprocess_depths,
-)
-from losses.dt_loss import (
-    compute_distance_field_cv2,
-    compute_chunk_loss_logic,
-)
-from helpers.reprojection import (
-    filter_viewgraph_by_reprojection_batched,
-    grid_sample_nan,
-    unproject_2D_to_world,
-    project_and_sample_logic,
-)
-from helpers.frustum import build_view_graph_from_frustums
-from modules import BaseModule, CameraModule, DepthModule, PoseModule
-from modules.stopping_criterion import evaluate_pose_changes
-from epo_modules import MiscModule, ReconstructAndVizModule
-
-import sys
-
-sys.path.append("/home/mattia/Desktop/Repos/posebench/benchmarks_3D")
-from benchmark_pose import eval_colmap_model
 
 
 class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
@@ -161,12 +168,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         detector="canny",
         device="cuda",
         max_workers=-1,
-        detector_params={
-            "low_threshold": 0.15,
-            "high_threshold": 0.20,
-            "kernel_size": 9,
-            "sigma": 2,
-        },
+        detector_params=None,
         seed=42,
         max_edges_points=16_384,  # hard constraint due to memory on 24GB
         max_viewgraph_pairs=8_192,  # hard constraint due to memory on 24GB
@@ -249,6 +251,16 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.backend = backend
 
         # Edge extractor
+        # Default detector params used when caller passes ``detector_params=None``.
+        # Kept here (not as a mutable default arg) to avoid the shared-state bug.
+        if detector_params is None:
+            detector_params = {
+                "low_threshold": 0.15,
+                "high_threshold": 0.20,
+                "kernel_size": 9,
+                "sigma": 2,
+            }
+
         if detector == "canny":
             from extractors.canny import CannyEdgeDetector
 

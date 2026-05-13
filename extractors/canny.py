@@ -18,8 +18,7 @@ class CannyEdgeDetector(nn.Module):
         device: str = "cuda",
         verbose: bool = False,
     ):
-        """
-        Args:
+        """Args:
             low_threshold (float): Low threshold for hysteresis.
             high_threshold (float): High threshold for hysteresis.
             hysteresis (bool): Whether to use hysteresis.

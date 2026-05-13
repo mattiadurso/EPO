@@ -5,21 +5,20 @@ All loaders return tensors already on the requested device and dtype, with
 shapes matching the optional padding + resize convention used by EPO.
 """
 
-import os
 import glob
+import os
 import warnings
-from typing import List
-import torch
-import pycolmap
-import h5py
-import torch.nn.functional as F
-import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
+import h5py
+import numpy as np
+import pycolmap
+import torch
+import torch.nn.functional as F
 from PIL import Image  # fallback only — kept for unusual formats / RGBA blends
 from torchvision import transforms as TF  # noqa: F401 (kept for downstream)
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # cv2 ships with libjpeg-turbo and a parallel JPEG decoder; PIL is roughly
 # 2× slower at our typical 4K mipnerf360 sizes. We keep PIL as a fallback for
@@ -30,9 +29,8 @@ cv2.setNumThreads(0)
 
 
 ### Loading and preprocessing images and depths
-def find_images(images_path: str, verbose: bool = False) -> List[str]:
-    """
-    Find all images in the given path, including subdirectories.
+def find_images(images_path: str, verbose: bool = False) -> list[str]:
+    """Find all images in the given path, including subdirectories.
 
     Args:
         images_path: Path to directory containing images.
@@ -170,8 +168,7 @@ def load_and_preprocess_images(
     dtype=torch.float32,
     device="cuda",
 ):
-    """
-    Load and preprocess images by center padding to square and resizing to target size.
+    """Load and preprocess images by center padding to square and resizing to target size.
     Returns a dictionary mapping image names to tensors.
 
     Args:
@@ -370,8 +367,7 @@ def load_and_preprocess_depths(
     dtype=torch.float32,
     device="cuda",
 ):
-    """
-    Load and preprocess depth maps by center padding to square and resizing to target size.
+    """Load and preprocess depth maps by center padding to square and resizing to target size.
     Updates images_dict with depth information.
 
     Args:
