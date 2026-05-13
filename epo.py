@@ -15,20 +15,20 @@ Typical usage::
 import gc
 import math
 import os
-import sys
 import time
 import warnings
 from itertools import combinations
 
 import numpy as np
 import pycolmap
-import rerun as rr
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
+import rerun as rr
 from epo_modules import MiscModule, ReconstructAndVizModule
+from helpers.benchmark_pose import eval_colmap_model
 from helpers.frustum import build_view_graph_from_frustums
 from helpers.load import (
     find_images,
@@ -46,18 +46,6 @@ from helpers.reprojection import (
 from losses.dt_loss import compute_chunk_loss_logic, compute_distance_field_cv2
 from modules import BaseModule, CameraModule, DepthModule, PoseModule
 from modules.stopping_criterion import evaluate_pose_changes
-
-# `posebench` is a sibling repo not pip-installable; allow callers to point
-# at it via $EPO_POSEBENCH_PATH. Falls back to the historical hard-coded
-# location for backward compatibility. The import below is the only one that
-# legitimately follows a statement (sys.path mutation), hence the noqa.
-_POSEBENCH_PATH = os.environ.get(
-    "EPO_POSEBENCH_PATH",
-    "/home/mattia/Desktop/Repos/posebench/benchmarks_3D",
-)
-if _POSEBENCH_PATH not in sys.path:
-    sys.path.append(_POSEBENCH_PATH)
-from benchmark_pose import eval_colmap_model  # noqa: E402
 
 # NOTE: these env writes only affect subprocesses; ``import torch`` above has
 # already initialised MKL/cuBLAS for *this* process. Kept for spawned workers.
@@ -505,8 +493,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         scene_name="data",
         opt="optimized_reconstruction_GD/_current_test",
     ):
-        """
-        Main optimization loop.
+        """Main optimization loop.
+
         Args:
             batch_size (int, optional): Number of viewgraph pairs to process per batch. Default is 256.
             quantile (float, optional): Quantile for evaluating pose changes. Default is 0.95.
@@ -603,7 +591,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             total_points = self.max_edges * self.len_viewgraph
             print(
                 f"Processing {self.len_viewgraph:,} pairs with batch size {batch_size:,} ({num_batches} batches per iteration).",
-                f"Using {self.images[list(self.images.keys())[0]]['edges_padded'].numel()//2:,} edges per image.",  # // due to x and y
+                f"Using {self.images[list(self.images.keys())[0]]['edges_padded'].numel() // 2:,} edges per image.",  # // due to x and y
                 "\n",
                 f"Total points to process per iteration: {total_points:,}.",
                 end="\n\n",
@@ -834,8 +822,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
     ### Forward and backward helpers ###
     def check_convergence(self, list_of_changes, early_stop, window, tol):
-        """
-        Evaluate convergence based on pose changes: max(delta_r, delta_t).
+        """Evaluate convergence based on pose changes: max(delta_r, delta_t).
         Stop when smoothed max change is below tol for 'window' consecutive steps.
         """
         # We need at least 2*window - 1 steps to have 'window' smoothed points
@@ -883,7 +870,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
     def optimizers_zero_grad(self):
         """Zero the gradients of all optimizers."""
-
         if hasattr(self.intrinsics, "optimizer"):
             self.intrinsics.optimizer.zero_grad()
 
@@ -920,7 +906,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
     def collect_lrs(self, step):
         """Collect learning rates for all optimizers."""
-
         if hasattr(self.poses, "scheduler"):
             # these two are mutually exclusive
             if self.use_mlp_pose_refinement:
@@ -1354,7 +1339,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         """Compute viewgraph and filter by reprojection error and returns the sorted viewgraph."""
         if self.viewgraph_path is not None:
             # Load viewgraph from file
-            with open(self.viewgraph_path, "r") as f:
+            with open(self.viewgraph_path) as f:
                 lines = f.readlines()
             viewgraph = []
             for line in lines:
@@ -1583,7 +1568,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
         if self.verbose:
             print(
-                f"Edges stats:\n",
+                "Edges stats:\n",
                 f"{images_with_more_than_max:,} images have more than {max_edges_to_retain:,} edges. \n",
                 f"max: {max_edges:,} |",
                 f"min: {min_edges:,} | avg: {int(avg_edges):,} |",
