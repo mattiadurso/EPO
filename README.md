@@ -55,9 +55,9 @@
 
 ### Prerequisites
 
-- [Conda](https://docs.conda.io/en/latest/) (recommended)
 - Python 3.10
 - CUDA-compatible GPU
+- One of: [Conda](https://docs.conda.io/en/latest/) **or** `python3-venv` (any pip-only flow)
 
 ### Option A — Conda Environment File
 
@@ -69,7 +69,7 @@ conda env create -f environment.yml
 conda activate epo
 ```
 
-### Option B — Manual Setup
+### Option B — Conda + Manual Pip Install
 
 ```bash
 conda create -n epo python=3.10 -y
@@ -89,6 +89,33 @@ pip install h5py \
             tqdm \
             git+https://github.com/mattiadurso/mylib.git
 ```
+
+### Option C — Pip + venv (no Conda required)
+
+```bash
+git clone https://github.com/mattiadurso/epo.git
+cd epo
+
+python3.10 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install --upgrade pip
+
+pip install h5py \
+            kornia \
+            matplotlib \
+            numpy \
+            opencv-python \
+            pandas \
+            pycolmap==3.11 \
+            scikit-learn \
+            torch \
+            torchvision \
+            triton \
+            tqdm \
+            git+https://github.com/mattiadurso/mylib.git
+```
+
+> ℹ️ `triton` is Linux-only and requires a CUDA build of `torch`. On systems without CUDA, install `torch` from the [official selector](https://pytorch.org/get-started/locally/) first, then run the rest of the `pip install` line without `triton` — EPO will fall back to the PyTorch reference path (`backend="torch"`).
 
 ## Usage
 
