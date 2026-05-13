@@ -5,10 +5,10 @@ separate from the main ``EPO`` class purely to keep ``epo.py`` shorter.
 """
 
 import os
-import time
-import torch
 import random
+
 import numpy as np
+import torch
 
 
 def _fmt_seconds(s: float) -> str:
@@ -53,7 +53,6 @@ class MiscModule:
 
     def print_summary(self) -> None:
         """Print a structured timing + loss summary of the last EPO run."""
-
         t = self.timings
         num_iters = len(getattr(self, "loss_list", []))
 

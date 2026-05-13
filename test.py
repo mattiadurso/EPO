@@ -9,10 +9,11 @@ Examples:
     python test.py --dataset terrasky3D --edges canny --max_iterations 1000
 """
 
+import argparse
+import json
 import os
 import time
-import json
-import argparse
+
 from epo import EPO
 
 parser = argparse.ArgumentParser(description="Run EPO across benchmark scenes")

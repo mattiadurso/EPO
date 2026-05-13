@@ -1,0 +1,67 @@
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+extend-exclude = '''
+/(
+    extractors/BDCN
+  | extractors/TEED
+  | extractors/hed
+  | extractors/hed_
+  | extractors/DiffusionEdge
+  | extractors/SAM2
+  | extractors/rcf_torch
+  | optimized_reconstruction.*
+  | benchmarks
+  | benchmarks_full
+  | rerun_video
+)/
+'''
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+extend-exclude = [
+    "extractors/BDCN",
+    "extractors/TEED",
+    "extractors/hed",
+    "extractors/hed_",
+    "extractors/DiffusionEdge",
+    "extractors/SAM2",
+    "extractors/rcf_torch",
+    "optimized_reconstruction_GD",
+    "benchmarks",
+    "benchmarks_full",
+    "rerun_video",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "F",      # pyflakes
+    "W",      # pycodestyle warnings
+    "I",      # isort
+    "B",      # flake8-bugbear (catches mutable defaults via B006)
+    "UP",     # pyupgrade
+    "D",      # pydocstyle
+    "PLR0915", # too-many-statements (mirrors CLAUDE.md 40-line rule)
+]
+ignore = [
+    "E501",   # line length — Black owns this
+    "D100",   # missing module docstring (we have them; pydocstyle is noisy on tests)
+    "D104",   # missing __init__ docstring
+    "D203",   # incompatible with D211 (no blank line before class docstring)
+    "D213",   # incompatible with D212 (multi-line summary on first line)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]                          # tests don't need full pydocstyle
+"modules/__init__.py" = ["F401"]           # re-exports
+"epo_modules/__init__.py" = ["F401"]       # re-exports
+"helpers/triton_ops.py" = ["PLR0915"]      # Triton JIT kernels are necessarily long
+"helpers/benchmark_plotting.py" = ["PLR0915"]  # plot/LaTeX setup is inherently long
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pylint]
+max-statements = 40

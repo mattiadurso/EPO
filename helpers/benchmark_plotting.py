@@ -5,21 +5,32 @@ Reads pose-AUC and NVS results from on-disk JSON dumps produced by
 used in the paper. Imported almost exclusively by ``benchmark.ipynb``.
 """
 
-import os
 import json
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from IPython.display import clear_output
-
+import os
 import sys
 
-sys.path.append("/home/mattia/Desktop/Repos/posebench/benchmarks_3D")
-from benchmark_pose import eval_colmap_model_all_scenes, eval_colmap_model
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from IPython.display import clear_output
+
+# `posebench` is a sibling repo not pip-installable; allow callers to point
+# at it via $EPO_POSEBENCH_PATH. Falls back to the historical hard-coded
+# location for backward compatibility. The import below is the only one that
+# legitimately follows a statement (sys.path mutation), hence the noqa.
+_POSEBENCH_PATH = os.environ.get(
+    "EPO_POSEBENCH_PATH",
+    "/home/mattia/Desktop/Repos/posebench/benchmarks_3D",
+)
+if _POSEBENCH_PATH not in sys.path:
+    sys.path.append(_POSEBENCH_PATH)
+from benchmark_pose import (  # noqa: E402
+    eval_colmap_model_all_scenes,
+)
 
 
 def read_results(
-    dataset, target_folder, models, thr=5, round_to=1, remove=[], full=False
+    dataset, target_folder, models, thr=5, round_to=1, remove=None, full=False
 ):
     """Aggregate per-scene pose-AUC results for a list of models on a dataset.
 
@@ -29,12 +40,15 @@ def read_results(
         models: List of model run names to compare.
         thr: AUC threshold (degrees) to report.
         round_to: Number of decimals to round results to.
-        remove: Scene names to exclude from aggregation.
+        remove: Scene names to exclude from aggregation. ``None`` is treated
+            as the empty list.
         full: If True, read from the ``benchmarks_full`` tree.
 
     Returns:
         ``pd.DataFrame`` with one column per model and one row per scene.
     """
+    if remove is None:
+        remove = []
     base_target = f"/home/mattia/Desktop/datasets/{dataset}"
     if dataset == "imc":
         base_target = (
@@ -80,7 +94,7 @@ def read_results(
             if scene not in total_timings[f"{model}"]:
                 total_timings[f"{model}"][scene] = None
                 try:
-                    with open(f"{recon_path}/sparse/timings.txt", "r") as f:
+                    with open(f"{recon_path}/sparse/timings.txt") as f:
                         lines = f.readlines()
                     total_timings[f"{model}"][scene] = float(lines[-1].split()[1])
                 except FileNotFoundError:
@@ -281,12 +295,11 @@ def read_results_nvs(
     exclude_metrics=(),
     column_order=None,
 ):
-    """
-    Args:
-        round_to (int): Decimal places for rounding.
-        exclude_metrics (tuple): Metrics to exclude from results.
-        column_order (list): List of method names to set column order.
-                           If None, uses default sorting (GT first, then alphabetical).
+    """Args:
+    round_to (int): Decimal places for rounding.
+    exclude_metrics (tuple): Metrics to exclude from results.
+    column_order (list): List of method names to set column order.
+                       If None, uses default sorting (GT first, then alphabetical).
     """
     # nvs_results_path = "/home/mattia/Desktop/Repos/gaussian-splatting/data"
     data = []
@@ -304,7 +317,7 @@ def read_results_nvs(
         for scene in os.listdir(method_path):
             res_json = os.path.join(method_path, scene, "3dgs/results.json")
             if os.path.exists(res_json):
-                with open(res_json, "r") as f:
+                with open(res_json) as f:
                     res = json.load(f)
 
                 # Capitalize scene name here
@@ -368,8 +381,7 @@ def read_results_nvs(
 def latexfy(
     df, caption="Comparison of Results", label="tab:results", time_round=1, auc_round=1
 ):
-    """
-    Generates a LaTeX table from the dataframe output of read_results.
+    """Generates a LaTeX table from the dataframe output of read_results.
 
     Args:
         df (pd.DataFrame): Output from read_results.
@@ -381,7 +393,6 @@ def latexfy(
     Returns:
         str: A string containing the formatted LaTeX table.
     """
-
     # 1. Identify Model Pairs (AUC col + Time col)
     auc_cols = [c for c in df.columns if "auc" in c]
 
@@ -464,6 +475,7 @@ def latexfy(
 
             # Helper to format and optionally bold
             def format_cell(val, best_val, precision, is_vggt, bold_enabled=True):
+                """Render a numeric cell, bolding the best non-VGGT value."""
                 if pd.isnull(val):
                     return "-"
                 txt = f"{val:.{precision}f}"

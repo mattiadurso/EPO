@@ -6,9 +6,8 @@ and the tensor-only primitives used in the optimized EPO forward pass.
 """
 
 import torch
-from torch import Tensor
 import torch.nn.functional as F
-from tqdm import tqdm
+from torch import Tensor
 
 from losses.dt_loss import sample_distance_field
 
@@ -28,6 +27,7 @@ def normalize_pixel_coordinates(xy: Tensor, shape: tuple[int, int] | Tensor) -> 
             ``[0, W-1] x [0, H-1]``.
             ...x2
         shape: shape of the image in the order (H, W).
+
     Returns:
         xy_norm: normalized coordinates between [-1, 1].
     """
@@ -38,10 +38,11 @@ def normalize_pixel_coordinates(xy: Tensor, shape: tuple[int, int] | Tensor) -> 
 
 
 def grid_sample_nan(xy: Tensor, img: Tensor, mode="nearest") -> tuple[Tensor, Tensor]:
-    """pytorch grid_sample with embedded coordinate normalization and grid nan handling (if a nan is present in xy,
+    """Pytorch grid_sample with embedded coordinate normalization and grid nan handling (if a nan is present in xy,
     the output will be nan). Works both with input with shape B,n,2 and B,n0,n1,2
     xy point that fall outside the image are treated as nan (those which are really close are interpolated using
     border padding mode)
+
     Args:
         xy: input coordinates with integer-pixel-center convention (pixel 0
             center at (0, 0), pixel (W-1) center at (W-1, 0)). Matches the
@@ -105,8 +106,8 @@ def grid_sample_nan(xy: Tensor, img: Tensor, mode="nearest") -> tuple[Tensor, Te
 
 
 def create_grid(image, permute=False, sampling_factor=10, border=0):
-    """
-    Function to create a grid of the same size as the image.
+    """Function to create a grid of the same size as the image.
+
     Args:
         image: image of shape BxCxHxW or CxHxW
         permute: if True, the grid is permuted
@@ -229,7 +230,7 @@ def change_reference_3D_points(
     P0: Tensor,
     P1: Tensor,  # cast_to_double: bool = True
 ) -> Tensor:
-    """move 3D points from P0 to P1 reference systems
+    """Move 3D points from P0 to P1 reference systems
     Args:
         xyz0: the 3D points in the P0 coordinate system
             B,n,3
@@ -280,7 +281,7 @@ def reproject_2D_2D(
     border: int = 0,
     mode: str = "nearest",
 ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor]:
-    """projects xy0 points from img0 to img1 using depth0. Points that have an invalid depth='nan' are
+    """Projects xy0 points from img0 to img1 using depth0. Points that have an invalid depth='nan' are
         set to 'nan' (if bilinear sampling is used, all the 4 closest depth values must be valid to get a valid projection).
         If img1_shape is provided, also the points that project out of the second image are set to Nan
     Args:
@@ -354,8 +355,7 @@ def filter_viewgraph_by_reprojection_batched(
     batch_size: int = 512,
     verbose: bool = False,
 ) -> tuple[list[tuple[str, str]], dict[tuple[str, str], int]]:
-    """
-    Batched version of filter_viewgraph_by_reprojection.
+    """Batched version of filter_viewgraph_by_reprojection.
     Processes multiple pairs in parallel for better GPU utilization.
 
     Note: This assumes all images have the same resolution for batching.
@@ -493,7 +493,7 @@ def unproject_to_virtual_plane(
     xy: Tensor,
     K_inv: Tensor,
 ) -> Tensor:
-    """unproject points to the camera virtual plane at depth 1
+    """Unproject points to the camera virtual plane at depth 1
     Args:
         xy: xy points in img0 (with convention top-left pixel coordinate (0.5, 0.5)
             B,n,2
@@ -509,7 +509,7 @@ def unproject_to_virtual_plane(
 
 
 def unproject_to_3D(xy: Tensor, K_inv: Tensor, depths: Tensor) -> Tensor:
-    """unproject points to 3D in the camera ref system
+    """Unproject points to 3D in the camera ref system
     Args:
         xy: xy points in img0 (with convention top-left pixel coordinate (0.5, 0.5)
             B,n,2
@@ -536,8 +536,7 @@ def unproject_to_3D(xy: Tensor, K_inv: Tensor, depths: Tensor) -> Tensor:
 
 
 def invert_K(K: Tensor) -> Tensor:
-    """
-    Closed-form inversion of batched 3x3 intrinsic matrices.
+    """Closed-form inversion of batched 3x3 intrinsic matrices.
     K is expected to have shape (B, 3, 3).
     """
     K_inv = torch.zeros_like(K)
@@ -557,7 +556,7 @@ def invert_K(K: Tensor) -> Tensor:
 
 
 def invert_P(P: Tensor, return_Rt=False) -> Tensor:
-    """invert the extrinsics P matrix in a more stable way
+    """Invert the extrinsics P matrix in a more stable way
     Args:
         P: input extrinsics P matrix
             Bx4x4
@@ -598,7 +597,7 @@ def unproject_2D_to_world(
     P0: Tensor,
     backend: str = "torch",
 ) -> Tensor:
-    """unproject points to world coordinates
+    """Unproject points to world coordinates
     Args:
         xy: xy points in img0 (with convention top-left pixel coordinate (0.5, 0.5)
             B,n,2
@@ -613,6 +612,7 @@ def unproject_2D_to_world(
             ``"triton"`` swaps in a fused CUDA kernel with an analytical
             backward (numerically equivalent up to fp32 noise; requires
             CUDA tensors).
+
     Returns:
         xyz_world: unprojected 3D points in the world reference system
             B,n,3
@@ -659,8 +659,8 @@ def from_homogeneous(points: Tensor) -> Tensor:
 def filter_outside_safe(
     xy: Tensor, shape: Tensor | tuple[int, int], border: int = 0
 ) -> tuple[Tensor, Tensor]:
-    """
-    Identifies points outside the image.
+    """Identifies points outside the image.
+
     Returns:
         xy_safe: Points with outside values replaced by 0.0 (safe for graph execution)
         outside_mask: Boolean mask where True indicates the point was outside.
@@ -695,7 +695,7 @@ def project_to_2D(
     img_shape: Tensor | tuple[int, int] | None = None,
     border: int = 0,
 ) -> Tensor | tuple[Tensor, Tensor]:
-    """project 3D points to 2D using the provided intrinsics matrix K."""
+    """Project 3D points to 2D using the provided intrinsics matrix K."""
     original_dtype = xyz.dtype
     # B,3,3 * B,3,n =  B,3,n  -> B,n,3 after permutation
     xy_proj_hom = (K @ xyz.permute(0, 2, 1)).permute(0, 2, 1)
@@ -759,8 +759,7 @@ def project_and_sample_logic(
     border: int = 0,
     backend: str = "torch",
 ):
-    """
-    Fused operation: Projection -> 2D -> Sampling.
+    """Fused operation: Projection -> 2D -> Sampling.
     Guarantees no NaNs are produced. Invalid points are zeroed out and tracked via outside_mask.
 
     Args:

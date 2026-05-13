@@ -45,8 +45,7 @@ def gram_schmidt_rotation(R: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 
 class PoseRefinementMLP(nn.Module):
-    """
-    Pose Refinement MLP as described in ACE Zero (Supplementary Material).
+    """Pose Refinement MLP as described in ACE Zero (Supplementary Material).
 
     Architecture:
     - Input: 3x4 pose matrix
@@ -56,11 +55,10 @@ class PoseRefinementMLP(nn.Module):
     """
 
     def __init__(self, input_dim: int, output_dim: int, hidden_dim: int = 128):
-        """
-        Args:
-            input_dim: Flattened input size (12 for a 3x4 pose matrix).
-            output_dim: Flattened output size (12 for a 3x4 pose matrix).
-            hidden_dim: Hidden width of the fully-connected stack.
+        """Args:
+        input_dim: Flattened input size (12 for a 3x4 pose matrix).
+        output_dim: Flattened output size (12 for a 3x4 pose matrix).
+        hidden_dim: Hidden width of the fully-connected stack.
         """
         super().__init__()
         # The 6 layers
@@ -78,8 +76,7 @@ class PoseRefinementMLP(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """
-        Standard initialization.
+        """Standard initialization.
         Note: For refinement networks, it is often beneficial to initialize the
         final layer with very small weights so the initial prediction is close
         to identity (zero offset), preventing large jumps at the start of training.
@@ -111,8 +108,7 @@ class PoseRefinementMLP(nn.Module):
         return torch.cat([R_ortho, poses[:, :3, 3:]], dim=2)
 
     def forward(self, x):
-        """
-        Args:
+        """Args:
             initial_pose_flat: (Batch_Size, 3, 4) tensor containing 3x4 matrices pose.
 
         Returns:

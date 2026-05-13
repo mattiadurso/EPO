@@ -6,9 +6,9 @@ edge coordinates, and the per-chunk residual reduction used by the EPO
 forward pass (per-edge clamp → Huber → per-direction mean).
 """
 
-import torch
 import cv2
 import numpy as np
+import torch
 import torch.nn.functional as F
 
 
@@ -18,13 +18,13 @@ def compute_distance_field_cv2(
     device="cuda",
     dtype=torch.float32,
 ):
-    """
-    Compute the Euclidean distance field from edges coordinates using OpenCV.
+    """Compute the Euclidean distance field from edges coordinates using OpenCV.
 
     Args:
         edges_map: Tensor of shape (H, W). Values > 0 are treated as edges.
         device: Device to place the result on.
         dtype: Data type for the result (e.g., torch.float16).
+
     Returns:
         field: Distance field of shape (H, W).
     """
@@ -56,11 +56,12 @@ def compute_distance_field_torch(
     device="cuda",
     dtype=torch.float32,
 ):
-    """
-    Compute the Euclidean distance field from edges coordinates.
+    """Compute the Euclidean distance field from edges coordinates.
+
     Args:
         edges_map: Tensor of shape (H, W) with binary edge maps.
         device: Device to use for computation.
+
     Returns:
         field: Distance field of shape (H, W) showing distance from each pixel to nearest edge.
     """
@@ -139,8 +140,7 @@ def compute_chunk_loss_logic(
     clamp_max: float = 10.0,
     huber_delta: float = 1.0,
 ):
-    """
-    Pure tensor logic for the loss reduction of a single chunk.
+    """Pure tensor logic for the loss reduction of a single chunk.
 
     The clamp + Huber are applied per-edge sample (matching Eq. (7)-(8) of the
     paper) so that individual outlier edges cannot dominate the per-pair mean.

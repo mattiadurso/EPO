@@ -7,11 +7,13 @@ of the file before running.
 """
 
 import os
-import torch
-import pycolmap
+
 import numpy as np
-import rerun as rr
+import pycolmap
 import rerun.blueprint as rrb
+import torch
+
+import rerun as rr
 
 
 def get_frustum_strips(
@@ -50,7 +52,7 @@ def log_reconstruction_rerun(
     static_cameras: bool = False,
     points3D: bool = False,
     static_points: bool = False,
-    camera_color: list[int] = [0, 255, 0],
+    camera_color: list[int] | None = None,
 ) -> None:
     """Log a COLMAP reconstruction to Rerun under ``world/<entity>``.
 
@@ -60,8 +62,11 @@ def log_reconstruction_rerun(
         static_cameras: If True, log camera transforms as time-static.
         points3D: If True, also log the 3D point cloud.
         static_points: If True, log points as time-static.
-        camera_color: RGB color used for the frustum line strips.
+        camera_color: RGB color used for the frustum line strips. Defaults to
+            green ``[0, 255, 0]`` when ``None``.
     """
+    if camera_color is None:
+        camera_color = [0, 255, 0]
     recon = pycolmap.Reconstruction(path)
     for img_id, img in recon.images.items():
         # COLMAP stores world-to-cam (R, t)

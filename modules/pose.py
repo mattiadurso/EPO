@@ -14,11 +14,20 @@ SO(3).
 import torch
 import torch.nn as nn
 
-from modules.mlp import PoseRefinementMLP, gram_schmidt_rotation
 from modules.base_module import BaseModule
+from modules.mlp import PoseRefinementMLP, gram_schmidt_rotation
 
 
 class PoseModule(BaseModule):
+    """Per-image learnable extrinsics (world-to-camera, ``T_cw``).
+
+    Stores the rotation as an unconstrained 3x3 parameter (re-orthonormalized
+    via Gram-Schmidt on every fetch) and a normalized translation parameter
+    with a learnable per-image offset. When ``use_mlp=True`` the raw R/t are
+    frozen and a small :class:`PoseRefinementMLP` carries the optimization
+    instead.
+    """
+
     def __init__(
         self,
         image_id_map: dict[str, int],
@@ -38,8 +47,7 @@ class PoseModule(BaseModule):
         warmup_steps: int = 25,
         dtype: torch.dtype = torch.float32,
     ):
-        """
-        Class storing extrinsics (Pose) for multiple cameras.
+        """Class storing extrinsics (Pose) for multiple cameras.
         Assumes World-to-Camera convention (T_cw).
 
         Args:
@@ -178,8 +186,7 @@ class PoseModule(BaseModule):
             )
 
     def get_rotation_matrix(self, indices) -> torch.Tensor:
-        """
-        Returns (B, 3, 3) rotation matrices for the requested images,
+        """Returns (B, 3, 3) rotation matrices for the requested images,
         re-orthonormalized via Gram-Schmidt so the result is always on SO(3).
         """
         return gram_schmidt_rotation(self.R_param[indices])
@@ -195,8 +202,7 @@ class PoseModule(BaseModule):
         return self.t_offset[indices]
 
     def get_projection_matrix(self, indices) -> torch.Tensor:
-        """
-        Constructs 4x4 SE3 Matrix [R|t].
+        """Constructs 4x4 SE3 Matrix [R|t].
         Standard convention: World-to-Camera.
         """
         batch_size = len(indices)
@@ -270,7 +276,6 @@ class PoseModule(BaseModule):
 
     def parameters(self, t=False, R=False, mlp=False, recurse: bool = True):
         """Return list of trainable parameters - only leaf tensors"""
-
         params = []
 
         if mlp and self.use_mlp:  # no R and t when mlp is used

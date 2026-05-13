@@ -5,21 +5,22 @@ Bound onto :class:`epo.EPO`; functions assume ``self`` is an EPO instance
 learnable submodules).
 """
 
-import os
 import json
-import torch
+import os
 import random
-import pycolmap
-import rerun as rr
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
 
-from tqdm import tqdm
-from losses.dt_loss import sample_distance_field
-from helpers.reprojection import project_world_to_2D
-from helpers.reconstruction import build_reconstruction
+import matplotlib.cm as cm
+import matplotlib.pyplot as plt
+import numpy as np
+import pycolmap
+import torch
 from matplotlib.colors import Normalize
+from tqdm import tqdm
+
+import rerun as rr
+from helpers.reconstruction import build_reconstruction
+from helpers.reprojection import project_world_to_2D
+from losses.dt_loss import sample_distance_field
 
 
 class ReconstructAndVizModule:
@@ -33,8 +34,7 @@ class ReconstructAndVizModule:
         max_images=100,
         custom_viewgraph=None,
     ):
-        """
-        Visualize reprojection residuals for all image pairs in the viewgraph.
+        """Visualize reprojection residuals for all image pairs in the viewgraph.
         Creates error maps showing where edges align well or poorly between image pairs.
 
         Args:
@@ -42,9 +42,7 @@ class ReconstructAndVizModule:
             percentile (float): Percentile for colormap scaling (default 95 to avoid outliers)
         """
         import os
-        import matplotlib.pyplot as plt
-        import matplotlib.cm as cm
-        from matplotlib.colors import Normalize
+
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -471,7 +469,7 @@ class ReconstructAndVizModule:
         static_cameras: bool = False,
         points3D: bool = False,
         static_points: bool = False,
-        camera_color: list[int] = [0, 255, 0],
+        camera_color: list[int] | None = None,
     ) -> None:
         """Log a COLMAP reconstruction (cameras + optional point cloud) to Rerun.
 
@@ -481,8 +479,11 @@ class ReconstructAndVizModule:
             static_cameras: If True, log camera transforms as time-static.
             points3D: If True, also log the 3D point cloud.
             static_points: If True, log points as time-static.
-            camera_color: RGB color used for the frustum line strips.
+            camera_color: RGB color used for the frustum line strips. Defaults
+                to green ``[0, 255, 0]`` when ``None``.
         """
+        if camera_color is None:
+            camera_color = [0, 255, 0]
         recon = pycolmap.Reconstruction(path)
         for img_id, img in recon.images.items():
             # COLMAP stores world-to-cam (R, t)

@@ -8,8 +8,9 @@ collapsed to ``SIMPLE_PINHOLE`` by averaging ``fx`` and ``fy``.
 
 import torch
 import torch.nn as nn
-from modules.base_module import BaseModule
+
 from helpers.reprojection import invert_K
+from modules.base_module import BaseModule
 
 
 class CameraModule(BaseModule):

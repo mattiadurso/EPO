@@ -9,6 +9,7 @@ are learnable.
 
 import torch
 import torch.nn as nn
+
 from modules.base_module import BaseModule
 
 
@@ -28,8 +29,7 @@ class DepthModule(BaseModule):
         device="cuda",
         dtype=torch.float32,
     ):
-        """
-        Args:
+        """Args:
             image_id_map: Mapping from image IDs to tensor indices
             depth: Depth tensor (N, 1) or (N, 2) for parametric representation
             lr: Learning rate for optimizer
