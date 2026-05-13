@@ -19,6 +19,7 @@ The two are wired up so any external caller importing
 from __future__ import annotations
 
 import argparse
+import functools
 import logging
 import os
 import time
@@ -40,6 +41,53 @@ except ImportError:  # script / sys.path execution
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# Reconstruction loading + pose-dict cache                                     #
+# --------------------------------------------------------------------------- #
+def _extract_pose_dict(rec_or_dict):
+    """Coerce a ``pycolmap.Reconstruction`` (or pose dict) to a pose dict.
+
+    Returns ``{image_name: (R, t)}`` with ``R`` shape ``(3, 3)`` and ``t``
+    shape ``(3,)``, both ``float64``. Idempotent on dicts so callers can
+    accept either type uniformly. Arrays are copied out of pycolmap's C++
+    storage so the dict is picklable and outlives the Reconstruction.
+    """
+    if isinstance(rec_or_dict, dict):
+        return rec_or_dict
+    return {
+        img.name: (
+            np.asarray(img.cam_from_world.rotation.matrix(), dtype=np.float64),
+            np.asarray(img.cam_from_world.translation, dtype=np.float64),
+        )
+        for img in rec_or_dict.images.values()
+    }
+
+
+@functools.lru_cache(maxsize=64)
+def _load_pose_dict_cached(abs_path):
+    """Parse a reconstruction at ``abs_path`` once and cache its pose dict.
+
+    The cache is process-local (``functools.lru_cache`` lives in whichever
+    process calls this). For multi-call workflows like
+    :func:`helpers.benchmark_plotting.read_results` — which evaluate the
+    same target reconstruction against many input models —
+    :func:`eval_colmap_model_all_scenes` pre-parses all unique paths in
+    the parent process (populating this cache) and ships the resulting
+    pose dicts to joblib workers via the closure, so workers never call
+    ``pycolmap.Reconstruction`` themselves. Cached entries are small
+    (~30 KB per 150-image scene); ``maxsize=64`` covers typical sweeps.
+
+    Use :func:`clear_reconstruction_cache` to evict.
+    """
+    rec = pycolmap.Reconstruction(abs_path)
+    return _extract_pose_dict(rec)
+
+
+def clear_reconstruction_cache():
+    """Drop all cached pose dicts (e.g. after a long-running notebook)."""
+    _load_pose_dict_cached.cache_clear()
 
 
 # --------------------------------------------------------------------------- #
@@ -132,27 +180,28 @@ def evaluate_scene_reference(target_rec, input_rec, deg=True, verbose=False):
 # Vectorised implementation                                                   #
 # --------------------------------------------------------------------------- #
 def _stack_poses(rec, names):
-    """Pull (R, t) for ``names`` out of a ``pycolmap.Reconstruction``.
+    """Pull (R, t) for ``names`` out of a Reconstruction or pose dict.
 
     Returns ``(R, t, present_mask)`` where ``R`` has shape ``(N, 3, 3)``,
     ``t`` has shape ``(N, 3)``, and ``present_mask`` marks names absent
     from the reconstruction (those slots in ``R``/``t`` are identity / zero
     placeholders and must be filtered out by callers).
+
+    Accepts either a ``pycolmap.Reconstruction`` or a pre-extracted pose
+    dict (see :func:`_extract_pose_dict`).
     """
-    name_to_img = {img.name: img for img in rec.images.values()}
+    pose_dict = _extract_pose_dict(rec)
     n = len(names)
     R = np.empty((n, 3, 3), dtype=np.float64)
     t = np.empty((n, 3), dtype=np.float64)
     present = np.zeros(n, dtype=bool)
     for i, name in enumerate(names):
-        img = name_to_img.get(name)
-        if img is None:
+        entry = pose_dict.get(name)
+        if entry is None:
             R[i] = np.eye(3)
             t[i] = 0.0
             continue
-        cfw = img.cam_from_world
-        R[i] = cfw.rotation.matrix()
-        t[i] = cfw.translation
+        R[i], t[i] = entry
         present[i] = True
     return R, t, present
 
@@ -236,9 +285,15 @@ def evaluate_scene(target_rec, input_rec, deg=True, verbose=False):
        eigendecomposition in :func:`rotmat2qvec`.
 
     The "if either image is missing, error = inf" semantics are preserved.
+    Accepts either ``pycolmap.Reconstruction`` objects or pre-extracted
+    pose dicts (see :func:`_extract_pose_dict`); this lets
+    :func:`eval_colmap_model_all_scenes` parse each unique path once in
+    the parent process and ship picklable dicts to joblib workers.
     """
-    target_images = np.array(sorted([img.name for img in target_rec.images.values()]))
-    input_images_set = {img.name for img in input_rec.images.values()}
+    target_pd = _extract_pose_dict(target_rec)
+    input_pd = _extract_pose_dict(input_rec)
+    target_images = np.array(sorted(target_pd.keys()))
+    input_images_set = set(input_pd.keys())
 
     # All unordered pairs (i, j) with i < j.
     idx_i, idx_j = np.triu_indices(len(target_images), k=1)
@@ -247,8 +302,8 @@ def evaluate_scene(target_rec, input_rec, deg=True, verbose=False):
 
     # Fetch per-image poses once. Missing names get placeholder identity / zero
     # which we mask off afterwards.
-    Rt, tt, present_t = _stack_poses(target_rec, target_images)  # GT always present.
-    Ri, ti, present_i = _stack_poses(input_rec, target_images)  # may have gaps.
+    Rt, tt, present_t = _stack_poses(target_pd, target_images)  # GT always present.
+    Ri, ti, present_i = _stack_poses(input_pd, target_images)  # may have gaps.
 
     R1_t, t1_t = Rt[idx_i], tt[idx_i]
     R2_t, t2_t = Rt[idx_j], tt[idx_j]
@@ -300,23 +355,45 @@ def eval_colmap_model(
     verbose=False,
     _scene_fn=evaluate_scene,
 ):
-    """Evaluate one reconstruction against a target. Uses the fast scene fn by default."""
+    """Evaluate one reconstruction against a target.
+
+    Uses the fast scene fn by default. Reconstructions parsed via this
+    entry point are cached by absolute path (see
+    :func:`_load_pose_dict_cached`) so repeated calls against the same
+    target are essentially free after the first parse. The reference
+    path (``_scene_fn=evaluate_scene_reference``) keeps verbatim
+    pycolmap behaviour and bypasses the cache.
+    """
     if thrs is None:
         thrs = [1, 3, 5]
-    # read model
-    try:
-        rec_input = pycolmap.Reconstruction(model_path)
-    except Exception as e:
-        print(f"Failed to read input model from {model_path}: {e}")
-        return np.array([np.nan] * len(thrs)), (np.nan, np.nan), None
 
-    try:
-        rec_target = pycolmap.Reconstruction(target_path)
-    except Exception as e:
-        print(f"Failed to read target model from {target_path}: {e}")
-        return np.array([np.nan] * len(thrs)), (np.nan, np.nan), None
+    if _scene_fn is evaluate_scene_reference:
+        # Reference parity path: keep posebench-original Reconstruction objects.
+        try:
+            rec_input = pycolmap.Reconstruction(model_path)
+        except Exception as e:
+            print(f"Failed to read input model from {model_path}: {e}")
+            return np.array([np.nan] * len(thrs)), (np.nan, np.nan), None
+        try:
+            rec_target = pycolmap.Reconstruction(target_path)
+        except Exception as e:
+            print(f"Failed to read target model from {target_path}: {e}")
+            return np.array([np.nan] * len(thrs)), (np.nan, np.nan), None
+        df, num_images = _scene_fn(rec_target, rec_input, verbose=verbose)
+    else:
+        # Fast path: small picklable pose dicts, cached by abs path.
+        try:
+            input_pd = _load_pose_dict_cached(os.path.abspath(model_path))
+        except Exception as e:
+            print(f"Failed to read input model from {model_path}: {e}")
+            return np.array([np.nan] * len(thrs)), (np.nan, np.nan), None
+        try:
+            target_pd = _load_pose_dict_cached(os.path.abspath(target_path))
+        except Exception as e:
+            print(f"Failed to read target model from {target_path}: {e}")
+            return np.array([np.nan] * len(thrs)), (np.nan, np.nan), None
+        df, num_images = _scene_fn(target_pd, input_pd, verbose=verbose)
 
-    df, num_images = _scene_fn(rec_target, rec_input, verbose=verbose)
     AUC_score_max = np.array(compute_AUC(df[AUC_col], thrs))
 
     if return_df:
@@ -329,6 +406,22 @@ def eval_colmap_model_reference(*args, **kwargs):
     """Reference (slow) path — kept for the equivalence test only."""
     kwargs["_scene_fn"] = evaluate_scene_reference
     return eval_colmap_model(*args, **kwargs)
+
+
+def _eval_from_pose_dicts(input_pd, target_pd, thrs, return_df, AUC_col, verbose):
+    """Worker entry point: operate on pre-parsed pose dicts, no pycolmap I/O.
+
+    ``input_pd`` / ``target_pd`` may be ``None`` if the corresponding path
+    failed to parse in the parent; in that case we return NaN AUCs to
+    preserve the previous "skip with NaN" semantics.
+    """
+    if input_pd is None or target_pd is None:
+        return np.array([np.nan] * len(thrs)), (np.nan, np.nan), None
+    df, num_images = evaluate_scene(target_pd, input_pd, verbose=verbose)
+    AUC_score_max = np.array(compute_AUC(df[AUC_col], thrs))
+    if return_df:
+        return AUC_score_max, num_images, df
+    return AUC_score_max, num_images, None
 
 
 def eval_colmap_model_all_scenes(
@@ -346,6 +439,14 @@ def eval_colmap_model_all_scenes(
     """Evaluate the model on all the scenes in the data_path using parallel processing.
 
     These must be in COLMAP format. The model is evaluated at the specified thresholds.
+
+    All unique reconstruction paths are parsed **once in the parent process**
+    via :func:`_load_pose_dict_cached`, then the resulting pose dicts are
+    shipped to joblib workers through the call closure. Workers never call
+    ``pycolmap.Reconstruction`` themselves. For multi-call flows like
+    :func:`helpers.benchmark_plotting.read_results` — which evaluate many
+    models against the same target — target paths are cache hits on the
+    second model onwards, cutting per-dataset wall time roughly in half.
     """
     if thrs is None:
         thrs = [0.5, 1, 3, 5, 10]
@@ -382,19 +483,40 @@ def eval_colmap_model_all_scenes(
 
     print(f"Evaluating {len(valid_pairs)} valid scenes.")
 
-    parallel_results = Parallel(n_jobs=n_jobs)(
-        delayed(eval_colmap_model)(
-            input,
-            target,
-            thrs=thrs,
-            return_df=return_df,
-            AUC_col=AUC_col,
-            verbose=verbose,
+    # ---- Parent-side pre-parse ---------------------------------------------
+    # Resolve and de-dup every path we'll touch, then parse each one through
+    # the LRU cache. On a second call with the same target_path, every target
+    # is a cache hit and the only filesystem work is the new input recs.
+    unique_paths = {os.path.abspath(p) for pair in valid_pairs for p in pair}
+    parsed: dict[str, dict | None] = {}
+    for p in unique_paths:
+        try:
+            parsed[p] = _load_pose_dict_cached(p)
+        except Exception as e:
+            print(f"Failed to read reconstruction at {p}: {e}")
+            parsed[p] = None
+
+    work = [
+        (
+            parsed[os.path.abspath(inp)],
+            parsed[os.path.abspath(tgt)],
         )
-        for input, target in tqdm(
-            valid_pairs,
+        for inp, tgt in valid_pairs
+    ]
+
+    parallel_results = Parallel(n_jobs=n_jobs)(
+        delayed(_eval_from_pose_dicts)(
+            input_pd,
+            target_pd,
+            thrs,
+            return_df,
+            AUC_col,
+            verbose,
+        )
+        for input_pd, target_pd in tqdm(
+            work,
             desc="Evaluating scenes",
-            total=len(valid_pairs),
+            total=len(work),
         )
     )
 

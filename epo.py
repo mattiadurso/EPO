@@ -500,8 +500,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             quantile (float, optional): Quantile for evaluating pose changes. Default is 0.95.
             window_pose (int, optional): Window size for pose convergence evaluation. Default is 25.
             window_depth (int, optional): Window size for depth convergence evaluation. Default is 25.
+            window_loss (int, optional): Window size for loss-plateau convergence evaluation. Default is 100.
             convergence_tol_pose (float, optional): Tolerance for pose convergence. Default is 0.5.
             convergence_tol_depth (float, optional): Tolerance for depth convergence. Default is 0.1. Not used when early_stop is False.
+            convergence_tol_loss (float, optional): Relative-loss-change tolerance for early stop when ``early_stop="loss"``. Default is 5e-5.
             early_stop (str, optional): Whether to stop early if depth convergence is reached. Default is 'pose'.
             recompute_viewgraph (bool, optional): Whether to recompute the viewgraph after first convergence. Default is False.
             drop_last (bool, optional): Whether to drop the last batch if smaller than batch_size. Default is False.
@@ -616,7 +618,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             range(self.completed_iterations, self.max_num_iterations),
             total=self.max_num_iterations,
             initial=self.completed_iterations,
-            desc="Optimizing the scene",
+            desc="Optimizing",
         )
         for step in bar:
             self._sync()
