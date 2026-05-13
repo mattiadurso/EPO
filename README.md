@@ -82,6 +82,7 @@ pip install h5py \
             opencv-python \
             pandas \
             pycolmap==3.11 \
+            rerun \
             scikit-learn \
             torch \
             torchvision \

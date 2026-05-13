@@ -10,10 +10,10 @@ import os
 
 import numpy as np
 import pycolmap
-import rerun.blueprint as rrb
 import torch
 
 import rerun as rr
+import rerun.blueprint as rrb
 
 
 def get_frustum_strips(
@@ -68,7 +68,7 @@ def log_reconstruction_rerun(
     if camera_color is None:
         camera_color = [0, 255, 0]
     recon = pycolmap.Reconstruction(path)
-    for img_id, img in recon.images.items():
+    for _img_id, img in recon.images.items():
         # COLMAP stores world-to-cam (R, t)
         # Rerun needs cam-to-world for the transform
         R_gt = torch.from_numpy(img.cam_from_world.rotation.matrix())
@@ -113,12 +113,11 @@ def log_reconstruction_rerun(
 
 
 if __name__ == "__main__":
-
     dataset = "terrasky3D"
     scene = "vienna_state_opera"
 
     gt_path = f"/home/mattia/Desktop/datasets/{dataset}/{scene}/sparse_150"
-    scene_path = f"optimized_reconstruction_GD/{scene}"
+    scene_path = f"optimized_reconstruction/{scene}"
     ba_path = f"benchmarks/vggt_ba/{dataset}/{scene}/sparse"
     ba_ref_path = f"benchmarks/vggt_ba_ref/{dataset}/{scene}/sparse"
 

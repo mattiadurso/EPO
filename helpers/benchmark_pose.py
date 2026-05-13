@@ -66,28 +66,71 @@ def _extract_pose_dict(rec_or_dict):
 
 
 @functools.lru_cache(maxsize=64)
-def _load_pose_dict_cached(abs_path):
-    """Parse a reconstruction at ``abs_path`` once and cache its pose dict.
+def _load_pose_dict_keyed(abs_path, _stat_key):
+    """Inner cached parse keyed on (path, content-mtime).
 
-    The cache is process-local (``functools.lru_cache`` lives in whichever
-    process calls this). For multi-call workflows like
-    :func:`helpers.benchmark_plotting.read_results` — which evaluate the
-    same target reconstruction against many input models —
-    :func:`eval_colmap_model_all_scenes` pre-parses all unique paths in
-    the parent process (populating this cache) and ships the resulting
-    pose dicts to joblib workers via the closure, so workers never call
-    ``pycolmap.Reconstruction`` themselves. Cached entries are small
-    (~30 KB per 150-image scene); ``maxsize=64`` covers typical sweeps.
-
-    Use :func:`clear_reconstruction_cache` to evict.
+    The extra ``_stat_key`` arg is part of the cache key — pass the
+    composite mtime computed by :func:`_recon_stat_key` so a rewrite on
+    disk invalidates automatically. Callers should not use this directly;
+    use :func:`_load_pose_dict_cached`.
     """
     rec = pycolmap.Reconstruction(abs_path)
     return _extract_pose_dict(rec)
 
 
+def _recon_stat_key(abs_path):
+    """Composite mtime across the COLMAP files inside ``abs_path``.
+
+    A directory's own mtime only changes on add/remove, not on in-place
+    rewrites of files inside it. EPO writes to the same ``opt`` folder
+    each ``auc_saving_freq`` step, so we key the cache on the max mtime
+    of the underlying ``cameras|images|points3D.{bin,txt}`` files. Any
+    rewrite bumps the key → cache miss → fresh parse.
+    """
+    candidates = (
+        "cameras.bin",
+        "images.bin",
+        "points3D.bin",
+        "cameras.txt",
+        "images.txt",
+        "points3D.txt",
+    )
+    mt = 0.0
+    for name in candidates:
+        p = os.path.join(abs_path, name)
+        try:
+            mt = max(mt, os.path.getmtime(p))
+        except OSError:
+            continue
+    return mt
+
+
+def _load_pose_dict_cached(abs_path):
+    """Parse a reconstruction at ``abs_path`` once and cache its pose dict.
+
+    The cache is process-local (``functools.lru_cache`` lives in whichever
+    process calls this) and keyed on ``(abs_path, mtime_of_contents)`` —
+    so an in-place rewrite of the underlying COLMAP files (e.g. EPO
+    writing intermediate poses to the same folder every
+    ``auc_saving_freq`` steps) invalidates the cache automatically.
+
+    For multi-call workflows like :func:`helpers.benchmark_plotting.read_results`
+    — which evaluate the same target reconstruction against many input
+    models — :func:`eval_colmap_model_all_scenes` pre-parses all unique
+    paths in the parent process (populating this cache) and ships the
+    resulting pose dicts to joblib workers via the closure, so workers
+    never call ``pycolmap.Reconstruction`` themselves. Cached entries are
+    small (~30 KB per 150-image scene); ``maxsize=64`` covers typical
+    sweeps.
+
+    Use :func:`clear_reconstruction_cache` to evict.
+    """
+    return _load_pose_dict_keyed(abs_path, _recon_stat_key(abs_path))
+
+
 def clear_reconstruction_cache():
     """Drop all cached pose dicts (e.g. after a long-running notebook)."""
-    _load_pose_dict_cached.cache_clear()
+    _load_pose_dict_keyed.cache_clear()
 
 
 # --------------------------------------------------------------------------- #

@@ -28,7 +28,7 @@ extend-exclude = [
     "extractors/DiffusionEdge",
     "extractors/SAM2",
     "extractors/rcf_torch",
-    "optimized_reconstruction_GD",
+    "optimized_reconstruction",
     "benchmarks",
     "benchmarks_full",
     "rerun_video",
