@@ -7,26 +7,13 @@ used in the paper. Imported almost exclusively by ``benchmark.ipynb``.
 
 import json
 import os
-import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from IPython.display import clear_output
 
-# `posebench` is a sibling repo not pip-installable; allow callers to point
-# at it via $EPO_POSEBENCH_PATH. Falls back to the historical hard-coded
-# location for backward compatibility. The import below is the only one that
-# legitimately follows a statement (sys.path mutation), hence the noqa.
-_POSEBENCH_PATH = os.environ.get(
-    "EPO_POSEBENCH_PATH",
-    "/home/mattia/Desktop/Repos/posebench/benchmarks_3D",
-)
-if _POSEBENCH_PATH not in sys.path:
-    sys.path.append(_POSEBENCH_PATH)
-from benchmark_pose import (  # noqa: E402
-    eval_colmap_model_all_scenes,
-)
+from helpers.benchmark_pose import eval_colmap_model_all_scenes
 
 
 def read_results(
@@ -63,7 +50,6 @@ def read_results(
     # Read results
     dfs = {}
     for name in models:
-
         dfs[name] = eval_colmap_model_all_scenes(
             target_path=base_target,
             target_folder=target_folder,
@@ -98,7 +84,6 @@ def read_results(
                         lines = f.readlines()
                     total_timings[f"{model}"][scene] = float(lines[-1].split()[1])
                 except FileNotFoundError:
-
                     total_timings[f"{model}"][scene] = None
 
     df = pd.concat([dfs[key][f"auc@{thr}_{key}"] for key in keys], axis=1)
@@ -205,7 +190,7 @@ def plot_auc5_with_time(df, dataset, models, thr, ignore_time=False):
     # --- 4. Styling & Separator ---
     ax1.set_ylabel(f"AUC@{thr}")
 
-    ax1.set_title(f"AUC@{thr} & Time - {dataset[:1].upper()+dataset[1:]} Dataset")
+    ax1.set_title(f"AUC@{thr} & Time - {dataset[:1].upper() + dataset[1:]} Dataset")
 
     if not ignore_time:
         # Black Dashed Line between AUC rows and Time row
@@ -236,7 +221,6 @@ def plot_auc5_with_time(df, dataset, models, thr, ignore_time=False):
             # Check if the bar is part of the 'Tot Time' group (x-position after separator)
             # and has a non-zero height (we only annotate visible bars)
             if rect.get_x() > sep_x and current_time > 0:
-
                 # Calculate Ratio
                 ratio = current_time / vggt_time
                 ratio_text = f"{ratio:.2f}x"
