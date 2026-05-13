@@ -49,6 +49,7 @@ ignore = [
     "E501",   # line length — Black owns this
     "D100",   # missing module docstring (we have them; pydocstyle is noisy on tests)
     "D104",   # missing __init__ docstring
+    "D107",   # missing docstring in __init__ — class docstring documents args here
     "D203",   # incompatible with D211 (no blank line before class docstring)
     "D213",   # incompatible with D212 (multi-line summary on first line)
     "D205",   # blank line between summary and description — pedantic formatting

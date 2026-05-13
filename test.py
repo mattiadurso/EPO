@@ -72,7 +72,7 @@ for dataset in datasets:
             f"benchmarks/{args.model}_edge_{args.edges}{note}/{dataset}/{scene}/sparse"
         )
 
-        if not os.path.isdir(reconstruction_path):
+        if not os.path.isdir(reconstruction_path) or os.path.isdir(opt):
             print(f"Skipping {reconstruction_path}")
             continue
 
