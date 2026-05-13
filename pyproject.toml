@@ -51,15 +51,16 @@ ignore = [
     "D104",   # missing __init__ docstring
     "D203",   # incompatible with D211 (no blank line before class docstring)
     "D213",   # incompatible with D212 (multi-line summary on first line)
+    "D205",   # blank line between summary and description — pedantic formatting
+    "D415",   # first line ending punctuation — pedantic formatting
+    "B028",   # warnings.warn missing stacklevel — mechanical, not a real bug
+    "PLR0915", # too-many-statements — refactor signal, not a gate; tracked separately
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["D"]                          # tests don't need full pydocstyle
 "modules/__init__.py" = ["F401"]           # re-exports
 "epo_modules/__init__.py" = ["F401"]       # re-exports
-"helpers/triton_ops.py" = ["PLR0915"]      # Triton JIT kernels are necessarily long
-"helpers/benchmark_plotting.py" = ["PLR0915"]  # plot/LaTeX setup is inherently long
-"helpers/benchmark_pose.py" = ["PLR0915"]  # vendored posebench scene-evaluation glue
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
