@@ -46,7 +46,7 @@
 
 | Version | Description |
 |---------|-------------|
-| **1.1** | Fixed a bug in the loss function. Outliers are now handled more robustly, resulting in slightly higher scores. |
+| **1.1** | Fixed a bug in the loss function — outliers are now handled more robustly, resulting in slightly higher scores.<br>Added Triton kernel for point reprojection (~1.5× faster); enable with `backend="triton"`.<br>Added mixed-precision (BF16) support for the pose-refinement MLP via `use_amp=True`.<br>Improved per-stage time logging; can be disabled with `log_granular_time=False`. |
 | **1.0** | Initial release. |
 
 
