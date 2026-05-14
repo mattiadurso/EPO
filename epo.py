@@ -136,6 +136,15 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             is available.
         max_num_iterations: Hard cap on optimization steps.
         verbose: If True, log progress and statistics during the run.
+        log_granular_time: If True (default), record per-stage timings in
+            ``self.timings`` (loading sub-buckets + per-iter accumulators).
+            If False, only ``total_loading``, ``total_optimization`` and
+            ``total`` are populated; every other timing key stays at 0.0 for
+            backward compatibility with downstream consumers
+            (``print_summary``, ``timings.txt``, ``training_logs.json``,
+            ``benchmark_plotting``). Disabling also skips the timing-only
+            ``cuda.synchronize`` calls in the inner loop, removing the
+            per-step CPU↔GPU serialization.
         min_points: Minimum reprojection-inlier count to keep a viewgraph pair.
         sampling_factor: Oversampling factor used when building the viewgraph.
         reprojection_error: Threshold (px) used to filter viewgraph pairs.
@@ -180,6 +189,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         auc_saving_freq=50,
         max_num_iterations=2000,
         verbose=False,
+        log_granular_time=True,
         # viewgraph params
         min_points=750,
         sampling_factor=5,
@@ -194,7 +204,22 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # block (notably the edge-extractor model load) is included in
         # `total_loading`. Closing happens after the trailing GC at the end
         # of __init__.
-        self.timings = {}
+        #
+        # ``log_granular_time=False`` keeps the keys present (as 0.0) so
+        # downstream consumers (``print_summary``, ``timings.txt`` writer,
+        # ``training_logs.json``) keep working unchanged — only the two real
+        # totals (``total_loading``, ``total_optimization``) and the derived
+        # ``total`` get non-zero values.
+        self.log_granular_time = log_granular_time
+        self.timings = {
+            # loading sub-buckets — populated only when granular logging is on
+            "load_images": 0.0,
+            "load_depth_maps": 0.0,
+            "load_poses_and_intrinsics": 0.0,
+            "extract_edges": 0.0,
+            "compute_distance_fields": 0.0,
+            "compute_viewgraph": 0.0,
+        }
         load_start = time.perf_counter()
 
         # fix seed
@@ -321,12 +346,14 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # loads image, coords, scale, hw into self.images[image_name]
         self._load_and_preprocess_images()
         self.num_images = len(self.images)
-        self.timings["load_images"] = time.perf_counter() - s_time
+        if self.log_granular_time:
+            self.timings["load_images"] = time.perf_counter() - s_time
 
         ## Load depth maps
         s_time = time.perf_counter()
         self._load_and_preprocess_depths()
-        self.timings["load_depth_maps"] = time.perf_counter() - s_time
+        if self.log_granular_time:
+            self.timings["load_depth_maps"] = time.perf_counter() - s_time
 
         ## Load poses and intrinsics
         s_time = time.perf_counter()
@@ -334,17 +361,20 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # creating intrinsics such self.intrinsics[cam_id] = CameraModel(...)
         # using image name and camera id/folder str
         self._read_cameras_from_reconstruction()  # into self.images and self.intrinsics
-        self.timings["load_poses_and_intrinsics"] = time.perf_counter() - s_time
+        if self.log_granular_time:
+            self.timings["load_poses_and_intrinsics"] = time.perf_counter() - s_time
 
         ## Extract edges
         s_time = time.perf_counter()
         self._extract_edges()  # into self.images
-        self.timings["extract_edges"] = time.perf_counter() - s_time
+        if self.log_granular_time:
+            self.timings["extract_edges"] = time.perf_counter() - s_time
 
         ## Compute Distance Fields
         s_time = time.perf_counter()
         self._compute_distance_fields()  # into self.images
-        self.timings["compute_distance_fields"] = time.perf_counter() - s_time
+        if self.log_granular_time:
+            self.timings["compute_distance_fields"] = time.perf_counter() - s_time
 
         ## Viewgraph from frustums
         s_time = time.perf_counter()
@@ -355,7 +385,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             sampling_factor=sampling_factor,
             reprojection_error=reprojection_error,
         )
-        self.timings["compute_viewgraph"] = time.perf_counter() - s_time
+        if self.log_granular_time:
+            self.timings["compute_viewgraph"] = time.perf_counter() - s_time
 
         ## Prepare batched parameters modules that do not need to be optimized
         self.image_id_map = {}
@@ -474,7 +505,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
     def forward(
         self,
-        batch_size=256,
+        batch_size=128,
         quantile=0.95,
         window_pose=25,
         window_depth=50,
@@ -496,7 +527,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         """Main optimization loop.
 
         Args:
-            batch_size (int, optional): Number of viewgraph pairs to process per batch. Default is 256.
+            batch_size (int, optional): Number of viewgraph pairs to process per batch. Use large value GPU with more memory bandwidth. Default is 128 on a RTX 4090.
             quantile (float, optional): Quantile for evaluating pose changes. Default is 0.95.
             window_pose (int, optional): Window size for pose convergence evaluation. Default is 25.
             window_depth (int, optional): Window size for depth convergence evaluation. Default is 25.
@@ -548,6 +579,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             self.timings[k] = 0.0
         self.timings.pop("pose_convergence_time", None)
         self.timings.pop("depth_convergence_time", None)
+
+        # Snapshot whether per-stage timings are recorded for this run.
+        # Re-reading ``self.log_granular_time`` later (e.g. mid-iteration) is
+        # fine too, but binding here makes the gating obvious where it matters.
+        log_t = self.log_granular_time
 
         forward_start = time.perf_counter()
 
@@ -606,7 +642,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # init, GT/BA loading for visualization, the verbose banner). It is
         # NOT per-iteration logging — billing it there inflates the
         # AVG/iter column.
-        self.timings["setup_visualization"] = time.perf_counter() - forward_start
+        if log_t:
+            self.timings["setup_visualization"] = time.perf_counter() - forward_start
 
         # `optimization_start` anchors per-call totals and convergence
         # times to the actual loop, independent of the prologue.
@@ -621,7 +658,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             desc="Optimizing",
         )
         for step in bar:
-            self._sync()
+            self._sync_for_timing()
             t_pre = time.perf_counter()
 
             # Initialize optimizer gradients for all optimizers
@@ -638,8 +675,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             # we read the clock — without this, the kernel-launch overhead
             # is all we'd be measuring (and the real cost spills into
             # whichever later stage triggers the first .item()).
-            self._sync()
-            self.timings["step_pre_computation"] += time.perf_counter() - t_pre
+            # Skipped when granular logging is off — the stage clock is never
+            # read, and the sync was only ever there to make it accurate.
+            self._sync_for_timing()
+            if log_t:
+                self.timings["step_pre_computation"] += time.perf_counter() - t_pre
 
             # Compute residuals
             residuals, sampled_viewgraphs = self.compute_forward_step(
@@ -652,8 +692,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             loss = self.compute_batched_loss(residuals, sampled_viewgraphs, debug=debug)
             s_time = time.perf_counter()
             loss.backward()
-            self._sync()  # backward() returns before the GPU is done
-            self.timings["gradients_computation"] += time.perf_counter() - s_time
+            self._sync_for_timing()  # backward() returns before the GPU is done
+            if log_t:
+                self.timings["gradients_computation"] += time.perf_counter() - s_time
 
             self.optimizer_and_scheduler_step()
 
@@ -716,7 +757,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                             rr.Scalars(self.auc_list["auc"][th][-1]),
                         )
 
-            self.timings["logging"] += time.perf_counter() - logging_time_start
+            if log_t:
+                self.timings["logging"] += time.perf_counter() - logging_time_start
             # ============================================================
             # Early stopping
             # ============================================================
@@ -745,18 +787,20 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 )
                 if mlp_pose_convergence:
                     self.mlp_pose_convergence = True
-                    self.timings["pose_convergence_time"] = (
-                        time.perf_counter() - optimization_start
-                    )
+                    if log_t:
+                        self.timings["pose_convergence_time"] = (
+                            time.perf_counter() - optimization_start
+                        )
                     if self.verbose:
                         print(f"Pose convergence reached at step {step}.")
 
                     # If not optimizing depth, mark it as converged immediately
                     if not self.grad_z:
                         self.optim_convergence = True
-                        self.timings["depth_convergence_time"] = (
-                            time.perf_counter() - optimization_start
-                        )
+                        if log_t:
+                            self.timings["depth_convergence_time"] = (
+                                time.perf_counter() - optimization_start
+                            )
 
             elif self.mlp_pose_convergence:
                 if early_stop == "pose":
@@ -781,7 +825,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     # nothing to do in this case
                     pass
 
-            self.timings["early_stop_check"] += time.perf_counter() - early_stop_start
+            if log_t:
+                self.timings["early_stop_check"] += (
+                    time.perf_counter() - early_stop_start
+                )
 
             if (
                 self.mlp_pose_convergence
@@ -812,14 +859,20 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # accumulators before so we can attribute the delta to its own
         # `mre` key — otherwise the per-iter averages get contaminated and
         # the percentage column can exceed 100%.
-        _mre_pbi = self.timings["prepare_batched_inputs"]
-        _mre_fp = self.timings["forward_pass"]
-        _mre_t0 = time.perf_counter()
-        self.compute_mre()
-        self._sync()
-        self.timings["mre"] = time.perf_counter() - _mre_t0
-        self.timings["prepare_batched_inputs"] = _mre_pbi
-        self.timings["forward_pass"] = _mre_fp
+        # With granular logging off, none of those keys are populated, so we
+        # skip the snapshot/restore + the dedicated `mre` measurement entirely
+        # and just run the side-effect call.
+        if log_t:
+            _mre_pbi = self.timings["prepare_batched_inputs"]
+            _mre_fp = self.timings["forward_pass"]
+            _mre_t0 = time.perf_counter()
+            self.compute_mre()
+            self._sync()
+            self.timings["mre"] = time.perf_counter() - _mre_t0
+            self.timings["prepare_batched_inputs"] = _mre_pbi
+            self.timings["forward_pass"] = _mre_fp
+        else:
+            self.compute_mre()
         self.print_summary() if self.verbose else print("=" * 70, end="\n\n")
 
     ### Forward and backward helpers ###
@@ -902,9 +955,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             self.intrinsics.optimizer_and_scheduler_step()
 
         # Adam moment updates etc. are CUDA-async; sync before reading the
-        # clock so this stage gets the GPU time it actually used.
-        self._sync()
-        self.timings["parameters_update"] += time.perf_counter() - s_time
+        # clock so this stage gets the GPU time it actually used. Skipped when
+        # the clock is never read.
+        self._sync_for_timing()
+        if self.log_granular_time:
+            self.timings["parameters_update"] += time.perf_counter() - s_time
 
     def collect_lrs(self, step):
         """Collect learning rates for all optimizers."""
@@ -1072,13 +1127,14 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # i might want to process batches of same size and drop last batch
         for sampled_viewgraph in sampled_viewgraphs:
             # prepare batched inputs
-            self._sync()
+            self._sync_for_timing()
             s_time = time.perf_counter()
             batch, pad_masks, dt_fields_src, dt_indices = self.create_batched_inputs(
                 sampled_viewgraph
             )
-            self._sync()
-            self.timings["prepare_batched_inputs"] += time.perf_counter() - s_time
+            self._sync_for_timing()
+            if self.log_granular_time:
+                self.timings["prepare_batched_inputs"] += time.perf_counter() - s_time
 
             # actual inference
             s_time = time.perf_counter()
@@ -1117,9 +1173,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
             # `project_and_sample_logic` and the chunked Huber reduce are
             # all CUDA-async; without this sync we'd just measure how fast
-            # the CPU could enqueue the kernels.
-            self._sync()
-            self.timings["forward_pass"] += time.perf_counter() - s_time
+            # the CPU could enqueue the kernels. Skipped when the clock is
+            # never read — letting the GPU stay pipelined across iterations.
+            self._sync_for_timing()
+            if self.log_granular_time:
+                self.timings["forward_pass"] += time.perf_counter() - s_time
 
         # concatenate all collected batch results
         residuals = torch.cat(residuals_list, dim=0)  # (num_pairs,)
@@ -1137,7 +1195,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         over pairs. The ``delta`` argument is kept for API compatibility but
         is no longer used here -- pass it through ``compute_forward_step``.
         """
-        self._sync()
+        self._sync_for_timing()
         s_time = time.perf_counter()
 
         if residuals.numel() == 0:
@@ -1165,8 +1223,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # Mean over pairs
         loss = pair_losses.mean()
 
-        self._sync()
-        self.timings["loss_computation"] += time.perf_counter() - s_time
+        self._sync_for_timing()
+        if self.log_granular_time:
+            self.timings["loss_computation"] += time.perf_counter() - s_time
 
         return loss
 

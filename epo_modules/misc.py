@@ -47,6 +47,20 @@ class MiscModule:
         if torch.cuda.is_available() and torch.device(self.device).type == "cuda":
             torch.cuda.synchronize()
 
+    def _sync_for_timing(self) -> None:
+        """Sync only when granular timing is enabled.
+
+        Timing-only ``_sync()`` calls exist solely so per-stage clocks capture
+        GPU runtime instead of just kernel-launch overhead. When granular
+        logging is disabled, those stage clocks are never read, so we skip the
+        sync — letting the GPU stay pipelined and removing per-step
+        CPU↔GPU serialization. Syncs that gate the real totals
+        (``total_loading``, ``total_optimization``) call ``_sync()`` directly
+        and are unaffected.
+        """
+        if getattr(self, "log_granular_time", True):
+            self._sync()
+
     # ------------------------------------------------------------------
     # Summary printing
     # ------------------------------------------------------------------
@@ -72,7 +86,7 @@ class MiscModule:
             s_t = _fmt_seconds(secs)
             perc_s = f"{perc:5.1f}%" if perc is not None else ""
             avg_s = f"{_fmt_seconds(avg)}/it" if avg is not None else ""
-            return f"{lbl:<{KW}}" f"{s_t:>{VW}}" f"{perc_s:>{PW}}" f"{avg_s:>{AW}}"
+            return f"{lbl:<{KW}}{s_t:>{VW}}{perc_s:>{PW}}{avg_s:>{AW}}"
 
         def pct(val, base):
             return (val / base * 100) if base > 0 else 0.0
@@ -123,12 +137,7 @@ class MiscModule:
         print(thin)
 
         # Header
-        print(
-            f"{'stage':<{KW}}"
-            f"{'total':>{VW}}"
-            f"{'% opt':>{PW}}"
-            f"{'avg / iter':>{AW}}"
-        )
+        print(f"{'stage':<{KW}}{'total':>{VW}}{'% opt':>{PW}}{'avg / iter':>{AW}}")
         print(thin)
 
         per_iter_keys = [
