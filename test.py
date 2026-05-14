@@ -99,7 +99,7 @@ for dataset in datasets:
             #     "sigma": 2,
             # },
             max_edges_points=12_288,
-            max_viewgraph_pairs=4_096,
+            max_viewgraph_pairs=2048,
             single_camera_per_folder=True,
             max_num_iterations=args.max_iterations,
             verbose=False,

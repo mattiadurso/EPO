@@ -102,6 +102,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         max_edges_points: Maximum edge samples per image (memory bound).
         max_viewgraph_pairs: Maximum viewgraph pairs processed per iteration;
             larger viewgraphs are resampled each step (mini-batching).
+            Increase for slightly better performance.
         matcher_type: ``"exhaustive"`` or ``"sequential"``.
         sequential_matcher_window: Window size used when
             ``matcher_type == "sequential"``.
@@ -536,7 +537,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             convergence_tol_depth (float, optional): Tolerance for depth convergence. Default is 0.1. Not used when early_stop is False.
             convergence_tol_loss (float, optional): Relative-loss-change tolerance for early stop when ``early_stop="loss"``. Default is 5e-5.
             early_stop (str, optional): Whether to stop early if depth convergence is reached. Default is 'pose'.
-            recompute_viewgraph (bool, optional): Whether to recompute the viewgraph after first convergence. Default is False.
             drop_last (bool, optional): Whether to drop the last batch if smaller than batch_size. Default is False.
             debug (bool, optional): Whether to enable debug mode. Default is False.
             gt_path (str, optional): Path to the ground truth data. Default is None.
@@ -1100,7 +1100,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         """
         # reduce viewgraph if too large
         if len(sampled_viewgraph) > self.max_viewgraph_pairs:
-            # indices = torch.randperm(len(sampled_viewgraph))[: self.max_viewgraph_pairs]
             indices = torch.randperm(len(sampled_viewgraph), generator=self.rng_cpu)[
                 : self.max_viewgraph_pairs
             ]
