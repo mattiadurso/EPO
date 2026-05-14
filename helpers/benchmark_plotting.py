@@ -11,7 +11,8 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from IPython.display import clear_output
+import torch
+from IPython.display import clear_output, display
 
 from helpers.benchmark_pose import eval_colmap_model_all_scenes
 
@@ -79,12 +80,21 @@ def read_results(
                 continue
             if scene not in total_timings[f"{model}"]:
                 total_timings[f"{model}"][scene] = None
-                try:
-                    with open(f"{recon_path}/sparse/timings.txt") as f:
-                        lines = f.readlines()
-                    total_timings[f"{model}"][scene] = float(lines[-1].split()[1])
-                except FileNotFoundError:
-                    total_timings[f"{model}"][scene] = None
+                if "gluemap" in model:
+                    try:
+                        d = torch.load(
+                            f"{recon_path}/pipeline_timing.pth", weights_only=False
+                        )
+                        total_timings[f"{model}"][scene] = d["total_pipeline"]
+                    except (FileNotFoundError, KeyError):
+                        pass
+                else:
+                    try:
+                        with open(f"{recon_path}/sparse/timings.txt") as f:
+                            lines = f.readlines()
+                        total_timings[f"{model}"][scene] = float(lines[-1].split()[1])
+                    except FileNotFoundError:
+                        pass
 
     df = pd.concat([dfs[key][f"auc@{thr}_{key}"] for key in keys], axis=1)
 
@@ -245,12 +255,10 @@ def plot_auc5_with_time(df, dataset, models, thr, ignore_time=False):
     if mean_idx is not None:
         # ax1 patches are grouped by column, so we need to find bars at mean_idx position
         num_rows = len(df_combined.index)
-        num_cols = len(df_combined.columns)
 
         for i, rect in enumerate(ax1.patches):
             # Calculate which row this bar belongs to
             row_idx = i % num_rows
-            col_idx = i // num_rows
 
             if row_idx == mean_idx:
                 auc_value = rect.get_height()
