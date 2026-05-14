@@ -102,12 +102,13 @@ for dataset in datasets:
             max_viewgraph_pairs=4_096,
             single_camera_per_folder=True,
             max_num_iterations=args.max_iterations,
-            verbose=True,
+            verbose=False,
             # Viewgraph parameters
             min_points=750,
             sampling_factor=5,
             reprojection_error=3,
             auc_saving_freq=100,
+            log_granular_time=False,
             use_amp=True,  # Whether to run the pose-refinement MLP's linear layers in BF16 via torch.autocast. Gram-Schmidt stays in FP32 (precision-sensitive). No GradScaler needed for BF16. Default False (FP32 throughout — historical behaviour).
             backend="triton",  # fused Triton kernels for both project+sample and unproject (fwd + analytical bwd). Much faster than the PyTorch path on large viewgraphs / many edges.
         )
