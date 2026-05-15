@@ -35,7 +35,7 @@ with open("benchmarks/paths.json") as f:
     paths_cfg = json.load(f)
 
 if args.dataset == "all":
-    datasets = ["mipnerf360", "terrasky3D", "scannetpp"]
+    datasets = ["mipnerf360", "terrasky3D", "scannetpp", "imc"]
 else:
     datasets = [args.dataset]
 
@@ -99,7 +99,7 @@ for dataset in datasets:
             #     "sigma": 2,
             # },
             max_edges_points=12_288,
-            max_viewgraph_pairs=2048,
+            max_viewgraph_pairs=1024,
             single_camera_per_folder=True,
             max_num_iterations=args.max_iterations,
             verbose=False,
