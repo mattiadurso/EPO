@@ -686,6 +686,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 self.viewgraph_ids,
                 batch_size=batch_size,
                 drop_last=drop_last,
+                step=step,
             )
 
             # Compute loss
@@ -1091,13 +1092,25 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         batch_size=1024,
         drop_last=True,
         huber_delta=1.0,
-        clamp_max=10.0,
+        clamp_start=10.0,
+        clamp_end=6.0,
+        clamp_warmup_iters=1000,
+        step=None,
     ):
         """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss.
 
         ``huber_delta`` and ``clamp_max`` are forwarded to ``compute_chunk_loss_logic``
         so robustification happens per-edge before the per-pair mean.
+
+        ``clamp_max`` is annealed linearly from ``clamp_start`` to ``clamp_end``
+        over ``clamp_warmup_iters``. When ``step`` is ``None`` (e.g. eval),
+        the end clamp is used.
         """
+        if step is None or step >= clamp_warmup_iters:
+            clamp_max = clamp_end
+        else:
+            progress = step / clamp_warmup_iters
+            clamp_max = clamp_start + (clamp_end - clamp_start) * progress
         # reduce viewgraph if too large
         if len(sampled_viewgraph) > self.max_viewgraph_pairs:
             indices = torch.randperm(len(sampled_viewgraph), generator=self.rng_cpu)[
