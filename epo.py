@@ -43,7 +43,7 @@ from helpers.reprojection import (
     project_and_sample_logic,
     unproject_2D_to_world,
 )
-from losses.dt_loss import compute_chunk_loss_logic, compute_distance_field_cv2
+from losses.dt_loss import compute_chunk_loss_logic, compute_distance_field
 from modules import BaseModule, CameraModule, DepthModule, PoseModule
 from modules.stopping_criterion import evaluate_pose_changes
 
@@ -365,6 +365,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         if self.log_granular_time:
             self.timings["load_poses_and_intrinsics"] = time.perf_counter() - s_time
 
+        ##==============  Loadings end here ==============
+
         ## Extract edges
         s_time = time.perf_counter()
         self._extract_edges()  # into self.images
@@ -482,7 +484,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
         # # At this point I might get rid of rgb images to save memory as not needed for edge loss
         # for image_name in self.images.keys():
-        #     self.images[image_name].pop("image")
+        #     self.images[image_name].pop("image") # no colors in point cloud tho
         #     self.images[image_name].pop("depth")
         #     self.images[image_name].pop("edges_map")
 
@@ -1659,7 +1661,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         dt_fields_shapes = []
         for image_name in self.images.keys():
             edges_map = self.images[image_name]["edges_map"]
-            dt_field = compute_distance_field_cv2(
+            dt_field = compute_distance_field(
                 edges_map,
                 device=self.device,
             )

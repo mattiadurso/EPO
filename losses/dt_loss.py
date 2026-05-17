@@ -1,24 +1,40 @@
 """Edge-distance-field loss building blocks.
 
-Provides two distance-field implementations (a fast OpenCV path and a pure
-PyTorch path), a bilinear sampler that reads the field at floating-point
-edge coordinates, and the per-chunk residual reduction used by the EPO
-forward pass (per-edge clamp → Huber → per-direction mean).
+Provides the exact Euclidean distance-field implementation (Felzenszwalb-
+Huttenlocher via Triton, with a lazy OpenCV fallback for non-CUDA paths or
+kernel failures), a quadratic torch reference, a bilinear sampler that reads
+the field at floating-point edge coordinates, and the per-chunk residual
+reduction used by the EPO forward pass (per-edge clamp → Huber → per-direction
+mean).
 """
 
-import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 
+# Try to load the Triton fast path at import time. If Triton (or CUDA) isn't
+# available, ``_distance_transform_l2_triton`` stays ``None`` and the cv2
+# fallback is used unconditionally.
+try:
+    from helpers.triton_ops import (
+        distance_transform_l2_triton as _distance_transform_l2_triton,
+    )
+except Exception:
+    _distance_transform_l2_triton = None
+
 
 @torch.no_grad()
-def compute_distance_field_cv2(
+def compute_distance_field(
     edges_map: torch.Tensor,
     device="cuda",
     dtype=torch.float32,
 ):
-    """Compute the Euclidean distance field from edges coordinates using OpenCV.
+    """Exact Euclidean distance field via Felzenszwalb-Huttenlocher.
+
+    Primary path is a Triton kernel; on non-CUDA tensors, missing Triton
+    install, or kernel failure it falls back to
+    ``cv2.distanceTransform(mask, DIST_L2, DIST_MASK_PRECISE)``
+    (cv2 is imported lazily so it's only required on the fallback path).
 
     Args:
         edges_map: Tensor of shape (H, W). Values > 0 are treated as edges.
@@ -28,25 +44,29 @@ def compute_distance_field_cv2(
     Returns:
         field: Distance field of shape (H, W).
     """
-    # 1. Move to CPU and convert to Numpy
+    if _distance_transform_l2_triton is not None and edges_map.is_cuda:
+        try:
+            field = _distance_transform_l2_triton(edges_map)
+            return field.to(device=device, dtype=dtype)
+        except Exception:
+            pass  # fall through to cv2 path
+
+    return _compute_distance_field_cv2_fallback(edges_map, device=device, dtype=dtype)
+
+
+def _compute_distance_field_cv2_fallback(
+    edges_map: torch.Tensor,
+    device="cuda",
+    dtype=torch.float32,
+):
+    """Lazy cv2 fallback. Only imports cv2 when actually called."""
+    import cv2  # lazy import — keeps cv2 off the import graph for the fast path
+
     edges_np = edges_map.detach().cpu().float().numpy()
-
-    # 2. Prepare Binary Mask for OpenCV
-    # Your logic: 1 (or >0) is an edge.
-    # OpenCV logic: 0 is the target (distance 0), non-zero is the background.
-    # We invert the logic: Set edges to 0, background to 1.
+    # cv2 convention: 0 is the target (distance 0), non-zero is background.
     mask = np.where(edges_np > 0, 0, 1).astype(np.uint8)
-
-    # 3. Run Distance Transform
-    # cv2.DIST_L2: Euclidean distance.
-    # cv2.DIST_MASK_PRECISE: Calculates exact geometric distance (matches torch.cdist).
-    # If you used '5' or '3', it would be an approximation and fail torch.allclose().
     field_np = cv2.distanceTransform(mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-
-    # 4. Convert back to Torch
-    field = torch.from_numpy(field_np).to(device=device, dtype=dtype)
-
-    return field
+    return torch.from_numpy(field_np).to(device=device, dtype=dtype)
 
 
 # this has 1:1 correspondence with cv2 version, but is slower since it is quadratic
@@ -61,6 +81,7 @@ def compute_distance_field_torch(
     Args:
         edges_map: Tensor of shape (H, W) with binary edge maps.
         device: Device to use for computation.
+        dtype: Data type for the output distance field (e.g., torch.float32).
 
     Returns:
         field: Distance field of shape (H, W) showing distance from each pixel to nearest edge.
