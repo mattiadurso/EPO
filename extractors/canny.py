@@ -78,6 +78,8 @@ class CannyEdgeDetector(nn.Module):
             + "or (C, H, W)"
         )
 
-        images = images.to(self.device).float()
-        _, edges_binary = self.canny(images)
+        images = images.to(self.device)
+        images = images if images.is_floating_point() else images.float()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _, edges_binary = self.canny(images)
         return edges_binary
