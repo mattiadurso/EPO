@@ -306,7 +306,8 @@ class ReconstructAndVizModule:
             dbscan_min_samples: DBSCAN ``min_samples`` (core-point threshold).
             gt_path: If given, align the exported reconstruction to this GT
                 model with ``colmap model_aligner``.
-            save_depth: If True, write per-image refined depth maps as ``.h5``.
+            save_depth: If True, write refined depth maps as a single
+                ``depths.pth`` dict (``{image_stem: {"depth": tensor}}``).
         """
         os.system(f"rm -rf {output_path}/*")
         recon = build_reconstruction(
@@ -334,10 +335,8 @@ class ReconstructAndVizModule:
         if save_depth:
             if self.verbose:
                 print("Saving depth maps...")
-            # saving depth in same format as input
-            import h5py
 
-            os.makedirs(os.path.join(output_path, "depth"), exist_ok=True)
+            depths_out = {}
             for image_name, id in self.image_id_map.items():
                 # read depth, edges, padding and images size
                 depth = self.sampled_depth.get_parameters([id]).detach().cpu().squeeze()
@@ -358,15 +357,9 @@ class ReconstructAndVizModule:
 
                 # populate hw_array at edges location with depth values
                 hw_array[edges[:, 1], edges[:, 0]] = depth
-                # create cam folder
-                cam = image_name.split("/")[0]
-                os.makedirs(os.path.join(output_path, "depth", cam), exist_ok=True)
-                # saving depth
-                image_name = image_name.split(".")[0] + ".h5"
-                with h5py.File(
-                    os.path.join(output_path, "depth", image_name), "w"
-                ) as f:
-                    f.create_dataset("depth", data=hw_array.numpy(), compression="gzip")
+                depths_out[image_name.split(".")[0]] = {"depth": hw_array}
+
+            torch.save(depths_out, os.path.join(output_path, "depths.pth"))
 
         # Keep `total` consistent whether or not `forward()` has been called
         # (e.g. if print_summary is skipped).  benchmark_plotting.py reads

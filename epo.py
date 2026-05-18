@@ -82,7 +82,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         reconstruction_path: Path to the COLMAP reconstruction folder
             (``cameras.bin``, ``images.bin``, ``points3D.bin``).
         images_path: Path to the folder containing the input images.
-        depths_path: Path to the folder containing dense depth maps (``.h5``).
+        depths_path: Path to ``depths.pth`` (or a folder containing it), a
+            single dict mapping image stem → ``{"depth": tensor, optional
+            "confidence": tensor}``.
         viewgraph_path: Optional precomputed viewgraph file. If ``None`` the
             viewgraph is built from frustum overlap.
         unreliable_area_masks_path: Optional folder with PNG masks marking

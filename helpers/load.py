@@ -11,7 +11,6 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import h5py
 import numpy as np
 import pycolmap
 import torch
@@ -233,29 +232,32 @@ def load_and_preprocess_images(
 
 
 def _process_single_depth(
-    depth_path, image_name, image_info, target_size, load_with_pad
+    depth_data, image_name, image_info, target_size, load_with_pad
 ):
     """Helper function to process a single depth map.
 
-    Loads a depth map, crops it to match the original image dimensions (center crop
-    if depth is larger), then resizes it to match the preprocessed image exactly.
+    Looks the entry up in ``depth_data`` (a dict keyed by image stem), crops to
+    match the original image dimensions (center crop if depth is larger), then
+    resizes it to match the preprocessed image exactly.
     """
-    # Load depth from h5 file
-    depth_file = Path(depth_path) / (image_name.split(".")[0] + ".h5")
-
-    if not depth_file.exists():
+    entry = depth_data.get(image_name.split(".")[0])
+    if entry is None:
         return image_name, None, None
 
-    # Use a context manager so file handles are released promptly — important
-    # now that multiple threads load depths in parallel.
-    with h5py.File(depth_file, "r") as h5:
-        depth = h5["depth"][()]
-        confidence = h5["confidence"][()] if "confidence" in h5.keys() else None
+    depth_tensor = entry["depth"]
+    if not torch.is_tensor(depth_tensor):
+        depth_tensor = torch.as_tensor(depth_tensor)
+    # Ensure (1, 1, H, W) for F.pad / F.interpolate.
+    while depth_tensor.ndim < 4:
+        depth_tensor = depth_tensor.unsqueeze(0)
 
-    # Convert to tensor and add batch+channel dimensions
-    depth_tensor = torch.tensor(depth).unsqueeze(0).unsqueeze(0)
+    confidence = entry.get("confidence")
     if confidence is not None:
-        confidence_tensor = torch.tensor(confidence).unsqueeze(0).unsqueeze(0)
+        confidence_tensor = (
+            confidence if torch.is_tensor(confidence) else torch.as_tensor(confidence)
+        )
+        while confidence_tensor.ndim < 4:
+            confidence_tensor = confidence_tensor.unsqueeze(0)
     else:
         confidence_tensor = None
 
@@ -376,7 +378,9 @@ def load_and_preprocess_depths(
     Updates images_dict with depth information.
 
     Args:
-        depth_path (str): Path to directory containing depth maps (.h5 files)
+        depth_path (str): Path to a ``.pth`` file (or directory containing
+            ``depths.pth``) mapping image stem → ``{"depth": tensor,
+            optional "confidence": tensor}``.
         images_dict (dict): Dictionary mapping image names to image data
         target_size (int, optional): Target size for both width and height. Defaults to 518.
         max_workers (int, optional): Maximum number of threads for parallel processing.
@@ -389,24 +393,28 @@ def load_and_preprocess_depths(
         dict: Updated images_dict with depth maps added
     """
     depth_path = Path(depth_path)
+    if depth_path.is_dir():
+        depth_file = depth_path / "depths.pth"
+    else:
+        depth_file = depth_path
 
-    if not depth_path.exists():
+    if not depth_file.exists():
         warnings.warn(
-            f"Depth path {depth_path} does not exist. Skipping depth loading.",
+            f"Depth file {depth_file} does not exist. Skipping depth loading.",
             stacklevel=2,
         )
         return images_dict
 
-    # h5py's *thread-safety* concern is about sharing a single file handle
-    # across threads. ``_process_single_depth`` opens its own ``h5py.File``
-    # per call ⇒ different threads ⇒ different handles ⇒ safe. The work is a
-    # mix of disk I/O + per-tensor crop/resize, both of which release the GIL,
-    # so threading does help (especially when the OS page cache is cold).
+    # Single read up front; downstream workers only touch the in-memory dict,
+    # so no file-handle / threading concerns. Crop + resize still release the
+    # GIL via PyTorch ops, so threading remains worthwhile.
+    depth_data = torch.load(depth_file, map_location="cpu", weights_only=False)
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(
                 _process_single_depth,
-                depth_path,
+                depth_data,
                 image_name,
                 images_dict[image_name],
                 target_size,
