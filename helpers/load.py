@@ -11,21 +11,20 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import cv2
 import h5py
 import numpy as np
 import pycolmap
 import torch
 import torch.nn.functional as F
 from PIL import Image  # fallback only — kept for unusual formats / RGBA blends
-from torchvision import transforms as TF  # noqa: F401 (kept for downstream)
+from torchvision.io import ImageReadMode, read_image
+from torchvision.transforms.v2 import InterpolationMode
+from torchvision.transforms.v2.functional import resize as tv_resize
 
-# cv2 ships with libjpeg-turbo and a parallel JPEG decoder; PIL is roughly
-# 2× slower at our typical 4K mipnerf360 sizes. We keep PIL as a fallback for
-# anything cv2.imread refuses (e.g. some 16-bit PNGs or images on a remote FS).
-# Disable cv2's own thread pool — we already parallelise at the file level
-# with ThreadPoolExecutor; nested pools just thrash schedulers.
-cv2.setNumThreads(0)
+# torchvision.io uses libjpeg-turbo + libpng under the hood — same decoders
+# as cv2 — and returns CHW uint8 tensors directly (no ndarray → permute hop).
+# PIL stays as the fallback for anything torchvision refuses (16-bit PNGs,
+# exotic formats, RGBA we want to explicitly alpha-blend).
 
 
 ### Loading and preprocessing images and depths
@@ -60,54 +59,56 @@ def find_images(images_path: str, verbose: bool = False) -> list[str]:
     return image_paths
 
 
-def _decode_image_rgb_uint8(image_path):
-    """Decode an image into an HWC RGB uint8 ndarray.
+def _decode_via_pil(image_path: str) -> torch.Tensor:
+    """PIL fallback path: decode → RGB (alpha-composited onto white) → CHW uint8."""
+    img = Image.open(image_path)
+    if img.mode == "RGBA":
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(bg, img)
+    img = img.convert("RGB")
+    arr = np.asarray(img)  # HWC uint8 RGB
+    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
-    Tries cv2 first (libjpeg-turbo, GIL-free, ~2x faster than PIL on our
-    typical 4K mipnerf360 JPEGs). Falls back to PIL for anything cv2 returns
-    ``None`` for, or for images with an alpha channel — cv2's loader does
-    not blend, and we want exact parity with the historic PIL pre-blend.
+
+def _decode_image_rgb_chw_uint8(image_path: str) -> torch.Tensor:
+    """Decode an image into a CHW RGB uint8 tensor.
+
+    Primary path uses ``torchvision.io.read_image`` (libjpeg-turbo + libpng,
+    GIL-released during decode). PIL is the fallback for anything torchvision
+    refuses (16-bit PNGs, exotic formats) or for channel counts we want to
+    handle explicitly (gray+alpha).
     """
-    bgr = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
-    if bgr is None:
-        # Anything cv2 refuses — fall back to PIL.
-        img = Image.open(image_path)
-        if img.mode == "RGBA":
-            bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            img = Image.alpha_composite(bg, img)
-        img = img.convert("RGB")
-        return np.asarray(img)
+    try:
+        img = read_image(image_path, mode=ImageReadMode.UNCHANGED)
+    except RuntimeError:
+        return _decode_via_pil(image_path)
 
-    # cv2 returned an array — normalise to HWC RGB uint8.
-    if bgr.ndim == 2:
-        # Grayscale → RGB
-        return cv2.cvtColor(bgr, cv2.COLOR_GRAY2RGB)
-    if bgr.shape[2] == 4:
-        # BGRA → blend alpha onto white, then drop alpha (matches old PIL path).
-        bgr_f = bgr[:, :, :3].astype(np.float32)
-        a = bgr[:, :, 3:4].astype(np.float32) / 255.0
-        blended = bgr_f * a + 255.0 * (1.0 - a)
-        bgr = np.clip(blended, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    c = img.shape[0]
+    if c == 1:
+        # Grayscale → RGB by repeating the channel.
+        return img.expand(3, -1, -1).contiguous()
+    if c == 3:
+        # torchvision returns RGB (not BGR), so no channel swap needed.
+        return img
+    if c == 4:
+        # RGBA → blend onto white, then drop alpha (matches historic PIL path).
+        rgb = img[:3].float()
+        a = img[3:4].float() / 255.0
+        blended = rgb * a + 255.0 * (1.0 - a)
+        return blended.clamp_(0, 255).to(torch.uint8)
+    # 2-channel (gray+alpha) or anything else: defer to PIL.
+    return _decode_via_pil(image_path)
 
 
-def _process_single_image(
-    image_path, images_path, target_size, to_tensor, load_with_pad
-):
+def _process_single_image(image_path, images_path, target_size, load_with_pad):
     """Helper function to process a single image."""
-    # `to_tensor` (torchvision ToTensor) is kept on the signature for backward
-    # compatibility; cv2 lets us go straight from ndarray to a permuted tensor
-    # without an extra copy, so we don't use it on the cv2 path.
-    del to_tensor
+    rgb = _decode_image_rgb_chw_uint8(image_path)  # CHW uint8
+    height, width = rgb.shape[-2:]
 
-    rgb = _decode_image_rgb_uint8(image_path)  # HWC uint8
-    height, width = rgb.shape[:2]
-
-    # Choose the cv2 interpolator the same way PIL's BICUBIC behaves: pixel-area
-    # integration when downsampling (proper anti-aliasing, much closer to PIL's
-    # output — max|Δ| ~ 0.13 vs ~ 0.58 for INTER_CUBIC on 8× downsample), cubic
-    # when upsampling.
-    interp = cv2.INTER_AREA if target_size < max(width, height) else cv2.INTER_CUBIC
+    # Bicubic + antialias matches PIL's BICUBIC, which is what we ultimately
+    # want parity with. Works for both up- and downsample (antialias kicks in
+    # only when downsampling).
+    interp = InterpolationMode.BICUBIC
 
     if load_with_pad:
         # Make the image square by padding the shorter dimension
@@ -128,12 +129,13 @@ def _process_single_image(
         coords = np.array([x1, y1, x2, y2, width, height])
 
         # Black-padded square, then antialiased resize to target.
-        square = np.zeros((max_dim, max_dim, 3), dtype=np.uint8)
-        square[top : top + height, left : left + width] = rgb
-        square = cv2.resize(
+        square = torch.zeros((3, max_dim, max_dim), dtype=torch.uint8)
+        square[:, top : top + height, left : left + width] = rgb
+        square = tv_resize(
             square,
-            (target_size, target_size),
+            [target_size, target_size],
             interpolation=interp,
+            antialias=True,
         )
     else:
         # Resize such that longest edge is target_size, preserve aspect ratio
@@ -144,14 +146,16 @@ def _process_single_image(
 
         new_w = int(width * scale)
         new_h = int(height * scale)
-        # cv2.resize takes (width, height), unlike PIL/Torch which take (h, w).
-        square = cv2.resize(rgb, (new_w, new_h), interpolation=interp)
+        square = tv_resize(
+            rgb,
+            [new_h, new_w],
+            interpolation=interp,
+            antialias=True,
+        )
         coords = np.array([0, 0, width * scale, height * scale, width, height])
 
-    # HWC uint8 → CHW float32 ∈ [0, 1] (same semantics as torchvision ToTensor)
-    img_tensor = (
-        torch.from_numpy(square).permute(2, 0, 1).contiguous().float().div_(255.0)
-    )
+    # CHW uint8 → CHW float32 ∈ [0, 1] (same semantics as torchvision ToTensor)
+    img_tensor = square.contiguous().float().div_(255.0)
 
     # Get image relative path wrt images_path
     image_name = Path(image_path).relative_to(images_path).as_posix()
@@ -173,11 +177,14 @@ def load_and_preprocess_images(
 
     Args:
         image_path_list (list): List of paths to image files
+        images_path (str | Path): Root directory used to derive relative image names.
         target_size (int, optional): Target size for both width and height. Defaults to 1024.
         max_workers (int, optional): Maximum number of threads for parallel processing.
                                     Defaults to None (uses default ThreadPoolExecutor behavior).
         load_with_pad (bool, optional): If True, images are resized to square with padding. Depth maps are resized accordingly.
                                         Use this if images might have different aspect ratios.
+        dtype (torch.dtype, optional): Dtype of the returned image tensors. Defaults to ``torch.float32``.
+        device (str, optional): Device on which the image tensors are placed. Defaults to ``"cuda"``.
 
     Returns:
         dict: Dictionary mapping image names (str) to image tensors (torch.Tensor)
@@ -190,7 +197,6 @@ def load_and_preprocess_images(
     if len(image_path_list) == 0:
         raise ValueError("At least 1 image is required")
 
-    to_tensor = TF.ToTensor()
     images_dict = {}
 
     # Process images in parallel
@@ -202,7 +208,6 @@ def load_and_preprocess_images(
                 img_path,
                 images_path,
                 target_size,
-                to_tensor,
                 load_with_pad,
             )
             for img_path in image_path_list
@@ -375,6 +380,10 @@ def load_and_preprocess_depths(
         images_dict (dict): Dictionary mapping image names to image data
         target_size (int, optional): Target size for both width and height. Defaults to 518.
         max_workers (int, optional): Maximum number of threads for parallel processing.
+        load_with_pad (bool, optional): If True, depth maps are padded to square before
+                                        being resized so they align with padded images.
+        dtype (torch.dtype, optional): Dtype of the returned depth tensors. Defaults to ``torch.float32``.
+        device (str, optional): Device on which the depth tensors are placed. Defaults to ``"cuda"``.
 
     Returns:
         dict: Updated images_dict with depth maps added
