@@ -157,9 +157,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
     def __init__(
         self,
-        reconstruction_path,
-        images_path,
-        depths_path,
+        reconstruction_path=None,
+        images_path=None,
+        depths_path=None,
         viewgraph_path=None,  # for testing with GT viewgraph
         unreliable_area_masks_path=None,
         images_size=518,
@@ -198,6 +198,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         sampling_factor=5,
         reprojection_error=3,
         run_mode="inference",  # or "debug" for deterministic results and more logging
+        _ff_data=None,  # internal; set by `from_ff` to bypass disk loaders
     ):
         super().__init__()
         self.device = device
@@ -339,33 +340,45 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.use_amp = use_amp
 
         # Loading
-        ## Load Reconstruction
-        self.recon = pycolmap.Reconstruction(self.reconstruction_path)
+        if _ff_data is None:
+            ## Load Reconstruction
+            self.recon = pycolmap.Reconstruction(self.reconstruction_path)
 
-        ## Load Images as dict {image_name: image_tensor}
-        s_time = time.perf_counter()
-        # image name includes subfolder if any
-        self.image_path_list = find_images(self.images_path, verbose=self.verbose)
-        # loads image, coords, scale, hw into self.images[image_name]
-        self._load_and_preprocess_images()
-        self.num_images = len(self.images)
-        if self.log_granular_time:
-            self.timings["load_images"] = time.perf_counter() - s_time
+            ## Load Images as dict {image_name: image_tensor}
+            s_time = time.perf_counter()
+            # image name includes subfolder if any
+            self.image_path_list = find_images(self.images_path, verbose=self.verbose)
+            # loads image, coords, scale, hw into self.images[image_name]
+            self._load_and_preprocess_images()
+            self.num_images = len(self.images)
+            if self.log_granular_time:
+                self.timings["load_images"] = time.perf_counter() - s_time
 
-        ## Load depth maps
-        s_time = time.perf_counter()
-        self._load_and_preprocess_depths()
-        if self.log_granular_time:
-            self.timings["load_depth_maps"] = time.perf_counter() - s_time
+            ## Load depth maps
+            s_time = time.perf_counter()
+            self._load_and_preprocess_depths()
+            if self.log_granular_time:
+                self.timings["load_depth_maps"] = time.perf_counter() - s_time
 
-        ## Load poses and intrinsics
-        s_time = time.perf_counter()
-        # creating poses such self.poses[image_name] = PoseModel(...)
-        # creating intrinsics such self.intrinsics[cam_id] = CameraModel(...)
-        # using image name and camera id/folder str
-        self._read_cameras_from_reconstruction()  # into self.images and self.intrinsics
-        if self.log_granular_time:
-            self.timings["load_poses_and_intrinsics"] = time.perf_counter() - s_time
+            ## Load poses and intrinsics
+            s_time = time.perf_counter()
+            # creating poses such self.poses[image_name] = PoseModel(...)
+            # creating intrinsics such self.intrinsics[cam_id] = CameraModel(...)
+            # using image name and camera id/folder str
+            self._read_cameras_from_reconstruction()  # into self.images and self.intrinsics
+            if self.log_granular_time:
+                self.timings["load_poses_and_intrinsics"] = time.perf_counter() - s_time
+        else:
+            # Feed-forward path: data already in memory, no disk I/O.
+            # self.recon stays None; only `matcher_type="frustums"` would need it.
+            self.recon = None
+            s_time = time.perf_counter()
+            self._populate_from_ff(_ff_data)
+            if self.log_granular_time:
+                t = time.perf_counter() - s_time
+                self.timings["load_images"] = t
+                self.timings["load_depth_maps"] = 0.0
+                self.timings["load_poses_and_intrinsics"] = 0.0
 
         ##==============  Loadings end here ==============
 
@@ -1384,6 +1397,135 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     self.images[image_name]["depth"] = depth.to(
                         self.device, dtype=self.dtype
                     )
+
+    def _populate_from_ff(self, ff_data):
+        """Populate ``self.images``, ``self.poses``, ``self.intrinsics`` from
+        an in-memory feed-forward dict.
+
+        ``ff_data`` is a dict keyed by ``"cam_id/image_name"`` (the same
+        layout the disk path produces). Each value is a dict with:
+
+        - ``"image"``: ``(3, H, W)`` float tensor in [0, 1]
+        - ``"depth"``: ``(H, W)`` float tensor
+        - ``"pose"``: ``(3, 4)`` or ``(4, 4)`` world-to-camera matrix (T_cw)
+        - ``"intrinsic"``: ``(3, 3)`` pinhole intrinsics matrix
+        - ``"confidence"`` (optional): ``(H, W)`` float tensor
+
+        Images and depths must already be at ``self.images_size``. One camera
+        per image: each entry gets a unique ``cam_id`` derived from the key.
+        """
+        if not ff_data:
+            raise ValueError("ff_data is empty")
+
+        self.images = {}
+        cam_ids_ordered = []
+        R_list, t_list = [], []
+        k_params_list = []
+
+        for name in sorted(ff_data.keys()):
+            entry = ff_data[name]
+            img = entry["image"].to(self.device, dtype=self.dtype)
+            dep = entry["depth"].to(self.device, dtype=self.dtype)
+            pose = entry["pose"].to(self.device, dtype=self.dtype)
+            K = entry["intrinsic"].to(self.device, dtype=self.dtype)
+
+            if img.dim() != 3 or img.shape[0] != 3:
+                raise ValueError(
+                    f"{name}: 'image' must be (3, H, W), got {tuple(img.shape)}"
+                )
+            if dep.dim() != 2 or dep.shape != img.shape[-2:]:
+                raise ValueError(
+                    f"{name}: 'depth' must be (H, W) matching image, got "
+                    f"{tuple(dep.shape)} vs {tuple(img.shape[-2:])}"
+                )
+            if pose.shape not in ((3, 4), (4, 4)):
+                raise ValueError(
+                    f"{name}: 'pose' must be (3,4) or (4,4), got {tuple(pose.shape)}"
+                )
+            if K.shape != (3, 3):
+                raise ValueError(
+                    f"{name}: 'intrinsic' must be (3, 3), got {tuple(K.shape)}"
+                )
+
+            # One camera per image; cam_id = full key (guaranteed unique).
+            cam_id = name
+            self.images[name] = {
+                "image": img,
+                "depth": dep,
+                "hw": (img.shape[-2], img.shape[-1]),
+                "scale": 1.0,
+                "cam_id": cam_id,
+            }
+            if "confidence" in entry and entry["confidence"] is not None:
+                self.images[name]["confidence"] = entry["confidence"].to(
+                    self.device, dtype=self.dtype
+                )
+
+            R_list.append(pose[:3, :3].contiguous())
+            t_list.append(pose[:3, 3].reshape(3, 1).contiguous())
+            # SIMPLE_PINHOLE params: [f, cx, cy]; average fx/fy.
+            f = (K[0, 0] + K[1, 1]) / 2.0
+            k_params_list.append(torch.stack([f, K[0, 2], K[1, 2]]))
+            cam_ids_ordered.append(cam_id)
+
+        self.num_images = len(self.images)
+
+        # Build CameraModule (one cam per image, SIMPLE_PINHOLE).
+        cam_id_to_tensor_id = {cid: i for i, cid in enumerate(cam_ids_ordered)}
+        self.intrinsics = CameraModule(
+            image_id_map=cam_id_to_tensor_id,
+            k_models=["SIMPLE_PINHOLE"] * self.num_images,
+            k_params=torch.stack(k_params_list),
+            lr=self.k_lr,
+            device=self.device,
+            dtype=self.dtype,
+            grad=self.grad_k,
+            max_num_iterations=self.max_num_iterations,
+        )
+
+        # Build PoseModule (world-to-camera convention, same as COLMAP).
+        image_id_map = {name: i for i, name in enumerate(sorted(self.images.keys()))}
+        any_name = next(iter(self.images))
+        self.poses = PoseModule(
+            image_id_map,
+            hw=self.images[any_name]["hw"],
+            R=torch.stack(R_list),
+            t=torch.stack(t_list),
+            R_lr=self.R_lr,
+            t_lr=self.t_lr,
+            grad_R=self.grad_R,
+            grad_t=self.grad_t,
+            grad_t_offset=self.grad_t_offset,
+            mlp_lr=self.mlp_pose_lr,
+            use_mlp=self.use_mlp_pose_refinement,
+            use_amp=self.use_amp,
+            max_num_iterations=self.max_num_iterations,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+    @classmethod
+    def from_ff(cls, ff_data, **kwargs):
+        """Build an EPO instance directly from a feed-forward model's output.
+
+        Skips the COLMAP/disk loading path entirely. ``ff_data`` is a dict
+        keyed by ``"cam_id/image_name"`` with values
+        ``{"image", "depth", "pose", "intrinsic"}`` (see
+        :meth:`_populate_from_ff` for the exact shapes). Pose is expected as
+        world-to-camera (T_cw), matching COLMAP / :class:`PoseModule`.
+
+        All other ``EPO`` constructor kwargs are forwarded. ``matcher_type``
+        must be ``"exhaustive"`` or ``"sequential"`` (``"frustums"`` requires
+        a ``pycolmap.Reconstruction`` which this path does not build).
+        """
+        matcher_type = kwargs.get("matcher_type", "exhaustive")
+        if matcher_type == "frustums":
+            raise ValueError(
+                "from_ff does not support matcher_type='frustums' "
+                "(needs a pycolmap.Reconstruction). "
+                "Use 'exhaustive' or 'sequential'."
+            )
+        return cls(_ff_data=ff_data, **kwargs)
 
     @torch.no_grad()
     def _compute_viewgraph(
