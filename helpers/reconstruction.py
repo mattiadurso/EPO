@@ -12,7 +12,6 @@ import warnings
 import numpy as np
 import pycolmap
 import torch
-from sklearn.cluster import DBSCAN
 
 
 @torch.no_grad()
@@ -30,6 +29,10 @@ def dbscan_filter(reconstruction, eps=0.5, min_samples=20, verbose: bool = False
         pycolmap.Reconstruction: Filtered reconstruction (the input is
         returned unchanged when DBSCAN fails or finds no clusters).
     """
+    # Lazy import — keeps sklearn off the import graph until DBSCAN filtering
+    # is actually requested (it's an opt-in post-processing step).
+    from sklearn.cluster import DBSCAN
+
     if len(reconstruction.points3D) == 0:
         return reconstruction
 
@@ -120,9 +123,13 @@ def build_reconstruction(
         epo: epo instance with images, poses, and intrinsics
         output_path: path to save the reconstruction
         save_points: whether to save 3D points from depth unprojection
+        verbose: if True, print progress information while assembling the reconstruction
         max_points_per_image: maximum number of 3D points per image (default: 100_000)
+        final_dbscan_filtering: if True, run DBSCAN outlier removal on the merged 3D
+            points before writing the reconstruction
         dbscan_eps: epsilon for DBSCAN clustering
         dbscan_min_samples: min samples for DBSCAN clustering
+        bin: if True, write COLMAP files in binary ``.bin`` format; otherwise ``.txt``
     """
     # free cache to avoid OOM while saving
     torch.cuda.empty_cache()
@@ -135,7 +142,7 @@ def build_reconstruction(
     camera_scales = {}
     unique_cam_ids = set()
 
-    for image_name, image_data in epo.images.items():
+    for _image_name, image_data in epo.images.items():
         cam_id = image_data["cam_id"]
         scale = image_data.get("scale", 1.0)
         unique_cam_ids.add(cam_id)
@@ -320,7 +327,7 @@ def build_reconstruction(
                 rgb = np.full((len(valid_3D), 3), 0, dtype=np.uint8)
 
             # Add points to reconstruction
-            for pt_world, rgb_val in zip(valid_3D, rgb):
+            for pt_world, rgb_val in zip(valid_3D, rgb, strict=False):
                 point3D_id = reconstruction.add_point3D(
                     pt_world, pycolmap.Track(), rgb_val
                 )
