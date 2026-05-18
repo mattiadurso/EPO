@@ -1,3 +1,41 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "epo"
+version = "0.1.0"
+description = "Edge-based Pose Optimization for 3D foundation model reconstructions"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Mattia Durso", email = "mattiadurso98@gmail.com" }]
+dependencies = [
+    "torch>=2.4",
+    "torchvision>=0.19",
+    "triton>=3.0",
+    "kornia>=0.7",
+    "kornia-rs>=0.1",
+    "pycolmap>=3.10",
+    "poselib>=2.0",
+    "pypose>=0.6",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "scikit-learn>=1.4",
+    "opencv-python>=4.9",
+    "h5py>=3.10",
+    "pillow>=10",
+    "pandas>=2.0",
+    "tqdm>=4.66",
+    "filelock>=3.13",
+    "fsspec>=2024.0",
+    "rerun-sdk>=0.20",
+    "matplotlib>=3.8",
+]
+
+[tool.setuptools]
+py-modules = ["epo"]
+packages = ["epo_modules", "modules", "helpers", "losses", "extractors"]
+
 [tool.black]
 line-length = 88
 target-version = ["py310"]
