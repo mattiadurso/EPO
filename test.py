@@ -82,6 +82,7 @@ for dataset in datasets:
             reconstruction_path = reconstruction_path.replace("vggt", args.model)
             depths_path = depths_path.replace("vggt", args.model)
 
+        print("Processing scene:", scene)
         # --- Build and run EPO for this scene ---
         epo = EPO(
             reconstruction_path=reconstruction_path,
@@ -113,13 +114,7 @@ for dataset in datasets:
             backend="triton",  # fused Triton kernels for both project+sample and unproject (fwd + analytical bwd). Much faster than the PyTorch path on large viewgraphs / many edges.
         )
 
-        epo(
-            window_pose=25,
-            window_depth=50,
-            convergence_tol_pose=0.5,  # degrees
-            convergence_tol_depth=0.1,  # relative change (%)
-            early_stop=args.early_stop,
-        )
+        epo()
 
         epo.to_colmap(
             opt,
