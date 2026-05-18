@@ -120,7 +120,7 @@ pip install kornia \
 
 > 📦 A few demo scenes can be downloaded [here](https://cloud.tugraz.at/index.php/s/dNfD96WNJ64kZCS).
 
-Organize your images using the following structure. Images can be grouped by camera if multiple camera rigs are used:
+Organize your images using the following structure. Images can be grouped by camera if multiple cameras are used:
 
 ```
 bicycle/
@@ -165,7 +165,7 @@ python epo.py \
 - Image and depth map directories must mirror the same folder structure.
 - Ground truth data must be provided in COLMAP format, with matching image names (e.g., `cam/images.jpg`).
 
-### Programmatic use — feed-forward output (no disk round-trip)
+### Programmatic use — feed-forward output 
 
 If you already have a 3DFM's output as tensors in memory, you can skip the COLMAP / `depths.pth` export and feed EPO directly:
 
@@ -188,12 +188,9 @@ ff_data = {
 
 epo = EPO.from_ff(
     ff_data,
-    images_size=518,
-    matcher_type="exhaustive",   # or "sequential"; "frustums" not supported here
     backend="triton",
-    use_mlp_pose_refinement=True,
 )
-epo(window_pose=25, window_depth=50, early_stop="pose")
+epo()
 epo.to_colmap("out/sparse", save_points=True)
 ```
 
