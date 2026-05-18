@@ -1035,30 +1035,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
     def create_batched_inputs(self, sampled_viewgraph):
         """Prepare batched inputs for the batched optimization step given a list of pairs from the viewgraph."""
-        # mantain str index for visualization/debugging
-        # if isinstance(sampled_viewgraph[0][0], str):
-        #     cam_ids = []
-        #     images_names_ij = []
-        #     images_names_ji = []
-        #     for (
-        #         i,
-        #         j,
-        #     ) in sampled_viewgraph:  # with i,j being left (0) and right (1) images
-        #         # I already have unprojected points to 3D, so I only have to check that
-        #         # those points reproject within the image boundaries.
-
-        #         # these are are the ids for points 3D and their corresponding pad
-        #         images_names_ij.append(i)
-        #         images_names_ij.append(j)
-
-        #         # these are the ids for right images where to reproject
-        #         cam_ids.append(self.images[j]["cam_id"])
-        #         cam_ids.append(self.images[i]["cam_id"])
-        #         images_names_ji.append(j)
-        #         images_names_ji.append(i)
-
-        # else:
-        # sampeld_viewgraph is tensor of shape (num_pairs, 4) with (img1_id, img2_id, cam1_id, cam2_id)
         images_names_ij = sampled_viewgraph[:, :2].reshape(-1)
         images_names_ji = sampled_viewgraph[:, :2].flip(1).reshape(-1)
         cam_ids = sampled_viewgraph[:, 2:].flip(1).reshape(-1)
@@ -1433,9 +1409,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 images_with_depth=self.images,
                 dtype=self.dtype,
             )
-            # min_points = 100
-            # sampling_factor = 5
-            # reprojection_error = 5.0
 
         elif type == "sequential":
             # Build sequential viewgraph based on sorted image names with a window size of 10
@@ -1452,16 +1425,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             # Build exhaustive viewgraph (all pairs)
             image_names = sorted(list(self.images.keys()))
             viewgraph = list(combinations(image_names, 2))
-            # min_points = 750  # ~12.5% (1/8) of 518*290
-            # sampling_factor = 5  # after sampling
-            # reprojection_error = 3.0
 
         else:
             raise ValueError(f"Viewgraph type {type} not supported.")
 
         # Filter viewgraph by reprojection
-        # min_points shouldbe set such images have enough overlap, maybe at least 25%
-        # 518*345*0.25 = 44_677
         if self.viewgraph_path is None:
             self.viewgraph, self.valid_points_per_pair = (
                 filter_viewgraph_by_reprojection_batched(
@@ -1610,9 +1578,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
             if n_edges > max_edges_to_retain:
                 # randomly sample max_edges
-                # indices = torch.randperm(n_edges, device=edges.device)[
-                #     :max_edges_to_retain
-                # ]
                 indices = torch.randperm(
                     n_edges, device=edges.device, generator=self.rng
                 )[:max_edges_to_retain]
@@ -1733,13 +1698,6 @@ if __name__ == "__main__":
     # Load dataset paths and parameters from JSON
     with open("benchmarks/paths.json") as f:
         paths_cfg = json.load(f)
-
-    # for dataset in ["terrasky3D", "scannetpp"]:
-    #     scenes = sorted(os.listdir(paths_cfg[dataset]["images_path"]))
-
-    #     for scene in scenes:
-    # if os.path.exists(f"rerun/{scene}.rrd") or scene[0] == "." or scene.endswith(".py"):
-    #     continue
 
     dataset_cfg = paths_cfg[dataset]
 
