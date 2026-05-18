@@ -38,7 +38,7 @@
 
 ## Overview
 
-**EPO** (Edge-based Pose Optimization) is a featureless method for refining camera poses and depth produced by 3D Foundation Models (3DFMs) such as VGGT. Rather than relying on hand-crafted/learned feature matching, EPO directly optimizes camera poses using dense depth maps, improving reconstruction quality in a lightweight and generalizable manner.
+**EPO** (Edge-based Pose Optimization) is a trackless method for refining camera poses and depth produced by 3D Foundation Models (3DFMs) such as VGGT. Rather than relying on hand-crafted/learned feature matching, EPO directly optimizes camera poses and depth maps using edges reprojection, improving reconstruction quality in a lightweight and generalizable manner.
 
 
 
@@ -46,8 +46,9 @@
 
 | Version | Description |
 |---------|-------------|
-| **1.1** | Fixed a bug in the loss function — outliers are now handled more robustly, resulting in slightly higher scores.<br>Added Triton kernel for point reprojection (~1.5× faster); enable with `backend="triton"`.<br>Added mixed-precision (BF16) support for the pose-refinement MLP via `use_amp=True`.<br>Improved per-stage time logging; can be disabled with `log_granular_time=False`. |
-| **1.0** | Initial release. |
+| **1.0.2** | Added `EPO.from_ff(...)` — initialize directly from a 3DFM's in-memory output (no COLMAP/`.h5` round-trip). |
+| **1.0.1** | Fixed a bug in the loss function — outliers are now handled more robustly, resulting in slightly higher scores.<br>Added Triton kernel for point reprojection (~1.5× faster); enable with `backend="triton"`.<br>Added mixed-precision (BF16) support for the pose-refinement MLP via `use_amp=True`.<br>Improved per-stage time logging; can be disabled with `log_granular_time=False`. |
+| **1.0.0** | Initial release. |
 
 
 
@@ -75,15 +76,12 @@ conda activate epo
 conda create -n epo python=3.10 -y
 conda activate epo
 
-pip install h5py \
-            kornia \
+pip install kornia \
             matplotlib \
             numpy \
             opencv-python \
             pandas \
             pycolmap==3.11 \
-            rerun \
-            scikit-learn \
             torch \
             torchvision \
             triton \
@@ -101,14 +99,12 @@ python3.10 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install --upgrade pip
 
-pip install h5py \
-            kornia \
+pip install kornia \
             matplotlib \
             numpy \
             opencv-python \
             pandas \
             pycolmap==3.11 \
-            scikit-learn \
             torch \
             torchvision \
             triton \
@@ -148,14 +144,8 @@ bicycle/
     ├── cameras.bin          # Camera intrinsic parameters
     ├── images.bin           # Camera extrinsics and image registration
     ├── points3D.bin         # Sparse 3D point cloud
-    └── depth_maps/
-        ├── 1/               # Depth maps for Camera Group 1
-        │   ├── _DSC8679.h5
-        │   ├── _DSC8680.h5
-        │   └── ...
-        └── 2/               # Depth maps for Camera Group 2 (if more)
-            ├── _DSC9001.h5
-            └── ...
+    └── depths.pth           # Dense depth maps: torch.save'd dict
+                             # {image_stem: {"depth": (H, W), "confidence": (H, W) (optional)}}
 ```
 
 
@@ -174,6 +164,40 @@ python epo.py \
 
 - Image and depth map directories must mirror the same folder structure.
 - Ground truth data must be provided in COLMAP format, with matching image names (e.g., `cam/images.jpg`).
+
+### Programmatic use — feed-forward output (no disk round-trip)
+
+If you already have a 3DFM's output as tensors in memory, you can skip the COLMAP / `depths.pth` export and feed EPO directly:
+
+```python
+from epo import EPO
+
+# ff_data: dict keyed by "cam_id/image_name"
+# Each value is a dict with the per-image tensors (already at images_size).
+# Pose is world-to-camera (T_cw), matching COLMAP / PoseModule.
+ff_data = {
+    "cam0/img_000.jpg": {
+        "image":     image_tensor,      # (3, H, W) float in [0, 1]
+        "depth":     depth_tensor,      # (H, W)
+        "pose":      pose_tensor,       # (3, 4) or (4, 4), world-to-camera
+        "intrinsic": intrinsic_tensor,  # (3, 3) pinhole
+        # "confidence": conf_tensor,    # (H, W), optional
+    },
+    ...
+}
+
+epo = EPO.from_ff(
+    ff_data,
+    images_size=518,
+    matcher_type="exhaustive",   # or "sequential"; "frustums" not supported here
+    backend="triton",
+    use_mlp_pose_refinement=True,
+)
+epo(window_pose=25, window_depth=50, early_stop="pose")
+epo.to_colmap("out/sparse", save_points=True)
+```
+
+All other `EPO(...)` kwargs are forwarded. Images and depths must already be at `images_size` (no internal resize). One camera per image.
 
 ## Citation
 
