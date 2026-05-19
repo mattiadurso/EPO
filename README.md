@@ -81,7 +81,7 @@ pip install kornia \
             numpy \
             opencv-python \
             pandas \
-            pycolmap==3.11 \
+            pycolmap \
             torch \
             torchvision \
             triton \

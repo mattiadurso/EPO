@@ -14,7 +14,7 @@ dependencies = [
     "torchvision>=0.19",
     "triton>=3.0",
     "kornia>=0.7",
-    "pycolmap==3.11",
+    "pycolmap>=4.0",
     "numpy>=1.26",
     "tqdm>=4.66",
     "matplotlib>=3.8",
