@@ -510,7 +510,8 @@ def process_pose(image):
     ``R`` and ``t`` are world-to-camera (COLMAP's native convention); ``t`` is
     returned with shape ``(3, 1)`` to match downstream stacking.
     """
-    R = torch.tensor(image.cam_from_world.rotation.matrix())
-    t = torch.tensor(image.cam_from_world.translation).unsqueeze(1)
+    P = torch.tensor(image.cam_from_world().matrix())
+    R = P[:3, :3]
+    t = P[:3, 3].unsqueeze(1)
 
     return R, t, image.camera_id
