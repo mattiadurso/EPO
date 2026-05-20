@@ -2,8 +2,10 @@
 
 Stores intrinsics as a simple-pinhole tuple ``(f, cx, cy)`` per camera and
 optimizes a single scalar focal-length scale per camera (``f_eff = f *
-(1 + alpha)``). Principal points are kept fixed; ``PINHOLE`` cameras are
-collapsed to ``SIMPLE_PINHOLE`` by averaging ``fx`` and ``fy``.
+(1 + alpha)``). With ``direct_backprop=True``, ``f`` is learned directly as
+a raw parameter instead of via ``alpha``. Principal points are kept fixed;
+``PINHOLE`` cameras are collapsed to ``SIMPLE_PINHOLE`` by averaging ``fx``
+and ``fy``. Skew (``gamma``) stays at 0 and non-learnable.
 """
 
 import torch
@@ -25,6 +27,7 @@ class CameraModule(BaseModule):
         grad: bool = True,
         warmup_steps: int = 25,
         max_num_iterations: int = 1000,
+        direct_backprop: bool = False,
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
     ):
@@ -35,16 +38,27 @@ class CameraModule(BaseModule):
             k_models: list of camera model names ("PINHOLE" or "SIMPLE_PINHOLE")
             k_params: camera parameters per camera; PINHOLE expects (fx, fy, cx, cy),
                       SIMPLE_PINHOLE expects (f, cx, cy). PINHOLE inputs are averaged: f=(fx+fy)/2.
+            lr: optimizer learning rate for the focal parameter.
+            grad: if True, register the focal parameter as learnable and build
+                optimizer/scheduler; if False, the module is read-only.
+            warmup_steps: linear-warmup steps before the cosine schedule kicks in.
+            max_num_iterations: total iterations used to shape the cosine schedule.
+            direct_backprop: if True, learn ``f`` directly as a raw parameter
+                (initialized from ``k_params``). If False (default), learn the
+                scale ``alpha`` such that ``f_eff = f * (1 + alpha)``.
+            device: torch device for parameters and cached matrices.
+            dtype: torch dtype for parameters and cached matrices.
         """
         super().__init__(image_id_map, device=device, dtype=dtype)
         self.max_num_iterations = max_num_iterations
         self.lr = float(lr)
+        self.direct_backprop = direct_backprop
         self.keys = list(self.image_to_tensor_idx.keys())
 
         # Normalize all cameras to simple pinhole format: [f, cx, cy]
         k_params = k_params.clone().detach().to(self.device, dtype=self.dtype)
         normalized = []
-        for model, p in zip(k_models, k_params):
+        for model, p in zip(k_models, k_params, strict=False):
             if model == "PINHOLE":
                 f = (p[0] + p[1]) / 2.0
                 normalized.append(torch.stack([f, p[2], p[3]]))
@@ -52,13 +66,15 @@ class CameraModule(BaseModule):
                 normalized.append(p[:3])
         self.k_params = torch.stack(normalized)  # (N, 3): [f, cx, cy]
 
-        # Single learnable scale per camera: f_eff = f * (1 + alpha)
-        self.params = nn.Parameter(
-            torch.zeros(
+        # Learnable focal per camera. Default: alpha scale (f_eff = f*(1+alpha)).
+        # direct_backprop: raw f initialized from k_params.
+        if direct_backprop:
+            init = self.k_params[:, 0:1].clone()
+        else:
+            init = torch.zeros(
                 (self.k_params.shape[0], 1), device=self.device, dtype=self.dtype
-            ),
-            requires_grad=grad,
-        )
+            )
+        self.params = nn.Parameter(init, requires_grad=grad)
 
         if grad:
             self.init_optimizer(lr=self.lr)
@@ -91,11 +107,14 @@ class CameraModule(BaseModule):
         return invert_K(self.get_intrinsic_matrix(indices))
 
     def _build_K(self, tensor_indices: torch.Tensor) -> torch.Tensor:
-        """Compose ``(B, 3, 3)`` intrinsic matrices from base params + ``alpha``."""
+        """Compose ``(B, 3, 3)`` intrinsic matrices from base params + learned focal."""
         params = self.k_params[tensor_indices]  # (B, 3): [f, cx, cy]
-        alpha = self.params[tensor_indices]  # (B, 1)
+        learn = self.params[tensor_indices]  # (B, 1): raw f or alpha
 
-        f = params[:, 0] * (1 + alpha[:, 0])
+        if self.direct_backprop:
+            f = learn[:, 0]
+        else:
+            f = params[:, 0] * (1 + learn[:, 0])
         cx = params[:, 1]
         cy = params[:, 2]
 
@@ -120,8 +139,11 @@ class CameraModule(BaseModule):
             indices = self.map_names_to_indices(indices)
 
         params = self.k_params[indices].clone()  # (B, 3): [f, cx, cy]
-        alpha = self.params[indices]  # (B, 1)
-        params[:, 0] = params[:, 0] * (1 + alpha[:, 0])
+        learn = self.params[indices]  # (B, 1): raw f or alpha
+        if self.direct_backprop:
+            params[:, 0] = learn[:, 0]
+        else:
+            params[:, 0] = params[:, 0] * (1 + learn[:, 0])
 
         return "SIMPLE_PINHOLE", params.squeeze()
 
@@ -132,6 +154,7 @@ class CameraModule(BaseModule):
         self.cameras_inv = None
 
     def __repr__(self) -> str:
+        """Return a short summary listing the first few cameras and their params."""
         s = "CameraModel:\n"
         limit = 5
         for i, params in enumerate(self.k_params[:limit]):

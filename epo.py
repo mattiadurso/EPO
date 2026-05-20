@@ -530,7 +530,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         window_loss=100,
         convergence_tol_pose=0.5,  # degrees
         convergence_tol_depth=0.1,  # relative change %
-        convergence_tol_loss=5e-5,  # relative change %
+        convergence_tol_loss=5e-4,  # relative change %
         early_stop="pose",
         drop_last=False,
         debug=False,
