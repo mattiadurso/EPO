@@ -58,8 +58,8 @@ def _extract_pose_dict(rec_or_dict):
         return rec_or_dict
     return {
         img.name: (
-            np.asarray(img.cam_from_world.rotation.matrix(), dtype=np.float64),
-            np.asarray(img.cam_from_world.translation, dtype=np.float64),
+            np.asarray(img.cam_from_world().rotation.matrix(), dtype=np.float64),
+            np.asarray(img.cam_from_world().translation, dtype=np.float64),
         )
         for img in rec_or_dict.images.values()
     }
@@ -167,33 +167,37 @@ def evaluate_scene_reference(target_rec, input_rec, deg=True, verbose=False):
         else:
             # get the rotation and translation for two images (target)
             R1_target, t1_target = (
-                target_rec.find_image_with_name(
-                    image_1_path
-                ).cam_from_world.rotation.matrix(),
-                target_rec.find_image_with_name(
-                    image_1_path
-                ).cam_from_world.translation,
+                target_rec.find_image_with_name(image_1_path)
+                .cam_from_world()
+                .rotation.matrix(),
+                target_rec.find_image_with_name(image_1_path)
+                .cam_from_world()
+                .translation,
             )
             R2_target, t2_target = (
-                target_rec.find_image_with_name(
-                    image_2_path
-                ).cam_from_world.rotation.matrix(),
-                target_rec.find_image_with_name(
-                    image_2_path
-                ).cam_from_world.translation,
+                target_rec.find_image_with_name(image_2_path)
+                .cam_from_world()
+                .rotation.matrix(),
+                target_rec.find_image_with_name(image_2_path)
+                .cam_from_world()
+                .translation,
             )
 
             R1_input, t1_input = (
-                input_rec.find_image_with_name(
-                    image_1_path
-                ).cam_from_world.rotation.matrix(),
-                input_rec.find_image_with_name(image_1_path).cam_from_world.translation,
+                input_rec.find_image_with_name(image_1_path)
+                .cam_from_world()
+                .rotation.matrix(),
+                input_rec.find_image_with_name(image_1_path)
+                .cam_from_world()
+                .translation,
             )
             R2_input, t2_input = (
-                input_rec.find_image_with_name(
-                    image_2_path
-                ).cam_from_world.rotation.matrix(),
-                input_rec.find_image_with_name(image_2_path).cam_from_world.translation,
+                input_rec.find_image_with_name(image_2_path)
+                .cam_from_world()
+                .rotation.matrix(),
+                input_rec.find_image_with_name(image_2_path)
+                .cam_from_world()
+                .translation,
             )
 
             # compute the relative pose between the two images (target)
