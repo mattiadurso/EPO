@@ -4,6 +4,11 @@ Provides :func:`build_reconstruction`, which assembles a full COLMAP
 reconstruction from an EPO instance (cameras, poses and the per-image
 unprojected edge points), and :func:`dbscan_filter`, an outlier-removal
 pass that keeps only the largest DBSCAN cluster of 3D points.
+
+Updated for pycolmap 4.x: poses now live on ``Frame`` objects (which
+reference a ``Rig``), not directly on ``Image``. Each image's data must
+be associated with its frame via ``Frame.add_data_id`` or the
+reconstruction will reject it (``frame.HasDataId(image.DataId())``).
 """
 
 import os
@@ -84,14 +89,31 @@ def dbscan_filter(reconstruction, eps=0.5, min_samples=20, verbose: bool = False
     for camera_id in reconstruction.cameras.keys():
         filtered_reconstruction.add_camera(reconstruction.cameras[camera_id])
 
-    # Recreate images with new camera references
+    # Copy rigs (4.x: rigs must exist before frames/images that reference them)
+    for rig_id in reconstruction.rigs.keys():
+        filtered_reconstruction.add_rig(reconstruction.rigs[rig_id])
+
+    # Recreate frames + images with the 4.x API. The pose lives on the
+    # frame; the image's data_id must be registered on the frame before
+    # add_image, or the reconstruction rejects it.
     for image_id in reconstruction.images.keys():
         old_image = reconstruction.images[image_id]
+        old_frame = reconstruction.frames[old_image.frame_id]
+        camera = reconstruction.cameras[old_image.camera_id]
+
+        new_frame = pycolmap.Frame()
+        new_frame.frame_id = old_frame.frame_id
+        new_frame.rig_id = old_frame.rig_id
+        new_frame.rig = filtered_reconstruction.rigs[old_frame.rig_id]
+        new_frame.set_cam_from_world(old_image.camera_id, old_image.cam_from_world)
+        new_frame.add_data_id(pycolmap.data_t(camera.sensor_id, old_image.image_id))
+        filtered_reconstruction.add_frame(new_frame)
+
         new_image = pycolmap.Image(
-            id=old_image.image_id,
+            image_id=old_image.image_id,
             name=old_image.name,
             camera_id=old_image.camera_id,
-            cam_from_world=old_image.cam_from_world,
+            frame_id=new_frame.frame_id,
         )
         filtered_reconstruction.add_image(new_image)
 
@@ -209,7 +231,31 @@ def build_reconstruction(
         )
         reconstruction.add_camera(cam)
 
-    # 2. Add images (poses)
+    # 2. Build one rig per camera (trivial: sensor == rig origin).
+    #    Do this once, before the image loop, so shared cameras don't
+    #    create duplicate rigs.
+    seen_rigs = set()
+    for cam_id_int in set(
+        epo.intrinsics.image_to_tensor_idx[d["cam_id"]] for d in epo.images.values()
+    ):
+        if cam_id_int in seen_rigs:
+            continue
+        camera = reconstruction.cameras[cam_id_int]
+        rig = pycolmap.Rig()
+        rig.rig_id = cam_id_int
+        rig.add_ref_sensor(camera.sensor_id)  # sensor_t; ref sensor == rig origin
+        reconstruction.add_rig(rig)
+        seen_rigs.add(cam_id_int)
+
+    # 3. Add images + frames. In pycolmap 4.x the pose lives on the
+    #    Frame, and the image's data_id must be registered on the frame
+    #    (Frame.add_data_id) before the image is added, otherwise
+    #    reconstruction.add_image fails the
+    #    `frame.HasDataId(image.DataId())` check.
+    #
+    #    We keep a stable image_id -> name mapping so the points/track
+    #    step below references the exact same ids.
+    image_id_to_name = {}
     for image_id, (image_name, image_data) in enumerate(epo.images.items(), start=1):
         # skip if image is blacklisted
         if image_name in epo.blacklist:
@@ -222,26 +268,50 @@ def build_reconstruction(
 
         # Convert cam_id to int for COLMAP
         cam_id_int = epo.intrinsics.image_to_tensor_idx[cam_id]
-        # Get rotation matrix and translation (R is already orthonormal)
+        camera = reconstruction.cameras[cam_id_int]
+
+        # Get rotation matrix and translation (R is already orthonormal).
+        # get_image_Rt takes a list and returns a batched result, so
+        # reshape to the strict (3, 3) / (3,) that Rotation3d / Rigid3d
+        # expect.
         R, t = epo.poses.get_image_Rt([image_name])
-        R = R.detach().cpu().numpy().astype(np.float64)
-        t = t.detach().cpu().numpy().astype(np.float64)
+        R = R.detach().cpu().numpy().astype(np.float64).reshape(3, 3)
+        t = t.detach().cpu().numpy().astype(np.float64).reshape(3)
 
         # Apply inverse scaling to translation (scale back to original)
         t = t / scale
 
-        # Create image — pycolmap.Rotation3d accepts a 3x3 matrix directly.
+        cam_from_world = pycolmap.Rigid3d(
+            rotation=pycolmap.Rotation3d(R), translation=t
+        )
+
+        # Frame holds the pose. set_cam_from_world dereferences the
+        # frame's rig pointer (frame.cc:62), so the live Rig object must
+        # be attached before that call -- rig_id alone is not enough.
+        frame = pycolmap.Frame()
+        frame.frame_id = image_id
+        frame.rig_id = cam_id_int
+        frame.rig = reconstruction.rigs[cam_id_int]
+        frame.set_cam_from_world(cam_id_int, cam_from_world)
+        # Associate this image's data with the frame BEFORE add_image.
+        frame.add_data_id(pycolmap.data_t(camera.sensor_id, image_id))
+        reconstruction.add_frame(frame)
+
+        # Image just associates name + camera + frame (no pose)
         img = pycolmap.Image(
-            id=image_id,
+            image_id=image_id,
             name=image_name,
             camera_id=cam_id_int,
-            cam_from_world=pycolmap.Rigid3d(
-                rotation=pycolmap.Rotation3d(R), translation=t
-            ),
+            frame_id=frame.frame_id,
         )
         reconstruction.add_image(img)
+        image_id_to_name[image_id] = image_name
 
-    # 3. Add Points3D from depth unprojection using fresh computation
+    # 4. Add Points3D from depth unprojection using fresh computation.
+    #    Reuse the exact image_id -> name mapping built above so track
+    #    elements reference registered image ids (the old code rebuilt a
+    #    separate sorted enumeration, which could desync ids from the
+    #    images actually added when blacklisting changed ordering).
     if save_points:
         if verbose:
             print("Unprojecting depth maps to 3D points...")
@@ -250,14 +320,8 @@ def build_reconstruction(
         epo.unproject_edges_to_3D()
 
         total_points = 0
-        image_names = sorted(list(epo.images.keys()))
 
-        for image_id, image_name in enumerate(image_names, start=1):
-            # Skip blacklisted images
-            if image_name in epo.blacklist:
-                if verbose:
-                    print(f"Skipping blacklisted image: {image_name}")
-                continue
+        for _image_id, image_name in image_id_to_name.items():
             image_data = epo.images[image_name]
             cam_id = image_data["cam_id"]
             scale = image_data.get("scale", 1.0)
@@ -326,13 +390,20 @@ def build_reconstruction(
                 # Default to black if no image available
                 rgb = np.full((len(valid_3D), 3), 0, dtype=np.uint8)
 
-            # Add points to reconstruction
+            # Add points to reconstruction.
+            #
+            # NOTE: we intentionally do NOT call track.add_element here.
+            # A track element references (image_id, point2D_index), but
+            # these images have no Point2D entries (we only export edge
+            # points, not feature observations). Writing a track element
+            # with a dangling 2D reference produces a model COLMAP can
+            # serialize but NOT read back: on load it indexes
+            # image.points2D[0] into an empty vector and raises
+            # `vector::_M_range_check: __n (0) >= size (0)`.
+            # Empty tracks are the correct representation for
+            # observation-free points (mean track length 0).
             for pt_world, rgb_val in zip(valid_3D, rgb, strict=False):
-                point3D_id = reconstruction.add_point3D(
-                    pt_world, pycolmap.Track(), rgb_val
-                )
-                track = reconstruction.point3D(point3D_id).track
-                track.add_element(image_id, 0)  # dummy keypoint index
+                reconstruction.add_point3D(pt_world, pycolmap.Track(), rgb_val)
 
             total_points += len(valid_3D)
             if verbose:
@@ -341,7 +412,7 @@ def build_reconstruction(
         if verbose:
             print(f"Total points added: {total_points:,}")
 
-    # 4. DBSCAN filtering
+    # 5. DBSCAN filtering
     if save_points and final_dbscan_filtering:
         if verbose:
             print("Running DBSCAN filtering...")
@@ -352,7 +423,7 @@ def build_reconstruction(
             verbose=verbose,
         )
 
-    # 5. Save reconstruction
+    # 6. Save reconstruction
     if verbose:
         print(f"Cameras: {len(reconstruction.cameras)}")
         print(f"Images: {len(reconstruction.images)}")
