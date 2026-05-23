@@ -97,7 +97,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         load_with_pad: If True, pad images to a square before resizing.
         detector: Edge detector name (currently ``"canny"``).
         detector_params: Keyword arguments forwarded to the detector.
-        device: Torch device to run on.
+        device: Torch device to run on. Accepts ``"cuda"`` (current default
+            CUDA device), ``"cuda:N"`` for a specific GPU index, or ``"cpu"``.
         max_workers: Max worker threads for parallel I/O. ``-1`` uses
             ``os.cpu_count()``.
         seed: Random seed for reproducibility.

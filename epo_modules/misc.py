@@ -270,7 +270,11 @@ class MiscModule:
             torch.backends.cudnn.benchmark = True
 
             if torch.cuda.is_available():
-                gpu_name = torch.cuda.get_device_name(0)
+                dev = torch.device(self.device)
+                dev_idx = (
+                    dev.index if dev.type == "cuda" and dev.index is not None else 0
+                )
+                gpu_name = torch.cuda.get_device_name(dev_idx)
                 if "4090" in gpu_name:
                     torch.set_float32_matmul_precision("high")
                 else:
