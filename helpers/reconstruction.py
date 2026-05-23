@@ -263,6 +263,12 @@ def build_reconstruction(
                 print(f"Skipping blacklisted image: {image_name}")
             continue
 
+        # skip if image never entered the viewgraph (pose/depth never optimized)
+        if image_name in epo.images_not_in_viewgraph:
+            if verbose:
+                print(f"Skipping image not in viewgraph: {image_name}")
+            continue
+
         cam_id = image_data["cam_id"]
         scale = image_data.get("scale", 1.0)
 
@@ -438,4 +444,10 @@ def build_reconstruction(
         if verbose:
             print(f"Reconstruction saved to: {output_path}")
 
+    if epo.images_not_in_viewgraph and verbose:
+        print(
+            f"{len(epo.images_not_in_viewgraph)} images were not in the "
+            f"viewgraph and were skipped in the reconstruction:\n"
+            f"{epo.images_not_in_viewgraph}"
+        )
     return reconstruction

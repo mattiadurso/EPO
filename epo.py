@@ -137,6 +137,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             Default False (FP32 throughout — historical behaviour).
         auc_saving_freq: Iterations between AUC checkpoints when ground truth
             is available.
+        warmup_steps: Number of iterations for the learning rate warmup.
         max_num_iterations: Hard cap on optimization steps.
         verbose: If True, log progress and statistics during the run.
         log_granular_time: If True (default), record per-stage timings in
@@ -190,6 +191,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         backend="torch",
         use_amp=False,
         auc_saving_freq=50,
+        warmup_steps=25,
         max_num_iterations=2000,
         verbose=False,
         log_granular_time=True,
@@ -246,6 +248,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.convergence = False
         self.auc_th = [1, 3, 5]
         self.completed_iterations = 0
+        self.warmup_steps = warmup_steps
         self.max_num_iterations = max_num_iterations
         self.auc_saving_freq = auc_saving_freq
         self.viewgraph_path = viewgraph_path
@@ -448,6 +451,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             lr=self.z_lr,
             grad=self.grad_z,
             max_num_iterations=self.max_num_iterations,
+            warmup_steps=self.warmup_steps,
             dtype=self.dtype,
         )
 
@@ -1310,6 +1314,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             dtype=self.dtype,
             grad=self.grad_k,
             max_num_iterations=self.max_num_iterations,
+            warmup_steps=self.warmup_steps,
         )
 
         # Read poses from images
@@ -1348,6 +1353,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             use_mlp=self.use_mlp_pose_refinement,
             use_amp=self.use_amp,
             max_num_iterations=self.max_num_iterations,
+            warmup_steps=self.warmup_steps,
             device=self.device,
             dtype=self.dtype,
         )
@@ -1481,6 +1487,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             dtype=self.dtype,
             grad=self.grad_k,
             max_num_iterations=self.max_num_iterations,
+            warmup_steps=self.warmup_steps,
         )
 
         # Build PoseModule (world-to-camera convention, same as COLMAP).
@@ -1500,6 +1507,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             use_mlp=self.use_mlp_pose_refinement,
             use_amp=self.use_amp,
             max_num_iterations=self.max_num_iterations,
+            warmup_steps=self.warmup_steps,
             device=self.device,
             dtype=self.dtype,
         )
@@ -1611,6 +1619,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 f"min connections {min(values)}, "
                 f"images with fewer than 5 neighbors: {(np.array(values) < 5).sum()}"
             )
+
+        self.images_not_in_viewgraph = set(self.images.keys()) - set(
+            self.adj_list.keys()
+        )  # this could be used to discard these images when saving
 
     ### Edges
     def _extract_edges(self, confidence_threshold=0.2, edge_batch_size=32):

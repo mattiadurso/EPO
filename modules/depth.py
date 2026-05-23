@@ -64,6 +64,7 @@ class DepthModule(BaseModule):
             dtype=dtype,
         )
         self.max_num_iterations = max_num_iterations
+        self.warmup_steps = warmup_steps
         self.lr = float(lr)
         self.depth = depth
         self.per_pixel = per_pixel
