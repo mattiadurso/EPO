@@ -51,6 +51,7 @@ class CameraModule(BaseModule):
         """
         super().__init__(image_id_map, device=device, dtype=dtype)
         self.max_num_iterations = max_num_iterations
+        self.warmup_steps = warmup_steps
         self.lr = float(lr)
         self.direct_backprop = direct_backprop
         self.keys = list(self.image_to_tensor_idx.keys())

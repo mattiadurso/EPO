@@ -7,6 +7,8 @@ used in the paper. Imported almost exclusively by ``benchmark.ipynb``.
 
 import json
 import os
+import shutil
+import tempfile
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,7 +20,14 @@ from helpers.benchmark_pose import eval_colmap_model_all_scenes
 
 
 def read_results(
-    dataset, target_folder, models, thr=5, round_to=1, remove=None, full=False
+    dataset,
+    target_folder,
+    models,
+    thr=5,
+    round_to=1,
+    remove=None,
+    full=False,
+    skip_time=False,
 ):
     """Aggregate per-scene pose-AUC results for a list of models on a dataset.
 
@@ -31,6 +40,8 @@ def read_results(
         remove: Scene names to exclude from aggregation. ``None`` is treated
             as the empty list.
         full: If True, read from the ``benchmarks_full`` tree.
+        skip_time: If True, skip per-scene timing extraction and omit the
+            corresponding columns from the returned dataframe.
 
     Returns:
         ``pd.DataFrame`` with one column per model and one row per scene.
@@ -42,17 +53,56 @@ def read_results(
         base_target = (
             "/home/mattia/Desktop/Repos/posebench/benchmarks_2D/imc/data/phototourism/"
         )
+    elif dataset == "eth3d":
+        base_target = "/home/mattia/HDD_Fast/eth3d/data"
     base_repo = "/home/mattia/Desktop/Repos/batchsfm/benchmarks"
     base_repo = (
         "/home/mattia/Desktop/Repos/batchsfm/benchmarks_full" if full else base_repo
     )
-    scenes = os.listdir(base_target)
+
+    # Collect benchmark scene names across all models. We use this both for
+    # the timings loop and to detect scene-name mismatches against the
+    # dataset folder (e.g. benchmark dir "alameda_full" vs dataset "alameda").
+    target_scenes = (
+        set(os.listdir(base_target)) if os.path.isdir(base_target) else set()
+    )
+    input_scenes = set()
+    for name in models:
+        model_dir = f"{base_repo}/{name}/{dataset}"
+        if os.path.isdir(model_dir):
+            input_scenes.update(os.listdir(model_dir))
+
+    # If any benchmark scene name has no direct dataset match but its
+    # "_<suffix>"-stripped form does (e.g. "alameda_full" -> "alameda"),
+    # build a tempdir of symlinks so eval_colmap_model_all_scenes' name
+    # intersection still finds the right GT folder.
+    alias_dir = None
+    target_path_for_eval = base_target
+    needs_alias = any(
+        s not in target_scenes and "_" in s and s.rsplit("_", 1)[0] in target_scenes
+        for s in input_scenes
+    )
+    if needs_alias:
+        alias_dir = tempfile.mkdtemp(prefix=f"batchsfm_alias_{dataset}_")
+        for s in input_scenes | target_scenes:
+            if s in target_scenes:
+                src = os.path.join(base_target, s)
+            elif "_" in s and s.rsplit("_", 1)[0] in target_scenes:
+                src = os.path.join(base_target, s.rsplit("_", 1)[0])
+            else:
+                continue
+            os.symlink(src, os.path.join(alias_dir, s))
+        target_path_for_eval = alias_dir
+
+    # Scenes to iterate for timings: benchmark-side names (so aliased
+    # variants like "alameda_full" are visited).
+    scenes = sorted(input_scenes)
 
     # Read results
     dfs = {}
     for name in models:
         dfs[name] = eval_colmap_model_all_scenes(
-            target_path=base_target,
+            target_path=target_path_for_eval,
             target_folder=target_folder,
             input_path=f"{base_repo}/{name}/{dataset}",
             input_folder="sparse",
@@ -62,6 +112,9 @@ def read_results(
             verbose=False,
         )
 
+    if alias_dir is not None:
+        shutil.rmtree(alias_dir, ignore_errors=True)
+
     keys = sorted(list(dfs.keys()))
     for key in keys:
         dfs[key].columns = [
@@ -70,42 +123,48 @@ def read_results(
 
     # Read timings
     total_timings = {}
-    for model in models:
-        if model not in total_timings:
-            total_timings[f"{model}"] = {}
-        for scene in scenes:
-            benchmarks = "benchmarks_full/" if full else "benchmarks/"
-            recon_path = f"{benchmarks}{model}/{dataset}/{scene}"
-            if not os.path.exists(recon_path):
-                continue
-            if scene not in total_timings[f"{model}"]:
-                total_timings[f"{model}"][scene] = None
-                if "gluemap" in model:
-                    try:
-                        d = torch.load(
-                            f"{recon_path}/pipeline_timing.pth", weights_only=False
-                        )
-                        total_timings[f"{model}"][scene] = d["total_pipeline"]
-                    except (FileNotFoundError, KeyError):
-                        pass
-                else:
-                    try:
-                        with open(f"{recon_path}/sparse/timings.txt") as f:
-                            lines = f.readlines()
-                        total_timings[f"{model}"][scene] = float(lines[-1].split()[1])
-                    except FileNotFoundError:
-                        pass
+    if not skip_time:
+        for model in models:
+            if model not in total_timings:
+                total_timings[f"{model}"] = {}
+            for scene in scenes:
+                benchmarks = "benchmarks_full/" if full else "benchmarks/"
+                recon_path = f"{benchmarks}{model}/{dataset}/{scene}"
+                if not os.path.exists(recon_path):
+                    continue
+                if scene not in total_timings[f"{model}"]:
+                    total_timings[f"{model}"][scene] = None
+                    if "gluemap" in model:
+                        try:
+                            d = torch.load(
+                                f"{recon_path}/pipeline_timing.pth", weights_only=False
+                            )
+                            total_timings[f"{model}"][scene] = d["total_pipeline"]
+                        except (FileNotFoundError, KeyError):
+                            pass
+                    else:
+                        try:
+                            with open(f"{recon_path}/sparse/timings.txt") as f:
+                                lines = f.readlines()
+                            total_timings[f"{model}"][scene] = float(
+                                lines[-1].split()[1]
+                            )
+                        except FileNotFoundError:
+                            pass
 
     df = pd.concat([dfs[key][f"auc@{thr}_{key}"] for key in keys], axis=1)
 
-    df = pd.concat([df, pd.DataFrame(total_timings)], axis=1)
-    for col in df.columns:
-        if col.startswith("vggt_edge"):
-            df[col] += df["vggt"]  # include base model time
+    if not skip_time:
+        df = pd.concat([df, pd.DataFrame(total_timings)], axis=1)
+        for col in df.columns:
+            if "omega" in col and "auc" not in col:
+                df[col] += df["vggt_omega"]  # include base model time
+            elif col.startswith("vggt_edge"):
+                df[col] += df["vggt"]  # include base model time
 
-    df.columns = [
-        col.replace("_", "+") if "auc" not in col else col for col in df.columns
-    ]
+        df.columns = [
+            col.replace("_", "+") if "auc" not in col else col for col in df.columns
+        ]
 
     for rem in remove:
         df.drop(rem, inplace=True, errors="ignore")

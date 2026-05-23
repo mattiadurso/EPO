@@ -67,6 +67,9 @@ class PoseModule(BaseModule):
                 stays in FP32 (precision-sensitive). No ``GradScaler`` is
                 needed for BF16. Default False (FP32 throughout).
             device: Device to run the module on
+            max_num_iterations: Total optimizer steps, used to size the
+                cosine-decay schedule
+            warmup_steps: Number of linear warmup steps before cosine decay
             dtype: Data type for the tensors
         Note:
             To make this module more readable, some variables and methods share between
@@ -79,6 +82,7 @@ class PoseModule(BaseModule):
         )
         self.hw = hw  # (H, W)
         self.max_num_iterations = max_num_iterations
+        self.warmup_steps = warmup_steps
 
         # When the MLP refines poses, the raw R/t parameters are frozen
         # (the MLP residual + t_offset carry the optimization).
