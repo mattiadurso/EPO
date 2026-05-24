@@ -529,34 +529,37 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
 
         BLOCK_N = 256
         grid = (B, triton.cdiv(N, BLOCK_N))
-        _project_sample_fwd_kernel[grid](
-            xyz_c,
-            K_c,
-            P_c,
-            dt_c,
-            idx_c,
-            hw_c,
-            residuals,
-            mask,
-            xc,
-            yc,
-            zc,
-            ds_du,
-            ds_dv,
-            B,
-            N,
-            H,
-            W,
-            xyz_c.stride(0),
-            xyz_c.stride(1),
-            K_c.stride(0),
-            P_c.stride(0),
-            dt_c.stride(0),
-            dt_c.stride(1),
-            hw_c.stride(0),
-            residuals.stride(0),
-            BLOCK_N=BLOCK_N,
-        )
+        # Triton launches against the current CUDA device, not the tensors'
+        # device — pin it so multi-GPU callers (e.g. ``device="cuda:4"``) work.
+        with torch.cuda.device(device):
+            _project_sample_fwd_kernel[grid](
+                xyz_c,
+                K_c,
+                P_c,
+                dt_c,
+                idx_c,
+                hw_c,
+                residuals,
+                mask,
+                xc,
+                yc,
+                zc,
+                ds_du,
+                ds_dv,
+                B,
+                N,
+                H,
+                W,
+                xyz_c.stride(0),
+                xyz_c.stride(1),
+                K_c.stride(0),
+                P_c.stride(0),
+                dt_c.stride(0),
+                dt_c.stride(1),
+                hw_c.stride(0),
+                residuals.stride(0),
+                BLOCK_N=BLOCK_N,
+            )
 
         # Save references for backward. u, v are NOT saved — the fused
         # reduce kernel recomputes them in-kernel from xc/yc/zc + K, and
@@ -586,28 +589,29 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
 
         BLOCK_N = 256
         grid = (B, triton.cdiv(N, BLOCK_N))
-        _project_sample_bwd_kernel[grid](
-            xc,
-            yc,
-            zc,
-            ds_du,
-            ds_dv,
-            mask,
-            gr,
-            K,
-            P,
-            grad_xyz_world,
-            grad_u,
-            grad_v,
-            B,
-            N,
-            xc.stride(0),
-            grad_xyz_world.stride(0),
-            grad_xyz_world.stride(1),
-            K.stride(0),
-            P.stride(0),
-            BLOCK_N=BLOCK_N,
-        )
+        with torch.cuda.device(device):
+            _project_sample_bwd_kernel[grid](
+                xc,
+                yc,
+                zc,
+                ds_du,
+                ds_dv,
+                mask,
+                gr,
+                K,
+                P,
+                grad_xyz_world,
+                grad_u,
+                grad_v,
+                B,
+                N,
+                xc.stride(0),
+                grad_xyz_world.stride(0),
+                grad_xyz_world.stride(1),
+                K.stride(0),
+                P.stride(0),
+                BLOCK_N=BLOCK_N,
+            )
 
         # ---- Fused K-grad + grad_R + grad_t reduction in one kernel ----
         # Replaces: bmm + sum for grad_R/grad_t and 9 sums for grad_K. The
@@ -616,28 +620,29 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
         grad_K_flat = torch.empty((B, 9), device=device, dtype=dtype)
         grad_R_flat = torch.empty((B, 9), device=device, dtype=dtype)
         grad_t = torch.empty((B, 3), device=device, dtype=dtype)
-        _bwd_reduce_kernel[(B,)](
-            xc,
-            yc,
-            zc,
-            grad_u,
-            grad_v,
-            xyz_world,
-            K,
-            grad_K_flat,
-            grad_R_flat,
-            grad_t,
-            B,
-            N,
-            xc.stride(0),
-            xyz_world.stride(0),
-            xyz_world.stride(1),
-            K.stride(0),
-            grad_K_flat.stride(0),
-            grad_R_flat.stride(0),
-            grad_t.stride(0),
-            BLOCK_N=1024,
-        )
+        with torch.cuda.device(device):
+            _bwd_reduce_kernel[(B,)](
+                xc,
+                yc,
+                zc,
+                grad_u,
+                grad_v,
+                xyz_world,
+                K,
+                grad_K_flat,
+                grad_R_flat,
+                grad_t,
+                B,
+                N,
+                xc.stride(0),
+                xyz_world.stride(0),
+                xyz_world.stride(1),
+                K.stride(0),
+                grad_K_flat.stride(0),
+                grad_R_flat.stride(0),
+                grad_t.stride(0),
+                BLOCK_N=1024,
+            )
         grad_K = grad_K_flat.view(B, 3, 3)
         grad_R = grad_R_flat.view(B, 3, 3)
         grad_P = torch.zeros_like(P)
@@ -924,24 +929,25 @@ class _UnprojectTriton(torch.autograd.Function):
 
         BLOCK_N = 256
         grid = (B, triton.cdiv(N, BLOCK_N))
-        _unproject_fwd_kernel[grid](
-            xy_c,
-            d_c,
-            K_c,
-            P_c,
-            xyz_world,
-            xyz_cam,
-            B,
-            N,
-            xy_c.stride(0),
-            xy_c.stride(1),
-            d_c.stride(0),
-            K_c.stride(0),
-            P_c.stride(0),
-            xyz_world.stride(0),
-            xyz_world.stride(1),
-            BLOCK_N=BLOCK_N,
-        )
+        with torch.cuda.device(device):
+            _unproject_fwd_kernel[grid](
+                xy_c,
+                d_c,
+                K_c,
+                P_c,
+                xyz_world,
+                xyz_cam,
+                B,
+                N,
+                xy_c.stride(0),
+                xy_c.stride(1),
+                d_c.stride(0),
+                K_c.stride(0),
+                P_c.stride(0),
+                xyz_world.stride(0),
+                xyz_world.stride(1),
+                BLOCK_N=BLOCK_N,
+            )
 
         ctx.save_for_backward(xy_c, d_c, K_c, P_c, xyz_cam)
         return xyz_world
@@ -963,25 +969,26 @@ class _UnprojectTriton(torch.autograd.Function):
 
         BLOCK_N = 256
         grid = (B, triton.cdiv(N, BLOCK_N))
-        _unproject_bwd_kernel[grid](
-            xy0,
-            depth,
-            K,
-            P,
-            gr,
-            grad_xyz_cam,
-            grad_depth,
-            B,
-            N,
-            xy0.stride(0),
-            xy0.stride(1),
-            depth.stride(0),
-            K.stride(0),
-            P.stride(0),
-            gr.stride(0),
-            gr.stride(1),
-            BLOCK_N=BLOCK_N,
-        )
+        with torch.cuda.device(xy0.device):
+            _unproject_bwd_kernel[grid](
+                xy0,
+                depth,
+                K,
+                P,
+                gr,
+                grad_xyz_cam,
+                grad_depth,
+                B,
+                N,
+                xy0.stride(0),
+                xy0.stride(1),
+                depth.stride(0),
+                K.stride(0),
+                P.stride(0),
+                gr.stride(0),
+                gr.stride(1),
+                BLOCK_N=BLOCK_N,
+            )
 
         # ---- Reductions over N (small, well-optimised PyTorch bmm/sum) --
         R = P[:, :3, :3]
@@ -1159,18 +1166,19 @@ def _edt_1d_sq_triton(f: torch.Tensor) -> torch.Tensor:
     # is well-defined and stops the backward sweep instead of walking off.
     z = torch.full((B, N + 1), float("inf"), dtype=torch.float32, device=f.device)
 
-    _edt_1d_sq_kernel[(B,)](
-        f,
-        out,
-        v,
-        z,
-        N,
-        f.stride(0),
-        out.stride(0),
-        v.stride(0),
-        z.stride(0),
-        INF=float("inf"),
-    )
+    with torch.cuda.device(f.device):
+        _edt_1d_sq_kernel[(B,)](
+            f,
+            out,
+            v,
+            z,
+            N,
+            f.stride(0),
+            out.stride(0),
+            v.stride(0),
+            z.stride(0),
+            INF=float("inf"),
+        )
     return out
 
 

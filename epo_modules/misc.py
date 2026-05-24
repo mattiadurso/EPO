@@ -257,6 +257,18 @@ class MiscModule:
         torch.cuda.manual_seed(self.seed)
         torch.cuda.manual_seed_all(self.seed)
 
+        # Pin the current CUDA device to the one the user asked for. Triton
+        # launches kernels against ``torch.cuda.current_device()``; if tensors
+        # live on ``cuda:N`` but the current device is ``cuda:0`` the launch
+        # fails with a misleading "cpu tensor?" error.
+        if torch.cuda.is_available():
+            dev = torch.device(self.device)
+            dev_idx = dev.index if dev.type == "cuda" and dev.index is not None else 0
+            if dev.type == "cuda":
+                torch.cuda.set_device(dev_idx)
+        else:
+            dev_idx = 0
+
         if mode == "debug":
             os.environ["PYTHONHASHSEED"] = "0"
             os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -270,10 +282,6 @@ class MiscModule:
             torch.backends.cudnn.benchmark = True
 
             if torch.cuda.is_available():
-                dev = torch.device(self.device)
-                dev_idx = (
-                    dev.index if dev.type == "cuda" and dev.index is not None else 0
-                )
                 gpu_name = torch.cuda.get_device_name(dev_idx)
                 if "4090" in gpu_name:
                     torch.set_float32_matmul_precision("high")
