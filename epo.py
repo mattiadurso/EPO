@@ -132,6 +132,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             kernels with analytical backwards for *both* paths (numerically
             equivalent up to fp32 accumulation noise; requires CUDA + the
             ``triton`` package). Toggles forward and backward in lockstep.
+        mlp_hidden_dim: Hidden dimension for the pose-refinement MLP. Default
         use_amp: If True, run the pose-refinement MLP's linear layers in BF16
             via ``torch.autocast``. Gram-Schmidt orthonormalisation stays in
             FP32 (precision-sensitive). No ``GradScaler`` needed for BF16.
@@ -190,6 +191,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         grad_z=True,
         use_mlp_pose_refinement=True,
         backend="torch",
+        mlp_hidden_dim=128,
         use_amp=False,
         auc_saving_freq=50,
         warmup_steps=25,
@@ -263,6 +265,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.min_points = min_points
         self.sampling_factor = sampling_factor
         self.reprojection_error = reprojection_error
+        self.mlp_hidden_dim = mlp_hidden_dim
         # Single backend switch — controls both fused Triton ops
         # (project+DT-sample and unproject) for both forward and backward.
         # "torch" = reference PyTorch chains; "triton" = fused CUDA kernels
@@ -1351,6 +1354,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             grad_t=self.grad_t,
             grad_t_offset=self.grad_t_offset,
             mlp_lr=self.mlp_pose_lr,
+            hidden_dim=self.mlp_pose_hidden_dim,
             use_mlp=self.use_mlp_pose_refinement,
             use_amp=self.use_amp,
             max_num_iterations=self.max_num_iterations,

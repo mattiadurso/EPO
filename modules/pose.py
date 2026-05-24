@@ -41,6 +41,7 @@ class PoseModule(BaseModule):
         grad_t_offset: bool = False,
         use_mlp: bool = True,
         mlp_lr: float = 3e-3,
+        hidden_dim: int = 128,
         use_amp: bool = False,
         device: str = "cuda",
         max_num_iterations: int = 2048,
@@ -62,6 +63,7 @@ class PoseModule(BaseModule):
             grad_t_offset: Whether to compute gradients for translation offset
             use_mlp: Whether to use MLP for pose refinement
             mlp_lr: Learning rate for MLP optimizer
+            hidden_dim: Dimension of the hidden layers in the MLP
             use_amp: If True, run the pose-refinement MLP's linear layers in
                 BF16 via ``torch.autocast``. The Gram-Schmidt orthonormalisation
                 stays in FP32 (precision-sensitive). No ``GradScaler`` is
@@ -129,7 +131,7 @@ class PoseModule(BaseModule):
             self.mlp = PoseRefinementMLP(
                 input_dim=12,  # 3x4 pose matrix flattened
                 output_dim=12,  # 3x4 pose matrix flattened
-                hidden_dim=128,  # or 256 for complex scenarios
+                hidden_dim=hidden_dim,  # or 256 for complex scenarios
             ).to(self.device, dtype=self.dtype)
             # Initialize optimizer with MLP parameters
             self.init_optimizer(mlp_lr=mlp_lr)
