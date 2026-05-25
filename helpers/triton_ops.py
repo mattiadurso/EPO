@@ -40,10 +40,12 @@ def _project_sample_fwd_kernel(
     IMG_HW_ptr,  # (B, 2) int32 — per-row real (H, W) of the target image
     OUT_ptr,  # (B, N) float — residuals
     MASK_ptr,  # (B, N) uint8 — 1 if inside
-    # Saved intermediates for backward
-    XC_ptr,
-    YC_ptr,
-    ZC_ptr,
+    # Saved intermediates for backward. xc/yc/zc are NOT saved — the fused
+    # bwd kernel (cycle 19) re-derives them from (xyz_world, P) using the
+    # same source expression, then uses them for *both* the per-point grad
+    # AND the per-tile K/R/t partial sums within one program. The cycle-18
+    # cross-kernel FP-order issue cannot arise because there's only one
+    # consumer kernel now.
     DSDU_ptr,
     DSDV_ptr,
     # Sizes — H, W here are the *padded* canvas (DT memory layout)
@@ -64,16 +66,22 @@ def _project_sample_fwd_kernel(
 ):
     """Forward: project xyz_world → pixel → bilinear-sample dt_field.
 
-    Grid layout: ``(B, ceil(N / BLOCK_N))``. Each program handles one batch row
-    and a block of ``BLOCK_N`` points.
+    Grid layout: ``(ceil(N / BLOCK_N), B)``. ``pid_n`` is the fast-varying
+    axis (axis 0 = CUDA ``blockIdx.x``), so the hardware dispatches
+    consecutive blocks with the same ``pid_b`` — i.e. they all sample the
+    same DT image. The 1 MB DT field for that image stays hot in L2 across
+    the ~ceil(N / BLOCK_N) tiles of a single batch row. The original layout
+    ``(B, N / BLOCK_N)`` put ``pid_b`` on the fast-varying axis, so
+    consecutive blocks hit different DT images and L2 went cold on the
+    dominant memory bottleneck of this kernel.
 
     DT_ptr is the *source* tensor — same memory for every program; ``DT_IDX_ptr``
     tells this program which image's DT field to sample. This avoids
     materialising a per-batch ``(B, H, W)`` copy, which on 518² fields is a
     ~550 MB gather per mini-batch.
     """
-    pid_b = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
 
     n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = n_offs < N
@@ -181,72 +189,245 @@ def _project_sample_fwd_kernel(
     sampled = tl.where(sampled == sampled, sampled, 0.0)  # NaN ⇒ 0
     tl.store(OUT_ptr + out_off, sampled, mask=n_mask)
     tl.store(MASK_ptr + out_off, inside.to(tl.uint8), mask=n_mask)
-    # Intermediates for backward — store SAFE values. For !inside points the
-    # raw xc/yc/zc/u/v can be ±Inf or NaN (e.g. point behind camera ⇒ zc ≤ 0
-    # ⇒ inv_z = ±Inf ⇒ u, v = ±Inf/NaN). The backward must never see those:
-    # ``0 * NaN = NaN`` in IEEE-754, so even a zeroed ``grad_residuals`` would
-    # poison the chain. Substitute neutral finite values for !inside points.
-    xc_s = tl.where(inside, xc, 0.0)
-    yc_s = tl.where(inside, yc, 0.0)
-    zc_s = tl.where(inside, zc, 1.0)  # 1.0 ⇒ inv_z = 1.0, finite in bwd
-    tl.store(XC_ptr + out_off, xc_s, mask=n_mask)
-    tl.store(YC_ptr + out_off, yc_s, mask=n_mask)
-    tl.store(ZC_ptr + out_off, zc_s, mask=n_mask)
+    # xc/yc/zc are NOT stored — see kernel-signature comment. The fused bwd
+    # kernel reads xyz_world+P and recomputes them. ds_du/ds_dv ARE stored
+    # because recomputing them in bwd would re-do the 4 random DT gathers,
+    # which are the dominant memory cost.
     tl.store(DSDU_ptr + out_off, ds_du_val, mask=n_mask)
     tl.store(DSDV_ptr + out_off, ds_dv_val, mask=n_mask)
 
 
 # ---------------------------------------------------------------------------
-# K-grad reduction kernel — loops over N in scalar accumulators
+# Fused backward + per-tile reduction kernel (cycle 19)
 # ---------------------------------------------------------------------------
 #
-# Replaces 9 PyTorch `(grad_* * X_*).sum(dim=1)` calls + 4 stacks.
-# Grid is 1D `(B,)` — one program per batch. Each program loops over N in
-# BLOCK_N tiles, doing `tl.sum(axis=0)` per tile and accumulating into 9
-# scalar registers. The single-program-per-batch loop preserves a sequential
-# reduction order over N, which is closer to PyTorch's monolithic sum order
-# than a 2-level per-tile + cross-tile reduction would be (avoiding the
-# FP-order drift that broke an earlier per-tile variant on flowers).
+# One kernel does what `_project_sample_bwd_kernel` and `_bwd_reduce_kernel`
+# previously did separately. Per program:
+#   1. Re-derive xc/yc/zc from xyz_world + P (same source expression as fwd,
+#      bit-identical FP since it's compiled in the same kernel context).
+#   2. Compute grad_xyz_world per point → write to GMEM.
+#   3. Accumulate 9 K-grad + 9 R-grad + 3 t-grad partial sums over the tile
+#      via `tl.sum(axis=0)` → write 21 scalars to per-tile partial buffers.
+#
+# A small `_combine_partials_kernel` (grid (B,)) then sequentially sums the
+# partials into final grad_K / grad_R / grad_t, matching the old reduce
+# kernel's left-associative outer-loop accumulation order.
+#
+# Why fused vs the old split: cycle 18 measured +5.94% from dropping the
+# xc/yc/zc fwd saves, but the AUC drifted because bwd and reduce each
+# recomputed xc/yc/zc separately and Triton scheduled their FMAs slightly
+# differently. Doing both in one kernel keeps xc/yc/zc bit-identical
+# between the per-point grad and the per-tile reduction; the cross-tile
+# combine is FP-order-identical to the old reduce kernel's outer loop.
 
 
 @triton.jit
-def _bwd_reduce_kernel(
-    XC_ptr,
-    YC_ptr,
-    ZC_ptr,
-    GU_ptr,
-    GV_ptr,
-    XYZW_ptr,  # (B, N, 3) world points — needed for grad_R
-    K_ptr,
-    GK_ptr,  # (B, 9) flat K-grad
-    GR_ptr,  # (B, 9) flat grad_R
-    GT_ptr,  # (B, 3) grad_t
+def _project_sample_bwd_kernel(
+    XYZW_ptr,  # (B, N, 3) world points — used for xc/yc/zc derive + grad_R
+    DSDU_ptr,  # (B, N) fwd-saved bilinear gradient
+    DSDV_ptr,
+    MASK_ptr,  # (B, N) uint8 — inside mask
+    GR_ptr,  # (B, N) grad_residuals (upstream cotangent)
+    K_ptr,  # (B, 3, 3)
+    P_ptr,  # (B, 4, 4)
+    # Outputs
+    GXYZ_ptr,  # (B, N, 3) grad_xyz_world (per-point)
+    PK_ptr,  # (B, n_tiles, 9) per-tile K-grad partials
+    PR_ptr,  # (B, n_tiles, 9) per-tile R-grad partials
+    PT_ptr,  # (B, n_tiles, 3) per-tile t-grad partials
+    # Sizes
     B,
     N,
-    s_xc_b,
+    # Strides
     s_xyzw_b,
     s_xyzw_n,
+    s_dsdu_b,  # stride between batches in (B, N) scalar tensors
+    s_gxyz_b,
+    s_gxyz_n,
     s_K_b,
-    s_gk_b,
-    s_gr_b,
-    s_gt_b,
+    s_P_b,
+    s_pk_b,
+    s_pk_t,
+    s_pr_b,
+    s_pr_t,
+    s_pt_b,
+    s_pt_t,
     BLOCK_N: tl.constexpr,
 ):
-    """Fused K-grad + grad_R + grad_t reduction.
+    """Fused per-point bwd + per-tile K/R/t partial reductions.
 
-    One program per batch row; loops over N, accumulating 9 K-grad + 9 grad_R
-    + 3 grad_t scalars in registers. Recomputes the projection chain
-    (grad_xc, grad_yc, grad_zc) from saved (grad_u, grad_v, xc, yc, zc, K)
-    so the (B, N, 3) grad_xyz_cam intermediate is never materialised.
+    Grid layout: ``(ceil(N / BLOCK_N), B)``. ``pid_n`` is fast-varying
+    (axis 0 = CUDA ``blockIdx.x``) so consecutive blocks share ``pid_b``
+    and reuse the per-batch K/P scalars and per-row (B, N) tensors in L1
+    — same locality argument as cycles 8/9. One tile of BLOCK_N points
+    per program; one row of (PK, PR, PT) partial sums per program.
     """
-    pid_b = tl.program_id(0)
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = n_offs < N
+
+    # ---- Load xyz_world (used for xc/yc/zc derive AND for grad_R sums) -
+    xyzw_row = pid_b * s_xyzw_b + n_offs * s_xyzw_n
+    x_w = tl.load(XYZW_ptr + xyzw_row + 0, mask=n_mask, other=0.0)
+    y_w = tl.load(XYZW_ptr + xyzw_row + 1, mask=n_mask, other=0.0)
+    z_w = tl.load(XYZW_ptr + xyzw_row + 2, mask=n_mask, other=0.0)
+
+    # ---- Load P (R + t) once; reused for xc/yc/zc + grad_xyz_world -----
+    Pb = P_ptr + pid_b * s_P_b
+    R00 = tl.load(Pb + 0)
+    R01 = tl.load(Pb + 1)
+    R02 = tl.load(Pb + 2)
+    t0 = tl.load(Pb + 3)
+    R10 = tl.load(Pb + 4)
+    R11 = tl.load(Pb + 5)
+    R12 = tl.load(Pb + 6)
+    t1 = tl.load(Pb + 7)
+    R20 = tl.load(Pb + 8)
+    R21 = tl.load(Pb + 9)
+    R22 = tl.load(Pb + 10)
+    t2 = tl.load(Pb + 11)
+
+    # ---- Recompute xc/yc/zc (same source expression as fwd) ------------
+    xc = R00 * x_w + R01 * y_w + R02 * z_w + t0
+    yc = R10 * x_w + R11 * y_w + R12 * z_w + t1
+    zc = R20 * x_w + R21 * y_w + R22 * z_w + t2
+
+    # ---- Mask + zc !inside-safe substitution ---------------------------
+    row = pid_b * s_dsdu_b + n_offs
+    inside_u8 = tl.load(MASK_ptr + row, mask=n_mask, other=0)
+    inside = inside_u8 != 0
+    # xc/yc are inherently finite (linear combo of finite world points);
+    # only zc needs the substitution so 1/zc stays finite.
+    zc = tl.where(inside, zc, 1.0)
+
+    # ---- Load grad_residuals + ds_du/ds_dv → grad_u/grad_v -------------
+    gr = tl.load(GR_ptr + row, mask=n_mask, other=0.0)
+    gr = tl.where(inside, gr, 0.0)
+    ds_du = tl.load(DSDU_ptr + row, mask=n_mask, other=0.0)
+    ds_dv = tl.load(DSDV_ptr + row, mask=n_mask, other=0.0)
+    grad_u = gr * ds_du
+    grad_v = gr * ds_dv
+
+    # ---- K (fx, fy, cx, cy) + perspective divide -----------------------
     Kb = K_ptr + pid_b * s_K_b
     fx = tl.load(Kb + 0)
     cx = tl.load(Kb + 2)
     fy = tl.load(Kb + 4)
     cy = tl.load(Kb + 5)
+    inv_z = 1.0 / zc
 
-    # K-grad accumulators
+    # ---- grad_xc/yc/zc — used for BOTH per-point AND partial sums ------
+    grad_xc = grad_u * fx * inv_z
+    grad_yc = grad_v * fy * inv_z
+    grad_zc = -(grad_u * fx * xc + grad_v * fy * yc) * inv_z * inv_z
+
+    # ---- grad_xyz_world = R^T @ grad_xyz_cam (per-point output) --------
+    g_x = R00 * grad_xc + R10 * grad_yc + R20 * grad_zc
+    g_y = R01 * grad_xc + R11 * grad_yc + R21 * grad_zc
+    g_z = R02 * grad_xc + R12 * grad_yc + R22 * grad_zc
+
+    # Defensive: mathematically zero for !inside (gr=0), but tl.where
+    # guards against any stray NaN coming through.
+    g_x = tl.where(inside, g_x, 0.0)
+    g_y = tl.where(inside, g_y, 0.0)
+    g_z = tl.where(inside, g_z, 0.0)
+
+    gxyz_row = pid_b * s_gxyz_b + n_offs * s_gxyz_n
+    tl.store(GXYZ_ptr + gxyz_row + 0, g_x, mask=n_mask)
+    tl.store(GXYZ_ptr + gxyz_row + 1, g_y, mask=n_mask)
+    tl.store(GXYZ_ptr + gxyz_row + 2, g_z, mask=n_mask)
+
+    # ---- Per-tile partial reductions (same operand sequence as the old
+    #      reduce kernel's per-tile sums) --------------------------------
+    X0 = xc * inv_z
+    X1 = yc * inv_z
+    X2 = zc * inv_z
+    u = fx * xc * inv_z + cx
+    v = fy * yc * inv_z + cy
+    guv = -(grad_u * u + grad_v * v)
+
+    pK00 = tl.sum(grad_u * X0, axis=0)
+    pK01 = tl.sum(grad_u * X1, axis=0)
+    pK02 = tl.sum(grad_u * X2, axis=0)
+    pK10 = tl.sum(grad_v * X0, axis=0)
+    pK11 = tl.sum(grad_v * X1, axis=0)
+    pK12 = tl.sum(grad_v * X2, axis=0)
+    pK20 = tl.sum(guv * X0, axis=0)
+    pK21 = tl.sum(guv * X1, axis=0)
+    pK22 = tl.sum(guv * X2, axis=0)
+
+    pR00 = tl.sum(grad_xc * x_w, axis=0)
+    pR01 = tl.sum(grad_xc * y_w, axis=0)
+    pR02 = tl.sum(grad_xc * z_w, axis=0)
+    pR10 = tl.sum(grad_yc * x_w, axis=0)
+    pR11 = tl.sum(grad_yc * y_w, axis=0)
+    pR12 = tl.sum(grad_yc * z_w, axis=0)
+    pR20 = tl.sum(grad_zc * x_w, axis=0)
+    pR21 = tl.sum(grad_zc * y_w, axis=0)
+    pR22 = tl.sum(grad_zc * z_w, axis=0)
+
+    pT0 = tl.sum(grad_xc, axis=0)
+    pT1 = tl.sum(grad_yc, axis=0)
+    pT2 = tl.sum(grad_zc, axis=0)
+
+    # ---- Store the 21 partials at slot (pid_b, pid_n, k) ---------------
+    pk_base = pid_b * s_pk_b + pid_n * s_pk_t
+    tl.store(PK_ptr + pk_base + 0, pK00)
+    tl.store(PK_ptr + pk_base + 1, pK01)
+    tl.store(PK_ptr + pk_base + 2, pK02)
+    tl.store(PK_ptr + pk_base + 3, pK10)
+    tl.store(PK_ptr + pk_base + 4, pK11)
+    tl.store(PK_ptr + pk_base + 5, pK12)
+    tl.store(PK_ptr + pk_base + 6, pK20)
+    tl.store(PK_ptr + pk_base + 7, pK21)
+    tl.store(PK_ptr + pk_base + 8, pK22)
+
+    pr_base = pid_b * s_pr_b + pid_n * s_pr_t
+    tl.store(PR_ptr + pr_base + 0, pR00)
+    tl.store(PR_ptr + pr_base + 1, pR01)
+    tl.store(PR_ptr + pr_base + 2, pR02)
+    tl.store(PR_ptr + pr_base + 3, pR10)
+    tl.store(PR_ptr + pr_base + 4, pR11)
+    tl.store(PR_ptr + pr_base + 5, pR12)
+    tl.store(PR_ptr + pr_base + 6, pR20)
+    tl.store(PR_ptr + pr_base + 7, pR21)
+    tl.store(PR_ptr + pr_base + 8, pR22)
+
+    pt_base = pid_b * s_pt_b + pid_n * s_pt_t
+    tl.store(PT_ptr + pt_base + 0, pT0)
+    tl.store(PT_ptr + pt_base + 1, pT1)
+    tl.store(PT_ptr + pt_base + 2, pT2)
+
+
+@triton.jit
+def _combine_partials_kernel(
+    PK_ptr,  # (B, n_tiles, 9)
+    PR_ptr,  # (B, n_tiles, 9)
+    PT_ptr,  # (B, n_tiles, 3)
+    GK_ptr,  # (B, 9) — final flat grad_K
+    GR_ptr,  # (B, 9) — final flat grad_R
+    GT_ptr,  # (B, 3) — final grad_t
+    N_TILES,
+    s_pk_b,
+    s_pk_t,
+    s_pr_b,
+    s_pr_t,
+    s_pt_b,
+    s_pt_t,
+    s_gk_b,
+    s_gr_b,
+    s_gt_b,
+):
+    """Combine per-tile partial sums into final grad_K / grad_R / grad_t.
+
+    Grid: ``(B,)``. Each program loops over ``N_TILES`` sequentially,
+    accumulating left-associatively — matches the old reduce kernel's
+    outer-loop FP order exactly. Per-tile partial sums and the cross-tile
+    combine together reproduce the old reduce kernel bit-for-bit:
+      ``((((0 + S_0) + S_1) + S_2) + ...) + S_{n_tiles-1}``.
+    """
+    pid_b = tl.program_id(0)
     aK00 = 0.0
     aK01 = 0.0
     aK02 = 0.0
@@ -256,7 +437,6 @@ def _bwd_reduce_kernel(
     aK20 = 0.0
     aK21 = 0.0
     aK22 = 0.0
-    # grad_R accumulators (R[i, j] = sum_n grad_xc[i] * xyz_world[j])
     aR00 = 0.0
     aR01 = 0.0
     aR02 = 0.0
@@ -266,63 +446,35 @@ def _bwd_reduce_kernel(
     aR20 = 0.0
     aR21 = 0.0
     aR22 = 0.0
-    # grad_t accumulators
     aT0 = 0.0
     aT1 = 0.0
     aT2 = 0.0
 
-    for block_start in range(0, N, BLOCK_N):
-        n_offs = block_start + tl.arange(0, BLOCK_N)
-        n_mask = n_offs < N
-        row = pid_b * s_xc_b + n_offs
-        xc = tl.load(XC_ptr + row, mask=n_mask, other=0.0)
-        yc = tl.load(YC_ptr + row, mask=n_mask, other=0.0)
-        zc = tl.load(ZC_ptr + row, mask=n_mask, other=1.0)
-        gu = tl.load(GU_ptr + row, mask=n_mask, other=0.0)
-        gv = tl.load(GV_ptr + row, mask=n_mask, other=0.0)
-
-        # Load xyz_world (B, N, 3) for grad_R reduction.
-        xyzw_row = pid_b * s_xyzw_b + n_offs * s_xyzw_n
-        x_w = tl.load(XYZW_ptr + xyzw_row + 0, mask=n_mask, other=0.0)
-        y_w = tl.load(XYZW_ptr + xyzw_row + 1, mask=n_mask, other=0.0)
-        z_w = tl.load(XYZW_ptr + xyzw_row + 2, mask=n_mask, other=0.0)
-
-        inv_z = 1.0 / zc
-        X0 = xc * inv_z
-        X1 = yc * inv_z
-        X2 = zc * inv_z
-        u = fx * xc * inv_z + cx
-        v = fy * yc * inv_z + cy
-        guv = -(gu * u + gv * v)
-
-        aK00 += tl.sum(gu * X0, axis=0)
-        aK01 += tl.sum(gu * X1, axis=0)
-        aK02 += tl.sum(gu * X2, axis=0)
-        aK10 += tl.sum(gv * X0, axis=0)
-        aK11 += tl.sum(gv * X1, axis=0)
-        aK12 += tl.sum(gv * X2, axis=0)
-        aK20 += tl.sum(guv * X0, axis=0)
-        aK21 += tl.sum(guv * X1, axis=0)
-        aK22 += tl.sum(guv * X2, axis=0)
-
-        # Recompute projection chain so we don't need to write grad_xyz_cam.
-        gxc = gu * fx * inv_z
-        gyc = gv * fy * inv_z
-        gzc = -(gu * fx * xc + gv * fy * yc) * inv_z * inv_z
-
-        aR00 += tl.sum(gxc * x_w, axis=0)
-        aR01 += tl.sum(gxc * y_w, axis=0)
-        aR02 += tl.sum(gxc * z_w, axis=0)
-        aR10 += tl.sum(gyc * x_w, axis=0)
-        aR11 += tl.sum(gyc * y_w, axis=0)
-        aR12 += tl.sum(gyc * z_w, axis=0)
-        aR20 += tl.sum(gzc * x_w, axis=0)
-        aR21 += tl.sum(gzc * y_w, axis=0)
-        aR22 += tl.sum(gzc * z_w, axis=0)
-
-        aT0 += tl.sum(gxc, axis=0)
-        aT1 += tl.sum(gyc, axis=0)
-        aT2 += tl.sum(gzc, axis=0)
+    for t_idx in range(N_TILES):
+        pk_b = pid_b * s_pk_b + t_idx * s_pk_t
+        aK00 += tl.load(PK_ptr + pk_b + 0)
+        aK01 += tl.load(PK_ptr + pk_b + 1)
+        aK02 += tl.load(PK_ptr + pk_b + 2)
+        aK10 += tl.load(PK_ptr + pk_b + 3)
+        aK11 += tl.load(PK_ptr + pk_b + 4)
+        aK12 += tl.load(PK_ptr + pk_b + 5)
+        aK20 += tl.load(PK_ptr + pk_b + 6)
+        aK21 += tl.load(PK_ptr + pk_b + 7)
+        aK22 += tl.load(PK_ptr + pk_b + 8)
+        pr_b = pid_b * s_pr_b + t_idx * s_pr_t
+        aR00 += tl.load(PR_ptr + pr_b + 0)
+        aR01 += tl.load(PR_ptr + pr_b + 1)
+        aR02 += tl.load(PR_ptr + pr_b + 2)
+        aR10 += tl.load(PR_ptr + pr_b + 3)
+        aR11 += tl.load(PR_ptr + pr_b + 4)
+        aR12 += tl.load(PR_ptr + pr_b + 5)
+        aR20 += tl.load(PR_ptr + pr_b + 6)
+        aR21 += tl.load(PR_ptr + pr_b + 7)
+        aR22 += tl.load(PR_ptr + pr_b + 8)
+        pt_b = pid_b * s_pt_b + t_idx * s_pt_t
+        aT0 += tl.load(PT_ptr + pt_b + 0)
+        aT1 += tl.load(PT_ptr + pt_b + 1)
+        aT2 += tl.load(PT_ptr + pt_b + 2)
 
     base_k = pid_b * s_gk_b
     tl.store(GK_ptr + base_k + 0, aK00)
@@ -348,121 +500,6 @@ def _bwd_reduce_kernel(
     tl.store(GT_ptr + base_t + 0, aT0)
     tl.store(GT_ptr + base_t + 1, aT1)
     tl.store(GT_ptr + base_t + 2, aT2)
-
-
-# ---------------------------------------------------------------------------
-# Triton backward kernel (per-point, no atomics)
-# ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _project_sample_bwd_kernel(
-    # Saved from fwd / inputs — u, v dropped (not used in bwd kernel post-H6;
-    # the fused reduce kernel recomputes u, v internally from xc/yc/zc + K).
-    XC_ptr,
-    YC_ptr,
-    ZC_ptr,
-    DSDU_ptr,
-    DSDV_ptr,
-    MASK_ptr,
-    GR_ptr,  # grad_residuals (B, N)
-    K_ptr,  # (B, 3, 3)
-    P_ptr,  # (B, 4, 4)
-    # Per-point outputs
-    GXYZ_ptr,  # grad_xyz_world (B, N, 3)
-    GU_ptr,  # grad_u (B, N) — for grad_K in PyTorch
-    GV_ptr,  # grad_v (B, N)
-    # Sizes
-    B,
-    N,
-    # Strides
-    s_xc_b,  # stride between batches in (B, N) scalar tensors
-    s_gxyz_b,
-    s_gxyz_n,
-    s_K_b,
-    s_P_b,
-    BLOCK_N: tl.constexpr,
-):
-    """Backward: per-point gradient of the project+bilinear-sample fwd kernel.
-
-    All computation is per-point (no scatter / atomics). Reductions over N
-    (for grad_R, grad_t, grad_K) are done outside this kernel via bmm + sum.
-    """
-    pid_b = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    n_mask = n_offs < N
-
-    # ---- Load per-point intermediates ----------------------------------
-    row = pid_b * s_xc_b + n_offs
-    xc = tl.load(XC_ptr + row, mask=n_mask, other=0.0)
-    yc = tl.load(YC_ptr + row, mask=n_mask, other=0.0)
-    zc = tl.load(ZC_ptr + row, mask=n_mask, other=1.0)
-    inside_u8 = tl.load(MASK_ptr + row, mask=n_mask, other=0)
-    inside = inside_u8 != 0
-    gr = tl.load(GR_ptr + row, mask=n_mask, other=0.0)
-    # Zero-out grad for outside points up-front; they contributed 0 to the loss.
-    gr = tl.where(inside, gr, 0.0)
-
-    # ---- Bilinear gradient: ds/du, ds/dv loaded directly from fwd ------
-    # Fwd computed these from the DT corners it already had loaded; loading
-    # them here is one coalesced read instead of 4 random DT gathers + the
-    # 8-op bilinear-grad compute.
-    ds_du = tl.load(DSDU_ptr + row, mask=n_mask, other=0.0)
-    ds_dv = tl.load(DSDV_ptr + row, mask=n_mask, other=0.0)
-    grad_u = gr * ds_du
-    grad_v = gr * ds_dv
-
-    # ---- Chain through projection: u = fx*xc/zc + cx; v = fy*yc/zc + cy
-    # zc was stored as 1.0 for !inside points (see fwd kernel), so inv_z is
-    # finite even when a point went behind the camera in the upstream graph.
-    Kb = K_ptr + pid_b * s_K_b
-    fx = tl.load(Kb + 0)
-    fy = tl.load(Kb + 4)
-    inv_z = 1.0 / zc
-    grad_xc = grad_u * fx * inv_z
-    grad_yc = grad_v * fy * inv_z
-    grad_zc = -(grad_u * fx * xc + grad_v * fy * yc) * inv_z * inv_z
-
-    # ---- Chain through xyz_cam = R @ xyz + t: grad_xyz = R^T @ grad_xyz_cam
-    Pb = P_ptr + pid_b * s_P_b
-    R00 = tl.load(Pb + 0)
-    R01 = tl.load(Pb + 1)
-    R02 = tl.load(Pb + 2)
-    R10 = tl.load(Pb + 4)
-    R11 = tl.load(Pb + 5)
-    R12 = tl.load(Pb + 6)
-    R20 = tl.load(Pb + 8)
-    R21 = tl.load(Pb + 9)
-    R22 = tl.load(Pb + 10)
-    # grad_xyz_world[k] = sum_i R[i,k] * grad_xyz_cam[i]
-    g_x = R00 * grad_xc + R10 * grad_yc + R20 * grad_zc
-    g_y = R01 * grad_xc + R11 * grad_yc + R21 * grad_zc
-    g_z = R02 * grad_xc + R12 * grad_yc + R22 * grad_zc
-
-    # ---- Final defensive mask -------------------------------------------
-    # Every value below is mathematically zero for !inside points (gr=0 and
-    # safe intermediates), but a stray NaN would still poison the optimizer.
-    # Explicitly clamp to 0.0 for !inside ⇒ guaranteed-finite gradients.
-    g_x = tl.where(inside, g_x, 0.0)
-    g_y = tl.where(inside, g_y, 0.0)
-    g_z = tl.where(inside, g_z, 0.0)
-    grad_xc = tl.where(inside, grad_xc, 0.0)
-    grad_yc = tl.where(inside, grad_yc, 0.0)
-    grad_zc = tl.where(inside, grad_zc, 0.0)
-    grad_u = tl.where(inside, grad_u, 0.0)
-    grad_v = tl.where(inside, grad_v, 0.0)
-
-    # ---- Store outputs --------------------------------------------------
-    gxyz_row = pid_b * s_gxyz_b + n_offs * s_gxyz_n
-    tl.store(GXYZ_ptr + gxyz_row + 0, g_x, mask=n_mask)
-    tl.store(GXYZ_ptr + gxyz_row + 1, g_y, mask=n_mask)
-    tl.store(GXYZ_ptr + gxyz_row + 2, g_z, mask=n_mask)
-    # grad_xyz_cam is NOT stored — _bwd_reduce_kernel recomputes the
-    # projection chain in-tile so the (B, N, 3) intermediate is dead memory.
-    # grad_u, grad_v: (B, N) — still needed for the K-grad reduce kernel.
-    tl.store(GU_ptr + row, grad_u, mask=n_mask)
-    tl.store(GV_ptr + row, grad_v, mask=n_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -521,14 +558,16 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
 
         residuals = torch.empty((B, N), device=device, dtype=dtype)
         mask = torch.empty((B, N), device=device, dtype=torch.uint8)
-        xc = torch.empty((B, N), device=device, dtype=dtype)
-        yc = torch.empty((B, N), device=device, dtype=dtype)
-        zc = torch.empty((B, N), device=device, dtype=dtype)
+        # xc/yc/zc removed (cycle 19): the fused bwd kernel recomputes them.
         ds_du = torch.empty((B, N), device=device, dtype=dtype)
         ds_dv = torch.empty((B, N), device=device, dtype=dtype)
 
         BLOCK_N = 256
-        grid = (B, triton.cdiv(N, BLOCK_N))
+        # Grid axes order matters: axis 0 (CUDA blockIdx.x) varies fastest in
+        # hardware dispatch, so we put ``N / BLOCK_N`` first and ``B`` second.
+        # Consecutive blocks then share ``pid_b`` (and DT image), keeping the
+        # 1 MB DT field hot in L2 across the ~48 tiles of one batch row.
+        grid = (triton.cdiv(N, BLOCK_N), B)
         # Triton launches against the current CUDA device, not the tensors'
         # device — pin it so multi-GPU callers (e.g. ``device="cuda:4"``) work.
         with torch.cuda.device(device):
@@ -541,9 +580,6 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 hw_c,
                 residuals,
                 mask,
-                xc,
-                yc,
-                zc,
                 ds_du,
                 ds_dv,
                 B,
@@ -559,12 +595,22 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 hw_c.stride(0),
                 residuals.stride(0),
                 BLOCK_N=BLOCK_N,
+                # Single fixed launch config (no autotune dispatch overhead).
+                # ``num_warps=8`` matches BLOCK_N=256 → 1 element/thread (vs
+                # default 4 warps × 32 threads = 128 threads, 2 elements each).
+                # ``num_stages=4`` lets the Triton pipeline-pass overlap the
+                # heavy load chain (xyz_world + K + P + IMG_HW + 4 DT taps)
+                # with the per-point FMAs across one extra stage — fwd is
+                # memory-bound on the random DT bilinear gathers.
+                num_warps=8,
+                num_stages=4,
             )
 
-        # Save references for backward. u, v are NOT saved — the fused
-        # reduce kernel recomputes them in-kernel from xc/yc/zc + K, and
-        # the bwd kernel no longer touches u, v post-H6.
-        ctx.save_for_backward(xyz_c, K_c, P_c, xc, yc, zc, ds_du, ds_dv, mask)
+        # Save references for backward. Neither u/v nor xc/yc/zc are saved
+        # — the fused bwd kernel (cycle 19) derives all of them once per
+        # point from (xyz_world, P) and uses them for both the per-point
+        # grad_xyz_world and the per-tile K/R/t partial reductions.
+        ctx.save_for_backward(xyz_c, K_c, P_c, ds_du, ds_dv, mask)
         return residuals, mask.bool()
 
     @staticmethod
@@ -574,26 +620,32 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
         Returns gradients w.r.t. ``(xyz_world, K, P)``; the DT field, dt
         indices, and ``img_hw`` are non-grad inputs and yield ``None``.
         """
-        xyz_world, K, P, xc, yc, zc, ds_du, ds_dv, mask = ctx.saved_tensors
+        xyz_world, K, P, ds_du, ds_dv, mask = ctx.saved_tensors
         B, N, _ = xyz_world.shape
         device, dtype = xyz_world.device, xyz_world.dtype
 
         gr = grad_residuals.contiguous()
 
-        # Per-point outputs from the bwd kernel: grad_xyz_world, grad_u,
-        # grad_v. grad_xyz_cam is NO LONGER materialised — the fused reduce
-        # kernel below recomputes the projection chain in-tile.
+        # Per-point grad_xyz_world. xc/yc/zc are re-derived in the fused
+        # kernel from (xyz_world, P) — no save/load round-trip (cycle 19).
         grad_xyz_world = torch.empty_like(xyz_world)
-        grad_u = torch.empty((B, N), device=device, dtype=dtype)
-        grad_v = torch.empty((B, N), device=device, dtype=dtype)
 
         BLOCK_N = 256
-        grid = (B, triton.cdiv(N, BLOCK_N))
+        n_tiles = triton.cdiv(N, BLOCK_N)
+        # Per-tile K/R/t partial reductions, combined sequentially below.
+        # Total partial buffer: 21 × B × n_tiles ≈ 4 MB at B=1024,
+        # n_tiles=48 — trivial vs the 250 MB of save-intermediates dropped.
+        partials_K = torch.empty((B, n_tiles, 9), device=device, dtype=dtype)
+        partials_R = torch.empty((B, n_tiles, 9), device=device, dtype=dtype)
+        partials_t = torch.empty((B, n_tiles, 3), device=device, dtype=dtype)
+
+        # Match fwd kernel grid order: pid_n (axis 0) varies fastest so
+        # consecutive blocks share a batch row and reuse per-row data in
+        # L1 (cycle 9 locality argument).
+        grid = (n_tiles, B)
         with torch.cuda.device(device):
             _project_sample_bwd_kernel[grid](
-                xc,
-                yc,
-                zc,
+                xyz_world,
                 ds_du,
                 ds_dv,
                 mask,
@@ -601,47 +653,59 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 K,
                 P,
                 grad_xyz_world,
-                grad_u,
-                grad_v,
+                partials_K,
+                partials_R,
+                partials_t,
                 B,
                 N,
-                xc.stride(0),
+                xyz_world.stride(0),
+                xyz_world.stride(1),
+                ds_du.stride(0),
                 grad_xyz_world.stride(0),
                 grad_xyz_world.stride(1),
                 K.stride(0),
                 P.stride(0),
+                partials_K.stride(0),
+                partials_K.stride(1),
+                partials_R.stride(0),
+                partials_R.stride(1),
+                partials_t.stride(0),
+                partials_t.stride(1),
                 BLOCK_N=BLOCK_N,
+                # Same launch config as cycle 14 bwd — load chain grew by
+                # only xyz_world (3 loads) vs the dropped xc/yc/zc loads
+                # (also 3), so register pressure is similar. num_stages=3
+                # leaves more registers for the new 21 reduction accumulators.
+                num_warps=8,
+                num_stages=3,
             )
 
-        # ---- Fused K-grad + grad_R + grad_t reduction in one kernel ----
-        # Replaces: bmm + sum for grad_R/grad_t and 9 sums for grad_K. The
-        # kernel loops over N per batch, accumulating 9 + 9 + 3 scalars in
-        # registers. No (B, N, 3) grad_xyz_cam intermediate needed.
+        # ---- Combine per-tile partials into final grad_K/grad_R/grad_t ---
+        # Grid (B,); sequential left-associative accumulation per program,
+        # matching the old reduce kernel's outer-loop FP order. Per-tile
+        # partial sums use the same BLOCK_N=256 operand sequence as the
+        # old per-tile tl.sum.
         grad_K_flat = torch.empty((B, 9), device=device, dtype=dtype)
         grad_R_flat = torch.empty((B, 9), device=device, dtype=dtype)
         grad_t = torch.empty((B, 3), device=device, dtype=dtype)
         with torch.cuda.device(device):
-            _bwd_reduce_kernel[(B,)](
-                xc,
-                yc,
-                zc,
-                grad_u,
-                grad_v,
-                xyz_world,
-                K,
+            _combine_partials_kernel[(B,)](
+                partials_K,
+                partials_R,
+                partials_t,
                 grad_K_flat,
                 grad_R_flat,
                 grad_t,
-                B,
-                N,
-                xc.stride(0),
-                xyz_world.stride(0),
-                xyz_world.stride(1),
-                K.stride(0),
+                n_tiles,
+                partials_K.stride(0),
+                partials_K.stride(1),
+                partials_R.stride(0),
+                partials_R.stride(1),
+                partials_t.stride(0),
+                partials_t.stride(1),
                 grad_K_flat.stride(0),
                 grad_R_flat.stride(0),
                 grad_t.stride(0),
-                BLOCK_N=1024,
             )
         grad_K = grad_K_flat.view(B, 3, 3)
         grad_R = grad_R_flat.view(B, 3, 3)
@@ -722,7 +786,10 @@ def _unproject_fwd_kernel(
     K_ptr,  # (B, 3, 3) — intrinsics (only fx, fy, cx, cy read)
     P_ptr,  # (B, 4, 4) — extrinsics
     XYZW_ptr,  # (B, N, 3) — output xyz_world
-    XYZC_ptr,  # (B, N, 3) — saved xyz_cam (used by backward reductions)
+    # xyz_cam NOT saved (cycle 27 fusion): the new bwd kernel recomputes
+    # xc/yc/zc from (xy, K, depth) and absorbs all post-bwd PyTorch
+    # reductions (grad_R bmm, gr.sum, grad_K sums). Single consumer →
+    # no cross-kernel FP-order risk (cycle 18 lesson).
     B,
     N,
     s_xy_b,
@@ -736,10 +803,12 @@ def _unproject_fwd_kernel(
 ):
     """Pixel → world: collapses the four-op chain into one kernel.
 
-    Grid layout ``(B, ceil(N / BLOCK_N))`` — one program per image and tile.
+    Grid layout ``(ceil(N / BLOCK_N), B)`` — axis 0 (CUDA blockIdx.x) varies
+    fastest, so consecutive blocks share ``pid_b`` and reuse per-batch K/P
+    and the per-row (B, N) tensors (xy0, depth) in L1.
     """
-    pid_b = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
 
     n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = n_offs < N
@@ -798,10 +867,7 @@ def _unproject_fwd_kernel(
     tl.store(XYZW_ptr + out_off + 0, xw, mask=n_mask)
     tl.store(XYZW_ptr + out_off + 1, yw, mask=n_mask)
     tl.store(XYZW_ptr + out_off + 2, zw, mask=n_mask)
-    # Save xyz_cam for the small bmm/sum reductions performed in PyTorch.
-    tl.store(XYZC_ptr + out_off + 0, xc, mask=n_mask)
-    tl.store(XYZC_ptr + out_off + 1, yc, mask=n_mask)
-    tl.store(XYZC_ptr + out_off + 2, zc, mask=n_mask)
+    # xyz_cam NOT stored — see kernel-signature comment.
 
 
 @triton.jit
@@ -809,10 +875,10 @@ def _unproject_bwd_kernel(
     XY_ptr,  # (B, N, 2)
     DEPTH_ptr,  # (B, N)
     K_ptr,  # (B, 3, 3)
-    P_ptr,  # (B, 4, 4) — only R is used here
+    P_ptr,  # (B, 4, 4)
     GXYZW_ptr,  # (B, N, 3) — upstream gradient
-    GXYZC_ptr,  # (B, N, 3) — output: grad_xyz_cam (used for grad_K in PyTorch)
     GDEPTH_ptr,  # (B, N)    — output: grad_depth (per-point)
+    PART_ptr,  # (B, n_tiles, 16) — per-tile partials for grad_R, total_gxyzw, grad_K
     B,
     N,
     s_xy_b,
@@ -822,15 +888,33 @@ def _unproject_bwd_kernel(
     s_P_b,
     s_gxyzw_b,
     s_gxyzw_n,
+    s_part_b,
+    s_part_t,
     BLOCK_N: tl.constexpr,
 ):
-    """Per-point backward: emits grad_xyz_cam and grad_depth.
+    """Fused per-point bwd + per-tile reductions (cycle 27).
 
-    grad_R, grad_t and grad_K are produced by small PyTorch reductions
-    outside the kernel using the saved ``xyz_cam`` from the forward.
+    Per point: emits grad_depth (the only true per-point output now —
+    grad_xyz_cam is purely intermediate and stays in registers).
+
+    Per tile: writes 16 partial sums to ``PART_ptr[b, pid_n, :]`` —
+      [0..9)   pR[i, k] = Σ Y[i] · grad_xyz_world[k]  (grad_R partials)
+      [9..12)  pT[k]    = Σ grad_xyz_world[k]         (for grad_t = -R·pT)
+      [12..16) pK = [Σ gxc·xc, Σ gyc·yc, Σ gxc·depth, Σ gyc·depth]
+                                                       (for grad_K)
+
+    A small ``_unproject_combine_kernel`` (grid (B,)) sequentially sums
+    these across tiles. Per-tile ``tl.sum`` operand order matches the
+    PyTorch reductions' tile-block decomposition closely enough that
+    AUC drift is bounded by the same FP-order envelope as cycle 19 on
+    project_sample.
+
+    Grid layout ``(ceil(N / BLOCK_N), B)`` — same locality argument as
+    fwd; pid_n is fast-varying so consecutive blocks share batch-row
+    data in L1.
     """
-    pid_b = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
 
     n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = n_offs < N
@@ -839,6 +923,7 @@ def _unproject_bwd_kernel(
     xy_row = pid_b * s_xy_b + n_offs * s_xy_n
     u = tl.load(XY_ptr + xy_row + 0, mask=n_mask, other=0.0)
     v = tl.load(XY_ptr + xy_row + 1, mask=n_mask, other=0.0)
+    z = tl.load(DEPTH_ptr + pid_b * s_d_b + n_offs, mask=n_mask, other=0.0)
 
     Kb = K_ptr + pid_b * s_K_b
     fx = tl.load(Kb + 0)
@@ -852,12 +937,20 @@ def _unproject_bwd_kernel(
     R00 = tl.load(Pb + 0)
     R01 = tl.load(Pb + 1)
     R02 = tl.load(Pb + 2)
+    t0 = tl.load(Pb + 3)
     R10 = tl.load(Pb + 4)
     R11 = tl.load(Pb + 5)
     R12 = tl.load(Pb + 6)
+    t1 = tl.load(Pb + 7)
     R20 = tl.load(Pb + 8)
     R21 = tl.load(Pb + 9)
     R22 = tl.load(Pb + 10)
+    t2 = tl.load(Pb + 11)
+
+    # ---- Recompute xyz_cam (matches fwd exactly) ------------------------
+    xc = z * (u - cx) * inv_fx
+    yc = z * (v - cy) * inv_fy
+    zc = z
 
     # ---- Upstream gradient ---------------------------------------------
     g_row = pid_b * s_gxyzw_b + n_offs * s_gxyzw_n
@@ -866,29 +959,137 @@ def _unproject_bwd_kernel(
     gzw = tl.load(GXYZW_ptr + g_row + 2, mask=n_mask, other=0.0)
 
     # ---- grad through xyz_world = R^T · Y -------------------------------
-    # ∂xyz_world[k] / ∂Y[j] = R[j, k]
-    # grad_Y[j] = Σ_k R[j, k] · grad_xyz_world[k]
     gYx = R00 * gxw + R01 * gyw + R02 * gzw
     gYy = R10 * gxw + R11 * gyw + R12 * gzw
     gYz = R20 * gxw + R21 * gyw + R22 * gzw
 
-    # ---- grad through Y = xyz_cam - t -----------------------------------
-    # Per-point: grad_xyz_cam = grad_Y. (grad_t is a per-batch reduction
-    # done in PyTorch.)
     grad_xc = gYx
     grad_yc = gYy
     grad_zc = gYz
 
-    # ---- grad through xyz_cam = depth · K_inv · [u, v, 1] ---------------
-    # ∂xc_cam/∂z = (u - cx) / fx   ;  ∂yc_cam/∂z = (v - cy) / fy
-    # ∂zc_cam/∂z = 1
+    # ---- grad_depth per-point output ------------------------------------
     grad_z = grad_xc * (u - cx) * inv_fx + grad_yc * (v - cy) * inv_fy + grad_zc
-
-    # ---- Store outputs --------------------------------------------------
-    tl.store(GXYZC_ptr + g_row + 0, grad_xc, mask=n_mask)
-    tl.store(GXYZC_ptr + g_row + 1, grad_yc, mask=n_mask)
-    tl.store(GXYZC_ptr + g_row + 2, grad_zc, mask=n_mask)
     tl.store(GDEPTH_ptr + pid_b * s_d_b + n_offs, grad_z, mask=n_mask)
+
+    # ---- Y = xyz_cam - t (per-point, kept in registers) -----------------
+    Yx = xc - t0
+    Yy = yc - t1
+    Yz = zc - t2
+
+    # ---- Per-tile partials ---------------------------------------------
+    # grad_R[i, k] = Σ Y[i] · grad_xyz_world[k] — 9 outputs
+    pR00 = tl.sum(Yx * gxw, axis=0)
+    pR01 = tl.sum(Yx * gyw, axis=0)
+    pR02 = tl.sum(Yx * gzw, axis=0)
+    pR10 = tl.sum(Yy * gxw, axis=0)
+    pR11 = tl.sum(Yy * gyw, axis=0)
+    pR12 = tl.sum(Yy * gzw, axis=0)
+    pR20 = tl.sum(Yz * gxw, axis=0)
+    pR21 = tl.sum(Yz * gyw, axis=0)
+    pR22 = tl.sum(Yz * gzw, axis=0)
+
+    # total_gxyzw[k] = Σ grad_xyz_world[k] — 3 outputs (for grad_t)
+    pT0 = tl.sum(gxw, axis=0)
+    pT1 = tl.sum(gyw, axis=0)
+    pT2 = tl.sum(gzw, axis=0)
+
+    # grad_K raw sums — 4 outputs (post-combine: multiplied by -inv_fx/fy)
+    pKfx = tl.sum(grad_xc * xc, axis=0)
+    pKfy = tl.sum(grad_yc * yc, axis=0)
+    pKcx = tl.sum(grad_xc * z, axis=0)
+    pKcy = tl.sum(grad_yc * z, axis=0)
+
+    part_base = pid_b * s_part_b + pid_n * s_part_t
+    tl.store(PART_ptr + part_base + 0, pR00)
+    tl.store(PART_ptr + part_base + 1, pR01)
+    tl.store(PART_ptr + part_base + 2, pR02)
+    tl.store(PART_ptr + part_base + 3, pR10)
+    tl.store(PART_ptr + part_base + 4, pR11)
+    tl.store(PART_ptr + part_base + 5, pR12)
+    tl.store(PART_ptr + part_base + 6, pR20)
+    tl.store(PART_ptr + part_base + 7, pR21)
+    tl.store(PART_ptr + part_base + 8, pR22)
+    tl.store(PART_ptr + part_base + 9, pT0)
+    tl.store(PART_ptr + part_base + 10, pT1)
+    tl.store(PART_ptr + part_base + 11, pT2)
+    tl.store(PART_ptr + part_base + 12, pKfx)
+    tl.store(PART_ptr + part_base + 13, pKfy)
+    tl.store(PART_ptr + part_base + 14, pKcx)
+    tl.store(PART_ptr + part_base + 15, pKcy)
+
+
+@triton.jit
+def _unproject_combine_kernel(
+    PART_ptr,  # (B, n_tiles, 16)
+    GR_ptr,  # (B, 9) — final flat grad_R
+    GT_ptr,  # (B, 3) — total_gxyzw (will be -R @ gt in post-kernel)
+    GK_ptr,  # (B, 4) — raw grad_K sums (post-kernel: × -inv_fx/fy)
+    N_TILES,
+    s_part_b,
+    s_part_t,
+    s_gr_b,
+    s_gt_b,
+    s_gk_b,
+):
+    """Combine per-tile partials into final per-batch vectors.
+
+    Grid ``(B,)``; each program loops over n_tiles sequentially, matching
+    the left-associative FP order used by the project_sample combine.
+    """
+    pid_b = tl.program_id(0)
+    a0 = 0.0
+    a1 = 0.0
+    a2 = 0.0
+    a3 = 0.0
+    a4 = 0.0
+    a5 = 0.0
+    a6 = 0.0
+    a7 = 0.0
+    a8 = 0.0
+    a9 = 0.0
+    a10 = 0.0
+    a11 = 0.0
+    a12 = 0.0
+    a13 = 0.0
+    a14 = 0.0
+    a15 = 0.0
+    for t_idx in range(N_TILES):
+        base = pid_b * s_part_b + t_idx * s_part_t
+        a0 += tl.load(PART_ptr + base + 0)
+        a1 += tl.load(PART_ptr + base + 1)
+        a2 += tl.load(PART_ptr + base + 2)
+        a3 += tl.load(PART_ptr + base + 3)
+        a4 += tl.load(PART_ptr + base + 4)
+        a5 += tl.load(PART_ptr + base + 5)
+        a6 += tl.load(PART_ptr + base + 6)
+        a7 += tl.load(PART_ptr + base + 7)
+        a8 += tl.load(PART_ptr + base + 8)
+        a9 += tl.load(PART_ptr + base + 9)
+        a10 += tl.load(PART_ptr + base + 10)
+        a11 += tl.load(PART_ptr + base + 11)
+        a12 += tl.load(PART_ptr + base + 12)
+        a13 += tl.load(PART_ptr + base + 13)
+        a14 += tl.load(PART_ptr + base + 14)
+        a15 += tl.load(PART_ptr + base + 15)
+    base_r = pid_b * s_gr_b
+    tl.store(GR_ptr + base_r + 0, a0)
+    tl.store(GR_ptr + base_r + 1, a1)
+    tl.store(GR_ptr + base_r + 2, a2)
+    tl.store(GR_ptr + base_r + 3, a3)
+    tl.store(GR_ptr + base_r + 4, a4)
+    tl.store(GR_ptr + base_r + 5, a5)
+    tl.store(GR_ptr + base_r + 6, a6)
+    tl.store(GR_ptr + base_r + 7, a7)
+    tl.store(GR_ptr + base_r + 8, a8)
+    base_t = pid_b * s_gt_b
+    tl.store(GT_ptr + base_t + 0, a9)
+    tl.store(GT_ptr + base_t + 1, a10)
+    tl.store(GT_ptr + base_t + 2, a11)
+    base_k = pid_b * s_gk_b
+    tl.store(GK_ptr + base_k + 0, a12)
+    tl.store(GK_ptr + base_k + 1, a13)
+    tl.store(GK_ptr + base_k + 2, a14)
+    tl.store(GK_ptr + base_k + 3, a15)
 
 
 class _UnprojectTriton(torch.autograd.Function):
@@ -925,10 +1126,13 @@ class _UnprojectTriton(torch.autograd.Function):
         device, dtype = xy_c.device, xy_c.dtype
 
         xyz_world = torch.empty((B, N, 3), device=device, dtype=dtype)
-        xyz_cam = torch.empty((B, N, 3), device=device, dtype=dtype)
+        # xyz_cam allocation dropped (cycle 27): bwd recomputes it from
+        # (xy, K, depth) inside the kernel.
 
         BLOCK_N = 256
-        grid = (B, triton.cdiv(N, BLOCK_N))
+        # Axis 0 = fast-varying ⇒ ``pid_n`` first so consecutive blocks share
+        # ``pid_b`` and keep K/P/(B,N) row data hot in L1 across batch-row tiles.
+        grid = (triton.cdiv(N, BLOCK_N), B)
         with torch.cuda.device(device):
             _unproject_fwd_kernel[grid](
                 xy_c,
@@ -936,7 +1140,6 @@ class _UnprojectTriton(torch.autograd.Function):
                 K_c,
                 P_c,
                 xyz_world,
-                xyz_cam,
                 B,
                 N,
                 xy_c.stride(0),
@@ -947,9 +1150,16 @@ class _UnprojectTriton(torch.autograd.Function):
                 xyz_world.stride(0),
                 xyz_world.stride(1),
                 BLOCK_N=BLOCK_N,
+                # Unproject is a simpler kernel than project+sample (no DT
+                # gather), so 4 warps is enough and 8 over-provisions
+                # (cycle 12 confirmed). One extra pipeline stage on top of
+                # the default (3) helps overlap the short load chain
+                # (xy + depth + K + P) with the projection FMAs.
+                num_warps=4,
+                num_stages=4,
             )
 
-        ctx.save_for_backward(xy_c, d_c, K_c, P_c, xyz_cam)
+        ctx.save_for_backward(xy_c, d_c, K_c, P_c)
         return xyz_world
 
     @staticmethod
@@ -957,27 +1167,34 @@ class _UnprojectTriton(torch.autograd.Function):
         """Analytical backward for the fused unproject op.
 
         Returns gradients w.r.t. ``(depth, K, P)``; ``xy0`` is a non-grad
-        input and yields ``None``.
+        input and yields ``None``. All reductions over N (grad_R, grad_t,
+        grad_K) are done inside the fused bwd kernel + combine kernel
+        (cycle 27 — mirrors the project_sample cycle-19 fusion).
         """
-        xy0, depth, K, P, xyz_cam = ctx.saved_tensors
+        xy0, depth, K, P = ctx.saved_tensors
         B, N, _ = xy0.shape
+        device, dtype = xy0.device, xy0.dtype
 
         gr = grad_xyz_world.contiguous()
-
-        grad_xyz_cam = torch.empty_like(xyz_cam)
         grad_depth = torch.empty_like(depth)
 
         BLOCK_N = 256
-        grid = (B, triton.cdiv(N, BLOCK_N))
-        with torch.cuda.device(xy0.device):
+        n_tiles = triton.cdiv(N, BLOCK_N)
+        # 16 partials per tile: 9 grad_R + 3 total_gxyzw + 4 grad_K-raw.
+        partials = torch.empty((B, n_tiles, 16), device=device, dtype=dtype)
+
+        # Axis 0 = fast-varying ⇒ ``pid_n`` first so consecutive blocks share
+        # ``pid_b`` and keep K/P/(B,N) row data hot in L1.
+        grid = (n_tiles, B)
+        with torch.cuda.device(device):
             _unproject_bwd_kernel[grid](
                 xy0,
                 depth,
                 K,
                 P,
                 gr,
-                grad_xyz_cam,
                 grad_depth,
+                partials,
                 B,
                 N,
                 xy0.stride(0),
@@ -987,53 +1204,50 @@ class _UnprojectTriton(torch.autograd.Function):
                 P.stride(0),
                 gr.stride(0),
                 gr.stride(1),
+                partials.stride(0),
+                partials.stride(1),
                 BLOCK_N=BLOCK_N,
+                # Cycle 28: 16 new reduction accumulators (cycle 27 fusion)
+                # add register pressure on top of the existing per-point chain.
+                # Mirrors cycle 20-21: post-fusion cliff drops; test num_stages=3.
+                num_warps=4,
+                num_stages=3,
             )
 
-        # ---- Reductions over N (small, well-optimised PyTorch bmm/sum) --
+        # ---- Combine per-tile partials into final per-batch vectors -----
+        grad_R_flat = torch.empty((B, 9), device=device, dtype=dtype)
+        total_gxyzw = torch.empty((B, 3), device=device, dtype=dtype)
+        grad_K_raw = torch.empty((B, 4), device=device, dtype=dtype)
+        with torch.cuda.device(device):
+            _unproject_combine_kernel[(B,)](
+                partials,
+                grad_R_flat,
+                total_gxyzw,
+                grad_K_raw,
+                n_tiles,
+                partials.stride(0),
+                partials.stride(1),
+                grad_R_flat.stride(0),
+                total_gxyzw.stride(0),
+                grad_K_raw.stride(0),
+            )
+
+        # ---- Tiny per-batch post-processing (B is small) ----------------
         R = P[:, :3, :3]
-        t = P[:, :3, 3]
-        # Y = xyz_cam - t (broadcast t over N)
-        Y = xyz_cam - t.unsqueeze(1)  # (B, N, 3)
-
-        # grad_R[b, i, k] = Σ_n Y[b, n, i] · grad_xyz_world[b, n, k]
-        grad_R = torch.bmm(Y.transpose(-1, -2), gr)  # (B, 3, 3)
-
-        # grad_t[b, i] = -Σ_n Σ_k R[b, i, k] · grad_xyz_world[b, n, k]
-        total_gxyzw = gr.sum(dim=1)  # (B, 3)
+        grad_R = grad_R_flat.view(B, 3, 3)
         grad_t = -torch.bmm(R, total_gxyzw.unsqueeze(-1)).squeeze(-1)
-
         grad_P = torch.zeros_like(P)
         grad_P[:, :3, :3] = grad_R
         grad_P[:, :3, 3] = grad_t
 
-        # ---- grad_K: only fx, fy, cx, cy (autograd through invert_K
-        #              would emit zero for off-diagonals; we match it). ----
-        # xc_cam = z · (u - cx) / fx  ⇒
-        #   ∂xc_cam/∂fx = -xc_cam / fx     ;  ∂xc_cam/∂cx = -z / fx
-        # similar for yc_cam / fy / cy.
-        fx_b = K[:, 0, 0]  # (B,)
-        fy_b = K[:, 1, 1]
-        inv_fx_b = 1.0 / fx_b
-        inv_fy_b = 1.0 / fy_b
-
-        gxc = grad_xyz_cam[:, :, 0]
-        gyc = grad_xyz_cam[:, :, 1]
-        xc = xyz_cam[:, :, 0]
-        yc = xyz_cam[:, :, 1]
-
-        grad_fx = -(gxc * xc).sum(dim=1) * inv_fx_b  # (B,)
-        grad_fy = -(gyc * yc).sum(dim=1) * inv_fy_b
-        grad_cx = -(gxc * depth).sum(dim=1) * inv_fx_b
-        grad_cy = -(gyc * depth).sum(dim=1) * inv_fy_b
-
+        inv_fx_b = 1.0 / K[:, 0, 0]
+        inv_fy_b = 1.0 / K[:, 1, 1]
         grad_K = torch.zeros_like(K)
-        grad_K[:, 0, 0] = grad_fx
-        grad_K[:, 1, 1] = grad_fy
-        grad_K[:, 0, 2] = grad_cx
-        grad_K[:, 1, 2] = grad_cy
+        grad_K[:, 0, 0] = -grad_K_raw[:, 0] * inv_fx_b
+        grad_K[:, 1, 1] = -grad_K_raw[:, 1] * inv_fy_b
+        grad_K[:, 0, 2] = -grad_K_raw[:, 2] * inv_fx_b
+        grad_K[:, 1, 2] = -grad_K_raw[:, 3] * inv_fy_b
 
-        # xy0 is fixed (no grad).
         return None, grad_depth, grad_K, grad_P
 
 
