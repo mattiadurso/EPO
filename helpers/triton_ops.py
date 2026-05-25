@@ -1218,3 +1218,222 @@ def distance_transform_l2_triton(edges_map: torch.Tensor) -> torch.Tensor:
     f = _edt_1d_sq_triton(f.t().contiguous()).t().contiguous()
 
     return torch.sqrt(f)
+
+
+# ===========================================================================
+# Fused 2D-to-2D reprojection kernel (viewgraph filter)
+# ===========================================================================
+#
+# Per-point pipeline:
+#   1. Nearest-mode sample of depthmap0 at xy0 (matches grid_sample_nan).
+#   2. xyz_cam0 = depth · ((u-cx0)/fx0, (v-cy0)/fy0, 1)
+#   3. xyz_world = R0^T · (xyz_cam0 - t0)
+#   4. xyz_cam1 = R1 · xyz_world + t1
+#   5. (u1, v1) = (fx1·xc1/zc1 + cx1, fy1·yc1/zc1 + cy1)
+#
+# Outputs NaN for any invalid point (NaN xy0, xy0 out-of-bounds, NaN depth).
+# The downstream filter's nan_mask + border_mask reject NaN-uv pairs
+# identically to the reference path's 0.0-padded outputs.
+#
+# Used exclusively by filter_viewgraph_by_reprojection_batched under
+# @torch.no_grad. No saved intermediates, no analytical backward.
+
+
+@triton.jit
+def _reproject_2D_2D_kernel(
+    XY0_ptr,
+    DEPTH_ptr,
+    K0_ptr,
+    P0_ptr,
+    K1_ptr,
+    P1_ptr,
+    XY_OUT_ptr,
+    B,
+    N,
+    H,
+    W,
+    s_xy0_b,
+    s_xy0_n,
+    s_depth_b,
+    s_depth_h,
+    s_K0_b,
+    s_P0_b,
+    s_K1_b,
+    s_P1_b,
+    s_xyout_b,
+    s_xyout_n,
+    BLOCK_N: tl.constexpr,
+):
+    """Fused img0 → img1 reprojection.
+
+    Grid layout (ceil(N / BLOCK_N), B) — axis 0 (CUDA blockIdx.x) varies
+    fastest so consecutive blocks share pid_b and reuse the same
+    depthmap0 / K / P data in L1 across the tiles of one pair.
+    """
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = n_offs < N
+
+    xy0_off = pid_b * s_xy0_b + n_offs * s_xy0_n
+    u0 = tl.load(XY0_ptr + xy0_off + 0, mask=n_mask, other=0.0)
+    v0 = tl.load(XY0_ptr + xy0_off + 1, mask=n_mask, other=0.0)
+
+    xy0_finite = (u0 == u0) & (v0 == v0)
+    Wf = tl.cast(W - 1, tl.float32)
+    Hf = tl.cast(H - 1, tl.float32)
+    in_bounds = (u0 >= 0.0) & (u0 <= Wf) & (v0 >= 0.0) & (v0 <= Hf)
+    valid = xy0_finite & in_bounds & n_mask
+
+    u0_idx = tl.floor(u0 + 0.5).to(tl.int32)
+    v0_idx = tl.floor(v0 + 0.5).to(tl.int32)
+    u0_idx = tl.minimum(tl.maximum(u0_idx, 0), W - 1)
+    v0_idx = tl.minimum(tl.maximum(v0_idx, 0), H - 1)
+    depth = tl.load(
+        DEPTH_ptr + pid_b * s_depth_b + v0_idx * s_depth_h + u0_idx,
+        mask=valid,
+        other=0.0,
+    )
+    depth_finite = depth == depth
+    valid = valid & depth_finite
+
+    K0b = K0_ptr + pid_b * s_K0_b
+    fx0 = tl.load(K0b + 0)
+    cx0 = tl.load(K0b + 2)
+    fy0 = tl.load(K0b + 4)
+    cy0 = tl.load(K0b + 5)
+
+    P0b = P0_ptr + pid_b * s_P0_b
+    R0_00 = tl.load(P0b + 0)
+    R0_01 = tl.load(P0b + 1)
+    R0_02 = tl.load(P0b + 2)
+    t0_0 = tl.load(P0b + 3)
+    R0_10 = tl.load(P0b + 4)
+    R0_11 = tl.load(P0b + 5)
+    R0_12 = tl.load(P0b + 6)
+    t0_1 = tl.load(P0b + 7)
+    R0_20 = tl.load(P0b + 8)
+    R0_21 = tl.load(P0b + 9)
+    R0_22 = tl.load(P0b + 10)
+    t0_2 = tl.load(P0b + 11)
+
+    K1b = K1_ptr + pid_b * s_K1_b
+    fx1 = tl.load(K1b + 0)
+    cx1 = tl.load(K1b + 2)
+    fy1 = tl.load(K1b + 4)
+    cy1 = tl.load(K1b + 5)
+
+    P1b = P1_ptr + pid_b * s_P1_b
+    R1_00 = tl.load(P1b + 0)
+    R1_01 = tl.load(P1b + 1)
+    R1_02 = tl.load(P1b + 2)
+    t1_0 = tl.load(P1b + 3)
+    R1_10 = tl.load(P1b + 4)
+    R1_11 = tl.load(P1b + 5)
+    R1_12 = tl.load(P1b + 6)
+    t1_1 = tl.load(P1b + 7)
+    R1_20 = tl.load(P1b + 8)
+    R1_21 = tl.load(P1b + 9)
+    R1_22 = tl.load(P1b + 10)
+    t1_2 = tl.load(P1b + 11)
+
+    xc0 = depth * (u0 - cx0) / fx0
+    yc0 = depth * (v0 - cy0) / fy0
+    zc0 = depth
+
+    Yx = xc0 - t0_0
+    Yy = yc0 - t0_1
+    Yz = zc0 - t0_2
+    xw = R0_00 * Yx + R0_10 * Yy + R0_20 * Yz
+    yw = R0_01 * Yx + R0_11 * Yy + R0_21 * Yz
+    zw = R0_02 * Yx + R0_12 * Yy + R0_22 * Yz
+
+    xc1 = R1_00 * xw + R1_01 * yw + R1_02 * zw + t1_0
+    yc1 = R1_10 * xw + R1_11 * yw + R1_12 * zw + t1_1
+    zc1 = R1_20 * xw + R1_21 * yw + R1_22 * zw + t1_2
+
+    inv_zc1 = 1.0 / zc1
+    u1 = fx1 * xc1 * inv_zc1 + cx1
+    v1 = fy1 * yc1 * inv_zc1 + cy1
+
+    nan = float("nan")
+    u1_out = tl.where(valid, u1, nan)
+    v1_out = tl.where(valid, v1, nan)
+
+    out_off = pid_b * s_xyout_b + n_offs * s_xyout_n
+    tl.store(XY_OUT_ptr + out_off + 0, u1_out, mask=n_mask)
+    tl.store(XY_OUT_ptr + out_off + 1, v1_out, mask=n_mask)
+
+
+def reproject_2D_2D_triton(
+    xy0: torch.Tensor,
+    depthmap0: torch.Tensor,
+    P0: torch.Tensor,
+    P1: torch.Tensor,
+    K0: torch.Tensor,
+    K1: torch.Tensor,
+) -> torch.Tensor:
+    """Fused img0 → img1 reprojection used by the viewgraph filter.
+
+    Replaces the 5-op PyTorch chain (grid_sample → invert_K → unproject →
+    change_reference → project) with one Triton kernel. No autograd: the
+    viewgraph filter is wrapped in torch.no_grad.
+
+    Args:
+        xy0: (B, N, 2) source pixel coordinates.
+        depthmap0: (B, H, W) source depth map.
+        P0: (B, 4, 4) world-to-cam extrinsics for the source view.
+        P1: (B, 4, 4) world-to-cam extrinsics for the target view.
+        K0: (B, 3, 3) source intrinsics.
+        K1: (B, 3, 3) target intrinsics.
+
+    Returns:
+        (B, N, 2) projected pixel coordinates in img1. Invalid points emit
+        NaN; the downstream filter's nan_mask + border_mask catch them.
+    """
+    assert xy0.is_cuda and depthmap0.is_cuda
+    assert xy0.dim() == 3 and xy0.shape[-1] == 2
+    assert depthmap0.dim() == 3
+    B, N, _ = xy0.shape
+    H, W = depthmap0.shape[-2:]
+
+    xy0_c = xy0.contiguous()
+    depth_c = depthmap0.contiguous()
+    K0_c = K0.contiguous()
+    P0_c = P0.contiguous()
+    K1_c = K1.contiguous()
+    P1_c = P1.contiguous()
+
+    xy_out = torch.empty((B, N, 2), device=xy0.device, dtype=xy0.dtype)
+
+    BLOCK_N = 256
+    grid = (triton.cdiv(N, BLOCK_N), B)
+    with torch.cuda.device(xy0.device):
+        _reproject_2D_2D_kernel[grid](
+            xy0_c,
+            depth_c,
+            K0_c,
+            P0_c,
+            K1_c,
+            P1_c,
+            xy_out,
+            B,
+            N,
+            H,
+            W,
+            xy0_c.stride(0),
+            xy0_c.stride(1),
+            depth_c.stride(0),
+            depth_c.stride(1),
+            K0_c.stride(0),
+            P0_c.stride(0),
+            K1_c.stride(0),
+            P1_c.stride(0),
+            xy_out.stride(0),
+            xy_out.stride(1),
+            BLOCK_N=BLOCK_N,
+            num_warps=4,
+            num_stages=4,
+        )
+    return xy_out
