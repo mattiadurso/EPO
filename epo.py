@@ -1358,7 +1358,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             grad_t=self.grad_t,
             grad_t_offset=self.grad_t_offset,
             mlp_lr=self.mlp_pose_lr,
-            hidden_dim=self.mlp_pose_hidden_dim,
+            hidden_dim=self.mlp_hidden_dim,
             use_mlp=self.use_mlp_pose_refinement,
             use_amp=self.use_amp,
             max_num_iterations=self.max_num_iterations,
