@@ -76,15 +76,14 @@ def grid_sample_nan(xy: Tensor, img: Tensor, mode="nearest") -> tuple[Tensor, Te
     # ? set to nan the point that fall out of the second image
     xy_norm[(xy_norm < -1) + (xy_norm > 1)] = float("nan")
     if xy.ndim == 3:
-        sampled = F.grid_sample(
+        sampled_raw = F.grid_sample(
             img,
             xy_norm[:, :, None, ...],
             align_corners=True,
             mode=mode,
             padding_mode="border",
-        ).view(
-            B, C, xy.shape[1]
-        )  # BxCxN
+        )
+        sampled = sampled_raw.view(B, C, xy.shape[1])  # BxCxN
     else:
         sampled = F.grid_sample(
             img, xy_norm, align_corners=True, mode=mode, padding_mode="border"
@@ -105,7 +104,7 @@ def grid_sample_nan(xy: Tensor, img: Tensor, mode="nearest") -> tuple[Tensor, Te
     return sampled, mask_img_nan
 
 
-def create_grid(image, permute=False, sampling_factor=10, border=0):
+def create_grid(image, permute=False, sampling_factor=10, border=0):  # noqa: D417
     """Function to create a grid of the same size as the image.
 
     Args:
@@ -130,7 +129,7 @@ def create_grid(image, permute=False, sampling_factor=10, border=0):
     return grid
 
 
-def compute_121_reprojection(
+def compute_121_reprojection(  # noqa: D417
     data,
     img0,
     img1,
@@ -243,16 +242,16 @@ def change_reference_3D_points(
         xyz1: the 3D points in the P1 coordinate system
             B,n,3
     """
-    assert (
-        xyz0.shape[0] == P0.shape[0] and xyz0.shape[0] == P1.shape[0]
-    ), f"Expected xyz0 and P0 to have the same batch size, got {xyz0.shape[0]} and {P0.shape[0]}"
-    assert xyz0.shape[2] == 3, f"Expected xyz0 to have 3 channels, got {xyz0.shape[2]}"
-    assert (
-        P0.shape[1] == 4 and P0.shape[2] == 4
-    ), f"Expected P0 to have shape Bx4x4, got {P0.shape}"
-    assert (
-        P1.shape[1] == 4 and P1.shape[2] == 4
-    ), f"Expected P1 to have shape Bx4x4, got {P1.shape}"
+    if not (xyz0.shape[0] == P0.shape[0] and xyz0.shape[0] == P1.shape[0]):
+        raise AssertionError(
+            f"Expected xyz0/P0 same batch, got {xyz0.shape[0]} and {P0.shape[0]}"
+        )
+    if xyz0.shape[2] != 3:
+        raise AssertionError(f"Expected xyz0 to have 3 channels, got {xyz0.shape[2]}")
+    if not (P0.shape[1] == 4 and P0.shape[2] == 4):
+        raise AssertionError(f"Expected P0 shape Bx4x4, got {P0.shape}")
+    if not (P1.shape[1] == 4 and P1.shape[2] == 4):
+        raise AssertionError(f"Expected P1 shape Bx4x4, got {P1.shape}")
 
     xyz0_hom = to_homogeneous(xyz0)  # B,n,4
     # if cast_to_double:
@@ -280,6 +279,7 @@ def reproject_2D_2D(
     img1_shape: tuple[int, int] | None = None,
     border: int = 0,
     mode: str = "nearest",
+    backend: str = "torch",
 ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor]:
     """Projects xy0 points from img0 to img1 using depth0. Points that have an invalid depth='nan' are
         set to 'nan' (if bilinear sampling is used, all the 4 closest depth values must be valid to get a valid projection).
@@ -309,16 +309,29 @@ def reproject_2D_2D(
             second image
             B,n  bool
     """
-    # ? interpolate depths
+    if backend == "triton":
+        if depthmap0.dim() != 3:
+            raise ValueError("Triton reproject_2D_2D requires depthmap0=(B,H,W)")
+        if mode != "nearest":
+            raise ValueError("Triton reproject_2D_2D supports mode='nearest' only")
+        from helpers.triton_ops import reproject_2D_2D_triton
+
+        xy_proj = reproject_2D_2D_triton(xy0, depthmap0, P0, P1, K0, K1)
+        return xy_proj
+
+    if backend != "torch":
+        raise ValueError(f"Unknown backend {backend!r}; expected 'torch' or 'triton'")
+
     if depthmap0.dim() == 3:
         selected_depths0, mask_invalid_depth0 = grid_sample_nan(
             xy0, depthmap0, mode=mode
         )  # Bxn, Bxn
     else:
         # pre-sampled depths
-        assert (
-            depthmap0.shape == xy0.shape[:2]
-        ), f"If depthmap0 is not BxHxW, it must be Bxn, got {depthmap0.shape} and {xy0.shape}"
+        if depthmap0.shape != xy0.shape[:2]:
+            raise AssertionError(
+                f"If depthmap0 is not BxHxW, it must be Bxn, got {depthmap0.shape} and {xy0.shape}"
+            )
         selected_depths0 = depthmap0
 
     # ? use the depth to define the 3D coordinates of points in the ref system of camera0
@@ -360,66 +373,70 @@ def filter_viewgraph_by_reprojection_batched(
 
     Note: This assumes all images have the same resolution for batching.
     """
-    filtered_viewgraph = []
-    valid_points_per_pair = {}
-
-    # Pre-compute all projection matrices and intrinsics
     image_names = sorted(list(images.keys()))
     name_to_idx = {name: idx for idx, name in enumerate(image_names)}
 
-    # Get all camera data
     all_Ps = poses.get_projection_matrix(image_names)  # (N, 4, 4)
     cam_ids = [images[name]["cam_id"] for name in image_names]
     all_Ks = intrinsics.get_intrinsic_matrix(cam_ids)  # (N, 3, 3)
 
-    # Pre-compute grids and world points for all images
-    all_depths = {}
+    # Stack ALL depths into one (N_img, H, W) tensor once, instead of
+    # per-batch torch.stack on Python-list comprehensions.
+    all_depths_stacked = torch.stack(
+        [images[name]["depth"].to(device) for name in image_names], dim=0
+    )
+    # Likewise stack image shapes once.
+    all_shapes = torch.tensor(
+        [images[name]["image"].shape[-2:] for name in image_names],
+        device=device,
+        dtype=torch.long,
+    )
+    # Sort pairs by (idx_i, idx_j) so consecutive pairs share their source
+    # image. The Triton kernel grid is (n_tiles, B=pair_idx), with pid_b on
+    # the slow-varying axis — consecutive program blocks now reuse the same
+    # depthmap0/K0/P0 in L2 (same cycle-8/9 locality argument that gave
+    # +5-7% on the EPO inner-loop kernels). For exhaustive matchers
+    # combinations() already returns this order, so the sort is a no-op
+    # there; for sequential / pre-loaded viewgraphs it's a real reorder.
+    viewgraph = sorted(viewgraph, key=lambda p: (name_to_idx[p[0]], name_to_idx[p[1]]))
 
-    for name in image_names:
-        depth = images[name]["depth"]
-        if depth.ndim == 2:
-            depth = depth
-        all_depths[name] = depth.to(device)
+    # Pair-index tensors for the entire viewgraph (no Python comprehension
+    # in the per-batch loop).
+    idx_i_all = torch.tensor(
+        [name_to_idx[p[0]] for p in viewgraph], device=device, dtype=torch.long
+    )
+    idx_j_all = torch.tensor(
+        [name_to_idx[p[1]] for p in viewgraph], device=device, dtype=torch.long
+    )
 
-    # Create grid for all images once since we assume same resolution
-    # We take the first image resolution as reference for the grid
     first_img_name = image_names[0]
     grid = create_grid(
         images[first_img_name]["image"], sampling_factor=sampling_factor, border=border
     ).to(device)[None]
 
     num_pairs = len(viewgraph)
+    # On-device num_valid accumulator → single bulk .cpu() at end instead of
+    # one .item() (CUDA sync) per pair.
+    num_valid_all = torch.empty(num_pairs, device=device, dtype=torch.long)
 
     for batch_start in range(0, num_pairs, batch_size):
         batch_end = min(batch_start + batch_size, num_pairs)
-        batch_pairs = viewgraph[batch_start:batch_end]
-        current_batch_size = len(batch_pairs)
+        current_batch_size = batch_end - batch_start
 
-        # Prepare batch indices
-        idx_i = [name_to_idx[p[0]] for p in batch_pairs]
-        idx_j = [name_to_idx[p[1]] for p in batch_pairs]
+        idx_i = idx_i_all[batch_start:batch_end]
+        idx_j = idx_j_all[batch_start:batch_end]
 
-        # Gather batch data
         P0_batch = all_Ps[idx_i]
         P1_batch = all_Ps[idx_j]
         K0_batch = all_Ks[idx_i]
         K1_batch = all_Ks[idx_j]
+        depths_i = all_depths_stacked[idx_i]
+        depths_j = all_depths_stacked[idx_j]
+        shapes_i = all_shapes[idx_i]
+        shapes_j = all_shapes[idx_j]
 
-        depths_i = torch.stack([all_depths[p[0]] for p in batch_pairs])
-        depths_j = torch.stack([all_depths[p[1]] for p in batch_pairs])
-
-        # Prepare shapes for projection check
-        shapes_i = torch.tensor(
-            [images[p[0]]["image"].shape[-2:] for p in batch_pairs], device=device
-        )
-        shapes_j = torch.tensor(
-            [images[p[1]]["image"].shape[-2:] for p in batch_pairs], device=device
-        )
-
-        # Expand grid
         kpts0 = grid.expand(current_batch_size, -1, -1)  # (B, N, 2)
 
-        # Forward projection: img_i -> img_j
         kpts1 = reproject_2D_2D(
             xy0=kpts0,
             depthmap0=depths_i,
@@ -427,11 +444,11 @@ def filter_viewgraph_by_reprojection_batched(
             P1=P1_batch,
             K0=K0_batch,
             K1=K1_batch,
-            img1_shape=shapes_j,  # Pass tensor of shapes
+            img1_shape=shapes_j,
             border=border,
+            backend="triton",
         )
 
-        # Backward projection: img_j -> img_i
         kpts0_back = reproject_2D_2D(
             xy0=kpts1,
             depthmap0=depths_j,
@@ -439,18 +456,16 @@ def filter_viewgraph_by_reprojection_batched(
             P1=P0_batch,
             K0=K1_batch,
             K1=K0_batch,
-            img1_shape=shapes_i,  # Pass tensor of shapes
+            img1_shape=shapes_i,
             border=border,
+            backend="triton",
         )
 
-        # Filter by NaN
         nan_mask = torch.isnan(kpts1).any(dim=-1) | torch.isnan(kpts0_back).any(dim=-1)
 
-        # Filter by reprojection error
         reproj_dist = torch.sqrt(((kpts0 - kpts0_back) ** 2).sum(dim=-1))
         reproj_mask = reproj_dist < reprojection_error
 
-        # Filter by border (using shapes_j for kpts1)
         H_j = shapes_j[:, 0:1]
         W_j = shapes_j[:, 1:2]
 
@@ -458,19 +473,14 @@ def filter_viewgraph_by_reprojection_batched(
         border_mask_y = (kpts1[..., 1] > border) & (kpts1[..., 1] < H_j - border)
         border_mask = border_mask_x & border_mask_y
 
-        # Combined mask
         valid_mask = (~nan_mask) & reproj_mask & border_mask
-        num_valid_batch = valid_mask.sum(dim=1)  # (B,)
+        num_valid_all[batch_start:batch_end] = valid_mask.sum(dim=1)
 
-        # Collect results
-        for k, (i_name, j_name) in enumerate(batch_pairs):
-            num_valid = num_valid_batch[k].item()
-
-            if num_valid >= min_points:
-                filtered_viewgraph.append((i_name, j_name))
-            # all pairs
-            valid_points_per_pair[(i_name, j_name)] = num_valid
-
+    num_valid_cpu = num_valid_all.cpu().tolist()
+    filtered_viewgraph = [
+        viewgraph[k] for k in range(num_pairs) if num_valid_cpu[k] >= min_points
+    ]
+    valid_points_per_pair = {viewgraph[k]: num_valid_cpu[k] for k in range(num_pairs)}
     if verbose:
         print(
             f"Filtered viewgraph: {len(filtered_viewgraph):,}/{len(viewgraph):,} pairs retained"
@@ -620,12 +630,11 @@ def unproject_2D_to_world(
     if backend == "triton":
         # Local import so CPU-only setups don't need triton installed.
         from helpers.triton_ops import unproject_2D_to_world_triton
+
         return unproject_2D_to_world_triton(xy0, K0, depth0, P0)
 
     if backend != "torch":
-        raise ValueError(
-            f"Unknown backend {backend!r}; expected 'torch' or 'triton'"
-        )
+        raise ValueError(f"Unknown backend {backend!r}; expected 'torch' or 'triton'")
 
     # invert K and P
     K0_inv = invert_K(K0)
@@ -749,7 +758,7 @@ def project_world_to_2D(
 ### Forward step
 
 
-def project_and_sample_logic(
+def project_and_sample_logic(  # noqa: D417
     xyz_world: torch.Tensor,
     K1: torch.Tensor,
     P1: torch.Tensor,
@@ -785,6 +794,7 @@ def project_and_sample_logic(
         )
         # Local import keeps Triton off the import path for CPU-only setups.
         from helpers.triton_ops import project_and_sample_triton
+
         return project_and_sample_triton(
             xyz_world, K1, P1, dt_fields, dt_indices, img1_shape
         )
