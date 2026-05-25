@@ -649,8 +649,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     )
 
         if self.verbose:
-            num_batches = math.ceil(self.len_viewgraph / batch_size)
-            num_batches = num_batches if drop_last else num_batches + 1
+            if self.len_viewgraph <= batch_size:
+                num_batches = 1
+            elif drop_last and self.len_viewgraph % batch_size != 0:
+                num_batches = self.len_viewgraph // batch_size
+            else:
+                num_batches = math.ceil(self.len_viewgraph / batch_size)
             total_points = self.max_edges * self.len_viewgraph
             print(
                 f"Processing {self.len_viewgraph:,} pairs with batch size {batch_size:,} ({num_batches} batches per iteration).",
