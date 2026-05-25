@@ -141,7 +141,7 @@ class PoseModule(BaseModule):
             self.init_optimizer(t_lr=self.t_lr, R_lr=self.R_lr)
 
         # Initialize learning rate scheduler
-        self.init_scheduler(warmup_steps, max_num_iterations)
+        self.init_scheduler(warmup_steps, int(max_num_iterations*1.5))  # 1.5x to allow higher lr for more iterations
 
         # Precompute all extrinsic matrices
         self.update_all_matrices()
