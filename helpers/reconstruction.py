@@ -257,18 +257,6 @@ def build_reconstruction(
     #    step below references the exact same ids.
     image_id_to_name = {}
     for image_id, (image_name, image_data) in enumerate(epo.images.items(), start=1):
-        # skip if image is blacklisted
-        if image_name in epo.blacklist:
-            if verbose:
-                print(f"Skipping blacklisted image: {image_name}")
-            continue
-
-        # skip if image never entered the viewgraph (pose/depth never optimized)
-        if image_name in epo.images_not_in_viewgraph:
-            if verbose:
-                print(f"Skipping image not in viewgraph: {image_name}")
-            continue
-
         cam_id = image_data["cam_id"]
         scale = image_data.get("scale", 1.0)
 
@@ -315,9 +303,7 @@ def build_reconstruction(
 
     # 4. Add Points3D from depth unprojection using fresh computation.
     #    Reuse the exact image_id -> name mapping built above so track
-    #    elements reference registered image ids (the old code rebuilt a
-    #    separate sorted enumeration, which could desync ids from the
-    #    images actually added when blacklisting changed ordering).
+    #    elements reference registered image ids.
     if save_points:
         if verbose:
             print("Unprojecting depth maps to 3D points...")

@@ -512,10 +512,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         #     self.images[image_name].pop("edges_map")
 
         self.loss_list = []
+        self.residuals = {}
         self.lr_list = {"q": [], "t": [], "mlp": [], "k": [], "z": []}
         self.auc_list = {"auc": {th: [] for th in self.auc_th}, "steps": []}
         self.convergence = False
-        self.blacklist = set()
         self.changes = {"q": [], "t": [], "max": [], "steps": [], "z": []}
         self.mlp_pose_convergence = False
         self.optim_convergence = False
@@ -678,6 +678,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # times to the actual loop, independent of the prologue.
         self._sync()
         optimization_start = time.perf_counter()
+
+        # auc before optimization starts
+        if gt_path is not None:
+            self.to_colmap(opt, save_points=False, verbose=False)
+            self.compute_auc(opt, gt_path, 0)
 
         # Forward and backward loop
         bar = tqdm(
@@ -880,7 +885,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             os.makedirs(rr_folder, exist_ok=True)
             rr.save(os.path.join(rr_folder, f"{scene_name}.rrd"))
 
-        if gt_path is not None:
+        if gt_path is not None and step > 0:
             self.to_colmap(opt, save_points=False, verbose=False)
             self.compute_auc(opt, gt_path, step)
 
@@ -1222,20 +1227,25 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # viewgraph pair; sum the two directions to get the per-pair loss.
         pair_losses = residuals.view(-1, 2).sum(dim=1)  # (num_pairs,)
 
-        # if sampled_viewgraphs is given, store per-pair losses for logging
+        # If sampled_viewgraphs is given, store per-pair losses indexed by
+        # image pair. Shape: ``{(i, j): [(step, residual), ...]}`` — so
+        # querying one pair's trajectory is O(1) and diagnostics that
+        # walk per pair don't have to scan every iteration.
         if sampled_viewgraphs is not None and debug:
-            if not hasattr(self, "residuals"):
-                self.residuals = []
-
-            residuals_iteration = {}
+            step = len(self.loss_list)
+            # Single GPU→CPU sync, then list-of-floats access in Python.
+            pair_losses_cpu = pair_losses.detach().cpu().tolist()
             pair_idx = 0
             for viewgraph in sampled_viewgraphs:
                 for i, j, _, _ in viewgraph:
-                    residuals_iteration[(i, j)] = (
-                        pair_losses[pair_idx].detach().cpu().item()
+                    # i, j come from the viewgraph as 0-d CUDA tensors;
+                    # tensors hash by identity not value, so without
+                    # int() every iteration creates a "new" pair key.
+                    key = (int(i), int(j))
+                    self.residuals.setdefault(key, []).append(
+                        (step, pair_losses_cpu[pair_idx])
                     )
                     pair_idx += 1
-            self.residuals.append(residuals_iteration)
 
         # Mean over pairs
         loss = pair_losses.mean()
@@ -1611,11 +1621,44 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
         self.viewgraph.sort(key=lambda x: (x[0], x[1]))
 
-        self.len_viewgraph = len(self.viewgraph)
-        self.adj_list = {}
+        adj_list = {}
         for i, j in self.viewgraph:
-            self.adj_list.setdefault(i, []).append(j)
-            self.adj_list.setdefault(j, []).append(i)
+            adj_list.setdefault(i, []).append(j)
+            adj_list.setdefault(j, []).append(i)
+
+        # Connected components over the current viewgraph. Drop any component
+        # smaller than 3 from the optimization: those images stay in
+        # `self.images` (so `to_colmap` still exports them with init poses)
+        # but they contribute no pairs to gradient updates.
+        seen = set()
+        components = []
+        for name in self.images.keys():
+            if name in seen:
+                continue
+            stack = [name]
+            comp = []
+            while stack:
+                node = stack.pop()
+                if node in seen:
+                    continue
+                seen.add(node)
+                comp.append(node)
+                stack.extend(adj_list.get(node, []))
+            components.append(comp)
+        components.sort(key=len, reverse=True)
+
+        drop = {n for comp in components if len(comp) < 3 for n in comp}
+        if drop:
+            self.viewgraph = [
+                (i, j) for (i, j) in self.viewgraph if i not in drop and j not in drop
+            ]
+            adj_list = {k: v for k, v in adj_list.items() if k not in drop}
+
+        self.adj_list = adj_list
+        self.len_viewgraph = len(self.viewgraph)
+        self.images_not_in_viewgraph = set(self.images.keys()) - set(
+            self.adj_list.keys()
+        )
 
         values = [len(v) for v in self.adj_list.values()]
         if len(values) == 0:
@@ -1628,10 +1671,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 f"min connections {min(values)}, "
                 f"images with fewer than 5 neighbors: {(np.array(values) < 5).sum()}"
             )
-
-        self.images_not_in_viewgraph = set(self.images.keys()) - set(
-            self.adj_list.keys()
-        )  # this could be used to discard these images when saving
+            sizes = [len(c) for c in components]
+            print(
+                f"Connected components: {len(sizes)}, sizes: {sizes} "
+                f"(dropped {len(drop)} images in components < 3)"
+            )
 
     ### Edges
     def _extract_edges(self, confidence_threshold=0.2, edge_batch_size=32):

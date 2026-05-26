@@ -89,7 +89,7 @@ class PoseRefinementMLP(nn.Module):
 
         # Initialize the last layer to near-zero to start with small updates
         # at step 0: mlp(x) = x
-        nn.init.normal_(self.fc6.weight, mean=0, std=1e-8)
+        nn.init.normal_(self.fc6.weight, mean=0, std=1e-12)
         nn.init.constant_(self.fc6.bias, 0)
 
     def gram_schmidt(self, poses):
@@ -143,7 +143,7 @@ if __name__ == "__main__":
         from torchinfo import summary
 
         torchinfo_available = True
-    except:
+    except ImportError:
         torchinfo_available = False
 
     # Simple test
