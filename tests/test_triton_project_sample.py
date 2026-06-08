@@ -47,7 +47,9 @@ def _make_inputs(B=4, N=128, H=64, W=80, dtype=torch.float32, seed=0, device="cu
     # Uniform per-row real H/W (every row uses the full DT canvas — the
     # degenerate case where padded == real and the kernel matches the
     # pre-fix behavior).
-    img_hw = torch.tensor([H, W], device=device, dtype=torch.int32).expand(B, 2).contiguous()
+    img_hw = (
+        torch.tensor([H, W], device=device, dtype=torch.int32).expand(B, 2).contiguous()
+    )
     return xyz, K, P, dt, dt_idx, img_hw
 
 
@@ -65,7 +67,9 @@ def test_forward_matches_reference():
 
     # Residuals should match up to floating-point noise on inside points
     diff = (res_ref - res_tri)[mask_ref]
-    print(f"forward |Δ| max={diff.abs().max().item():.3e}  mean={diff.abs().mean().item():.3e}")
+    print(
+        f"forward |Δ| max={diff.abs().max().item():.3e}  mean={diff.abs().mean().item():.3e}"
+    )
     assert diff.abs().max().item() < 1e-3, "forward residuals differ beyond tolerance"
 
 
@@ -169,16 +173,30 @@ def test_nonidentity_indices_match_gather():
     dt_gather = dt_src[dt_idx]  # (B, 1, H, W) — what the old API produced
 
     xyz, K, P, _, _, _ = _make_inputs(B=B, N=N, H=H, W=W, seed=21)
-    img_hw = torch.tensor([H, W], device="cuda", dtype=torch.int32).expand(B, 2).contiguous()
+    img_hw = (
+        torch.tensor([H, W], device="cuda", dtype=torch.int32).expand(B, 2).contiguous()
+    )
 
     # 1) torch backend with the source+indices path
     res_a, mask_a = project_and_sample_logic(
-        xyz, K, P, img_hw, dt_src, dt_indices=dt_idx, border=0,
+        xyz,
+        K,
+        P,
+        img_hw,
+        dt_src,
+        dt_indices=dt_idx,
+        border=0,
         backend="torch",
     )
     # 2) torch backend with the pre-gathered tensor (no indices)
     res_b, mask_b = project_and_sample_logic(
-        xyz, K, P, img_hw, dt_gather, border=0, backend="torch",
+        xyz,
+        K,
+        P,
+        img_hw,
+        dt_gather,
+        border=0,
+        backend="torch",
     )
     assert torch.equal(mask_a, mask_b)
     assert torch.allclose(res_a, res_b), "torch source+idx ≠ torch gather"
@@ -208,13 +226,12 @@ def test_no_nan_when_points_behind_camera():
     # Force ~30% of the points to land behind the camera (zc ≤ 0) and a few
     # to land at zc ≈ 0 (so inv_z → ±Inf).
     g = torch.Generator(device=dt.device).manual_seed(99)
-    bad = (torch.rand(xyz.shape[:2], device=dt.device, generator=g) < 0.3)
+    bad = torch.rand(xyz.shape[:2], device=dt.device, generator=g) < 0.3
     xyz = xyz.clone()
     xyz[..., 2] = torch.where(bad, -xyz[..., 2].abs(), xyz[..., 2])
     # Sprinkle a handful with zc tiny-positive
-    tiny = (torch.rand(xyz.shape[:2], device=dt.device, generator=g) < 0.02)
-    xyz[..., 2] = torch.where(tiny, 1e-9 * torch.ones_like(xyz[..., 2]),
-                              xyz[..., 2])
+    tiny = torch.rand(xyz.shape[:2], device=dt.device, generator=g) < 0.02
+    xyz[..., 2] = torch.where(tiny, 1e-9 * torch.ones_like(xyz[..., 2]), xyz[..., 2])
 
     xyz_t = xyz.clone().requires_grad_(True)
     K_t = K.clone().requires_grad_(True)
@@ -287,17 +304,24 @@ def test_per_row_img_hw_gates_padded_region():
     # Per-row real H/W: rows 0, 2 use the full canvas; rows 1, 3 are small.
     img_hw = torch.tensor(
         [[H_pad, W_pad], [H_small, W_small], [H_pad, W_pad], [H_small, W_small]],
-        device=device, dtype=torch.int32,
+        device=device,
+        dtype=torch.int32,
     )
 
     res_torch, mask_torch = project_and_sample_logic(
-        xyz, K, P, img_hw, dt, dt_indices=dt_idx, border=0, backend="torch",
+        xyz,
+        K,
+        P,
+        img_hw,
+        dt,
+        dt_indices=dt_idx,
+        border=0,
+        backend="torch",
     )
     res_tri, mask_tri = project_and_sample_triton(xyz, K, P, dt, dt_idx, img_hw)
 
-    assert torch.equal(mask_torch, mask_tri), (
-        "per-row img_hw: torch and triton disagree on inside-mask"
-    )
+    msg = "per-row img_hw: torch and triton disagree on inside-mask"
+    assert torch.equal(mask_torch, mask_tri), msg
 
     diff = (res_torch - res_tri)[mask_torch].abs()
     print(
@@ -310,7 +334,9 @@ def test_per_row_img_hw_gates_padded_region():
     # than a buggy "use padded H, W" check would yield. Equivalent to: at
     # least one projection lands in the padded zone of a small row.
     img_hw_buggy = torch.tensor(
-        [[H_pad, W_pad]] * B, device=device, dtype=torch.int32,
+        [[H_pad, W_pad]] * B,
+        device=device,
+        dtype=torch.int32,
     )
     _, mask_buggy = project_and_sample_triton(xyz, K, P, dt, dt_idx, img_hw_buggy)
     extra_inside = (mask_buggy & ~mask_tri).sum().item()

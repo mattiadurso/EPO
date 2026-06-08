@@ -59,7 +59,7 @@ class BaseModule(nn.Module):
         except KeyError as e:
             raise ValueError(
                 f"Image name {e} not found in PoseModel initialization dict."
-            )
+            ) from e
 
         return torch.tensor(indices, dtype=torch.long, device=self.device)
 
