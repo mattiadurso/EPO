@@ -345,13 +345,9 @@ class MiscModule:
         """Print the per-module parameter count + grand total."""
         total_params = 0
         print("\nTotal parameters to optimize:")
-        for key in ["t", "q", "mlp", "k", "z"]:
-            space = 14 if key == "mlp" else 16
-            if key not in params_to_optimize:
-                print(f"  {key}: {0:>{space},}")
-                continue
-            set_params = sum(p.numel() for p in params_to_optimize[key])
-            print(f"  {key}: {set_params:>{space},}")
+        for key, params in params_to_optimize.items():
+            set_params = sum(p.numel() for p in params)
+            print(f"  {key}: {set_params:>16,}")
             total_params += set_params
         print("-" * 23)
         print(f"  {'Total':}: {total_params:>12,}\n")

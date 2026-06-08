@@ -505,12 +505,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.timings["early_stop_check"] = 0.0
         self.timings["mre"] = 0.0
 
-        # # At this point I might get rid of rgb images to save memory as not needed for edge loss
-        # for image_name in self.images.keys():
-        #     self.images[image_name].pop("image") # no colors in point cloud tho
-        #     self.images[image_name].pop("depth")
-        #     self.images[image_name].pop("edges_map")
-
         self.loss_list = []
         self.residuals = {}
         self.lr_list = {"q": [], "t": [], "mlp": [], "k": [], "z": []}
@@ -1564,9 +1558,13 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             with open(self.viewgraph_path) as f:
                 lines = f.readlines()
             viewgraph = []
+            print(
+                f"Loaded viewgraph from {self.viewgraph_path} with {len(lines)} pairs."
+            )
             for line in lines:
                 # Each line is "img_i img_j num_matches"; we only need the pair.
-                i, j, _ = line.strip().split()
+                parts = line.strip().split()
+                i, j = parts[0], parts[1]
                 viewgraph.append((i, j))
             self.viewgraph = viewgraph
 
