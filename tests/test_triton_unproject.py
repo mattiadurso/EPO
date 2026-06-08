@@ -58,10 +58,7 @@ def test_forward_matches_reference():
     tri = unproject_2D_to_world(xy0, K, depth0, P, backend="triton")
 
     diff = (ref - tri).abs()
-    print(
-        f"forward |Δ| max={diff.max().item():.3e}  "
-        f"mean={diff.mean().item():.3e}"
-    )
+    print(f"forward |Δ| max={diff.max().item():.3e}  mean={diff.mean().item():.3e}")
     assert diff.max().item() < 5e-3, "forward output mismatch"
 
 
@@ -108,11 +105,15 @@ def test_backward_random_upstream():
     g = torch.Generator(device=K.device).manual_seed(11)
     grad_up = torch.randn(3, 400, 3, device=K.device, generator=g)
 
-    Ka = K.clone().requires_grad_(True); da = depth0.clone().requires_grad_(True); Pa = P.clone().requires_grad_(True)
+    Ka = K.clone().requires_grad_(True)
+    da = depth0.clone().requires_grad_(True)
+    Pa = P.clone().requires_grad_(True)
     ra = unproject_2D_to_world(xy0, Ka, da, Pa, backend="torch")
     (ra * grad_up).sum().backward()
 
-    Kb = K.clone().requires_grad_(True); db = depth0.clone().requires_grad_(True); Pb = P.clone().requires_grad_(True)
+    Kb = K.clone().requires_grad_(True)
+    db = depth0.clone().requires_grad_(True)
+    Pb = P.clone().requires_grad_(True)
     rb = unproject_2D_to_world(xy0, Kb, db, Pb, backend="triton")
     (rb * grad_up).sum().backward()
 
