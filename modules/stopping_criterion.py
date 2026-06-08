@@ -214,6 +214,8 @@ def evaluate_pose_changes(P_past, P_present, quantile=0.95, deg=True):
     Args:
         P_past: Past relative pose matrix.
         P_present: Present relative pose matrix.
+        quantile: Quantile of the per-image errors used as the summary value.
+        deg: If True, report errors in degrees; otherwise in radians.
 
     Returns:
         err_q: Rotation error in degrees (or radians).
@@ -243,6 +245,8 @@ def evaluate_depth_changes(depth_past, depth_present, pad_masks, quantile=0.95):
     Args:
         depth_past: Past depth map. (N,)
         depth_present: Present depth map. (N,)
+        pad_masks: Per-image boolean masks selecting valid (non-padded) points.
+        quantile: Quantile used both per-image and across images.
 
     Returns:
         qd: Quantile of relative depth changes.

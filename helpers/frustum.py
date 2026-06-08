@@ -57,12 +57,15 @@ def build_view_graph_from_frustums(
     with at least 30 geometric inliers. Measured on mydataset (90 scenes).
 
     Args:
-        recon_path: path to COLMAP reconstruction folder
-        device: torch device
-        z_near_default: default near plane distance
-        z_far_default: default far plane distance
+        recon: COLMAP reconstruction object or path to the reconstruction folder.
+        z_near_default: default near plane distance, used when no depth is available.
+        z_far_default: default far plane distance, used when no depth is available.
         max_view_angle_deg: maximum allowed view-direction angle difference between cameras. (To reduce pairs: lower the value (e.g., 20°)
         distance_factor: maximum allowed distance between camera centers as a factor of scene size (To reduce pairs: set to 1.0-1.5, to increase pairs: set to 3.0-4.0.)
+        verbose: if True, print progress and show a tqdm bar.
+        images_with_depth: optional dict mapping image name → {"depth": tensor},
+            used to derive per-image near/far planes from the actual depth range.
+        dtype: torch dtype used for the frustum geometry computations.
     """
     recon, cams, imgs, id_to_name, recon_path = load_reconstruction(recon)
     device = "cpu"

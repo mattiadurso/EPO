@@ -402,10 +402,18 @@ class ReconstructAndVizModule:
             "timings": self.timings,
             "max_edges": self.max_edges,
             "len_viewgraph": len(self.viewgraph),
-            "window_pose": self.window_pose,
-            "window_depth": self.window_depth,
-            "convergence_tol_pose": self.convergence_tol_pose,
-            "convergence_tol_depth": self.convergence_tol_depth,
+            "window_pose": self.window_pose if hasattr(self, "window_pose") else 0,
+            "window_depth": self.window_depth if hasattr(self, "window_depth") else 0,
+            "convergence_tol_pose": (
+                self.convergence_tol_pose
+                if hasattr(self, "convergence_tol_pose")
+                else 0
+            ),
+            "convergence_tol_depth": (
+                self.convergence_tol_depth
+                if hasattr(self, "convergence_tol_depth")
+                else 0
+            ),
             "min_viewgraph_points": self.min_points,
             "reprojection_error": self.reprojection_error,
             "sampling_factor": self.sampling_factor,

@@ -46,6 +46,7 @@ class PoseModule(BaseModule):
         device: str = "cuda",
         max_num_iterations: int = 2048,
         warmup_steps: int = 25,
+        iter_coeff: float = 1.5,
         dtype: torch.dtype = torch.float32,
     ):
         """Class storing extrinsics (Pose) for multiple cameras.
@@ -72,6 +73,7 @@ class PoseModule(BaseModule):
             max_num_iterations: Total optimizer steps, used to size the
                 cosine-decay schedule
             warmup_steps: Number of linear warmup steps before cosine decay
+            iter_coeff: Coefficient for the number of iterations in the scheduler (e.g. 1.5 means the scheduler is sized for 1.5x the max_num_iterations to allow higher lr for more iterations)
             dtype: Data type for the tensors
         Note:
             To make this module more readable, some variables and methods share between
@@ -141,7 +143,9 @@ class PoseModule(BaseModule):
             self.init_optimizer(t_lr=self.t_lr, R_lr=self.R_lr)
 
         # Initialize learning rate scheduler
-        self.init_scheduler(warmup_steps, int(max_num_iterations*1.5))  # 1.5x to allow higher lr for more iterations
+        self.init_scheduler(
+            warmup_steps, int(max_num_iterations * iter_coeff)
+        )  # 1.5x to allow higher lr for more iterations
 
         # Precompute all extrinsic matrices
         self.update_all_matrices()
