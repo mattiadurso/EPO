@@ -10,10 +10,9 @@ import os
 
 import numpy as np
 import pycolmap
-import torch
-
 import rerun as rr
 import rerun.blueprint as rrb
+import torch
 
 
 def get_frustum_strips(

@@ -22,12 +22,12 @@ from itertools import combinations
 
 import numpy as np
 import pycolmap
+import rerun as rr
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-import rerun as rr
 from epo_modules import MiscModule, ReconstructAndVizModule
 from helpers.benchmark_pose import eval_colmap_model
 from helpers.frustum import build_view_graph_from_frustums
