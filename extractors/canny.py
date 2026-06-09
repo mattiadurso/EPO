@@ -1,8 +1,12 @@
 """Canny edge-detector wrapper used as the default detector for EPO."""
 
+import logging
+
 import kornia
 import torch
 import torch.nn as nn
+
+logger = logging.getLogger(__name__)
 
 
 class CannyEdgeDetector(nn.Module):
@@ -44,10 +48,10 @@ class CannyEdgeDetector(nn.Module):
         super().__init__()
 
         if verbose:
-            print(
+            logger.info(
                 f"CannyEdgeDetector initialized with low_threshold={low_threshold}, "
-                + f"high_threshold={high_threshold}, hysteresis={hysteresis}, "
-                + f"kernel_size={kernel_size}, sigma={sigma}, device={device}"
+                f"high_threshold={high_threshold}, hysteresis={hysteresis}, "
+                f"kernel_size={kernel_size}, sigma={sigma}, device={device}"
             )
 
         self.device = torch.device(device)

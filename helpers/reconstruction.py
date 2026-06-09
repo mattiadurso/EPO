@@ -11,12 +11,15 @@ be associated with its frame via ``Frame.add_data_id`` or the
 reconstruction will reject it (``frame.HasDataId(image.DataId())``).
 """
 
+import logging
 import os
 import warnings
 
 import numpy as np
 import pycolmap
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 @torch.no_grad()
@@ -77,7 +80,7 @@ def dbscan_filter(reconstruction, eps=0.5, min_samples=20, verbose: bool = False
     ids_to_keep = set([point_ids[i] for i in cluster_indices])
 
     if verbose:
-        print(
+        logger.info(
             f"DBSCAN: keeping largest cluster with "
             f"{len(ids_to_keep):,} / {len(point_ids):,} points"
         )
@@ -306,7 +309,7 @@ def build_reconstruction(
     #    elements reference registered image ids.
     if save_points:
         if verbose:
-            print("Unprojecting depth maps to 3D points...")
+            logger.info("Unprojecting depth maps to 3D points...")
 
         # Compute fresh 3D world coordinates
         epo.unproject_edges_to_3D()
@@ -337,7 +340,7 @@ def build_reconstruction(
 
             if len(valid_3D) == 0:
                 if verbose:
-                    print(f"No valid edges for {image_name}")
+                    logger.warning(f"No valid edges for {image_name}")
                 continue
 
             # Convert to numpy if needed
@@ -399,15 +402,15 @@ def build_reconstruction(
 
             total_points += len(valid_3D)
             if verbose:
-                print(f"Added {len(valid_3D)} points from {image_name}")
+                logger.info(f"Added {len(valid_3D)} points from {image_name}")
 
         if verbose:
-            print(f"Total points added: {total_points:,}")
+            logger.info(f"Total points added: {total_points:,}")
 
     # 5. DBSCAN filtering
     if save_points and final_dbscan_filtering:
         if verbose:
-            print("Running DBSCAN filtering...")
+            logger.info("Running DBSCAN filtering...")
         reconstruction = dbscan_filter(
             reconstruction,
             eps=dbscan_eps,
@@ -417,9 +420,9 @@ def build_reconstruction(
 
     # 6. Save reconstruction
     if verbose:
-        print(f"Cameras: {len(reconstruction.cameras)}")
-        print(f"Images: {len(reconstruction.images)}")
-        print(f"Points3D: {len(reconstruction.points3D):,}")
+        logger.info(f"Cameras: {len(reconstruction.cameras)}")
+        logger.info(f"Images: {len(reconstruction.images)}")
+        logger.info(f"Points3D: {len(reconstruction.points3D):,}")
 
     if output_path is not None:
         os.makedirs(output_path, exist_ok=True)
@@ -428,10 +431,10 @@ def build_reconstruction(
         else:
             reconstruction.write_text(output_path)
         if verbose:
-            print(f"Reconstruction saved to: {output_path}")
+            logger.info(f"Reconstruction saved to: {output_path}")
 
     if epo.images_not_in_viewgraph and verbose:
-        print(
+        logger.info(
             f"{len(epo.images_not_in_viewgraph)} images were not in the "
             f"viewgraph and were skipped in the reconstruction:\n"
             f"{epo.images_not_in_viewgraph}"

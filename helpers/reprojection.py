@@ -5,11 +5,15 @@ viewgraph filtering, the full 1-to-1 reprojection used to seed the viewgraph,
 and the tensor-only primitives used in the optimized EPO forward pass.
 """
 
+import logging
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from losses.dt_loss import sample_distance_field
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_pixel_coordinates(xy: Tensor, shape: tuple[int, int] | Tensor) -> Tensor:
@@ -482,7 +486,7 @@ def filter_viewgraph_by_reprojection_batched(
     ]
     valid_points_per_pair = {viewgraph[k]: num_valid_cpu[k] for k in range(num_pairs)}
     if verbose:
-        print(
+        logger.info(
             f"Filtered viewgraph: {len(filtered_viewgraph):,}/{len(viewgraph):,} pairs retained"
         )
     return filtered_viewgraph, valid_points_per_pair
