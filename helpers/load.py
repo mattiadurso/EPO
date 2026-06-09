@@ -6,6 +6,7 @@ shapes matching the optional padding + resize convention used by EPO.
 """
 
 import glob
+import logging
 import os
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,6 +20,8 @@ from PIL import Image  # fallback only — kept for unusual formats / RGBA blend
 from torchvision.io import ImageReadMode, read_image
 from torchvision.transforms.v2 import InterpolationMode
 from torchvision.transforms.v2.functional import resize as tv_resize
+
+logger = logging.getLogger(__name__)
 
 # torchvision.io uses libjpeg-turbo + libpng under the hood — same decoders
 # as cv2 — and returns CHW uint8 tensors directly (no ndarray → permute hop).
@@ -54,7 +57,7 @@ def find_images(images_path: str, verbose: bool = False) -> list[str]:
         )
 
     if verbose:
-        print(f"Found {len(image_paths)} images in {images_path}")
+        logger.info(f"Found {len(image_paths)} images in {images_path}")
     return image_paths
 
 

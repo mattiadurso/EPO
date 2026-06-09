@@ -419,12 +419,12 @@ def eval_colmap_model(
         try:
             rec_input = pycolmap.Reconstruction(model_path)
         except Exception as e:
-            print(f"Failed to read input model from {model_path}: {e}")
+            logger.warning(f"Failed to read input model from {model_path}: {e}")
             return np.array([np.nan] * len(thrs)), (np.nan, np.nan), None
         try:
             rec_target = pycolmap.Reconstruction(target_path)
         except Exception as e:
-            print(f"Failed to read target model from {target_path}: {e}")
+            logger.warning(f"Failed to read target model from {target_path}: {e}")
             return np.array([np.nan] * len(thrs)), (np.nan, np.nan), None
         df, num_images = _scene_fn(rec_target, rec_input, verbose=verbose)
     else:
@@ -432,12 +432,12 @@ def eval_colmap_model(
         try:
             input_pd = _load_pose_dict_cached(os.path.abspath(model_path))
         except Exception as e:
-            print(f"Failed to read input model from {model_path}: {e}")
+            logger.warning(f"Failed to read input model from {model_path}: {e}")
             return np.array([np.nan] * len(thrs)), (np.nan, np.nan), None
         try:
             target_pd = _load_pose_dict_cached(os.path.abspath(target_path))
         except Exception as e:
-            print(f"Failed to read target model from {target_path}: {e}")
+            logger.warning(f"Failed to read target model from {target_path}: {e}")
             return np.array([np.nan] * len(thrs)), (np.nan, np.nan), None
         df, num_images = _scene_fn(target_pd, input_pd, verbose=verbose)
 
@@ -504,7 +504,7 @@ def eval_colmap_model_all_scenes(
     # Keep only common scenes
     common_scenes = sorted(input_scene_names & target_scene_names)
 
-    print(f"Found {len(common_scenes)} common scenes.")
+    logger.info(f"Found {len(common_scenes)} common scenes.")
 
     if len(common_scenes) == 0 and verbose:
         logger.warning("No common scenes found!")
@@ -528,7 +528,7 @@ def eval_colmap_model_all_scenes(
         else:
             logger.warning(f"Skipping {scene}: paths don't exist at {inp} and {tgt}")
 
-    print(f"Evaluating {len(valid_pairs)} valid scenes.")
+    logger.info(f"Evaluating {len(valid_pairs)} valid scenes.")
 
     # ---- Parent-side pre-parse ---------------------------------------------
     # Resolve and de-dup every path we'll touch, then parse each one through
@@ -540,7 +540,7 @@ def eval_colmap_model_all_scenes(
         try:
             parsed[p] = _load_pose_dict_cached(p)
         except Exception as e:
-            print(f"Failed to read reconstruction at {p}: {e}")
+            logger.warning(f"Failed to read reconstruction at {p}: {e}")
             parsed[p] = None
 
     work = [
@@ -579,7 +579,7 @@ def eval_colmap_model_all_scenes(
         for scene_name, df in zip(valid_scenes, dfs, strict=False):
             if df is not None:
                 df.to_csv(dfs_path / f"results_{scene_name}.csv", index=False)
-        print(f"Saved individual result dataframes to {dfs_path}")
+        logger.info(f"Saved individual result dataframes to {dfs_path}")
 
     res = {}
     for auc_scores, scene_name in zip(results, valid_scenes, strict=False):

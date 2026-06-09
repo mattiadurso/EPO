@@ -6,6 +6,7 @@ learnable submodules).
 """
 
 import json
+import logging
 import os
 import random
 
@@ -21,6 +22,8 @@ import rerun as rr
 from helpers.reconstruction import build_reconstruction
 from helpers.reprojection import project_world_to_2D
 from losses.dt_loss import sample_distance_field
+
+logger = logging.getLogger(__name__)
 
 
 class ReconstructAndVizModule:
@@ -61,7 +64,7 @@ class ReconstructAndVizModule:
             )
         num_pairs = len(viewgraph)
         if self.verbose:
-            print(f"Visualizing residuals for {num_pairs:,} image pairs...")
+            logger.info(f"Visualizing residuals for {num_pairs:,} image pairs...")
 
         for pair_idx, (img_i, img_j) in enumerate(
             tqdm(viewgraph, desc="Computing residuals")
@@ -334,7 +337,7 @@ class ReconstructAndVizModule:
 
         if save_depth:
             if self.verbose:
-                print("Saving depth maps...")
+                logger.info("Saving depth maps...")
 
             depths_out = {}
             for image_name, id in self.image_id_map.items():
@@ -528,7 +531,7 @@ class ReconstructAndVizModule:
         # Log GT Point Cloud
         if len(recon.points3D) > 0 and points3D:
             if self.verbose:
-                print(f"Logging {len(recon.points3D)} GT points...")
+                logger.info(f"Logging {len(recon.points3D)} GT points...")
             pts = []
             colors = []
             for p in recon.points3D.values():

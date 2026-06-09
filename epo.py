@@ -13,6 +13,7 @@ Typical usage::
 """
 
 import gc
+import logging
 import math
 import os
 import time
@@ -64,6 +65,9 @@ warnings.filterwarnings(
     "ignore",
     message=".*IProgress not found.*",
 )
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
@@ -262,6 +266,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.unreliable_area_masks_path = unreliable_area_masks_path
         self.use_depth_confidence = use_depth_confidence
         self.verbose = verbose
+        logger.setLevel(logging.DEBUG if verbose else logging.INFO)
         self.min_points = min_points
         self.sampling_factor = sampling_factor
         self.reprojection_error = reprojection_error
@@ -613,8 +618,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             # Log Ground Truth if available
             if gt_path is not None:
                 try:
-                    if self.verbose:
-                        print(f"Loading GT from {gt_path} for visualization...")
+                    logger.debug(f"Loading GT from {gt_path} for visualization...")
                     self.log_reconstruction_rerun(
                         gt_path,
                         entity="gt",
@@ -627,8 +631,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     warnings.warn(f"Failed to load GT for Rerun visualization: {e}")
             if ba_path is not None:
                 try:
-                    if self.verbose:
-                        print(f"Loading BA result from {ba_path} for visualization...")
+                    logger.debug(
+                        f"Loading BA result from {ba_path} for visualization..."
+                    )
                     self.log_reconstruction_rerun(
                         ba_path,
                         entity="ba",
@@ -642,7 +647,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                         f"Failed to load BA result for Rerun visualization: {e}"
                     )
 
-        if self.verbose:
+        if logger.isEnabledFor(logging.DEBUG):
             if self.len_viewgraph <= batch_size:
                 num_batches = 1
             elif drop_last and self.len_viewgraph % batch_size != 0:
@@ -650,12 +655,15 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             else:
                 num_batches = math.ceil(self.len_viewgraph / batch_size)
             total_points = self.max_edges * self.len_viewgraph
-            print(
-                f"Processing {self.len_viewgraph:,} pairs with batch size {batch_size:,} ({num_batches} batches per iteration).",
-                f"Using {self.images[list(self.images.keys())[0]]['edges_padded'].numel() // 2:,} edges per image.",  # // due to x and y
-                "\n",
-                f"Total points to process per iteration: {total_points:,}.",
-                end="\n\n",
+            # // 2 due to x and y coordinates per edge point
+            edges_per_image = (
+                self.images[list(self.images.keys())[0]]["edges_padded"].numel() // 2
+            )
+            logger.debug(
+                f"Processing {self.len_viewgraph:,} pairs with batch size "
+                f"{batch_size:,} ({num_batches} batches per iteration). "
+                f"Using {edges_per_image:,} edges per image. "
+                f"Total points to process per iteration: {total_points:,}."
             )
 
         # store past poses for convergence evaluation
@@ -820,8 +828,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                         self.timings["pose_convergence_time"] = (
                             time.perf_counter() - optimization_start
                         )
-                    if self.verbose:
-                        print(f"Pose convergence reached at step {step}.")
+                    logger.info(f"Pose convergence reached at step {step}.")
 
                     # If not optimizing depth, mark it as converged immediately
                     if not self.grad_z:
@@ -864,8 +871,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 and self.optim_convergence
                 and early_stop != "none"
             ):
-                if self.verbose:
-                    print(f"Stopping optimization at step {step}. Convergence reached.")
+                logger.info(
+                    f"Stopping optimization at step {step}. Convergence reached."
+                )
                 self.completed_iterations += 1
                 break
 
@@ -1558,7 +1566,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             with open(self.viewgraph_path) as f:
                 lines = f.readlines()
             viewgraph = []
-            print(
+            logger.info(
                 f"Loaded viewgraph from {self.viewgraph_path} with {len(lines)} pairs."
             )
             for line in lines:
@@ -1663,14 +1671,14 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             warnings.warn(
                 "Viewgraph contains no valid pairs; optimization cannot proceed."
             )
-        elif self.verbose:
-            print(
+        elif logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
                 f"Average degree: {np.mean(values):.2f}, "
                 f"min connections {min(values)}, "
                 f"images with fewer than 5 neighbors: {(np.array(values) < 5).sum()}"
             )
             sizes = [len(c) for c in components]
-            print(
+            logger.debug(
                 f"Connected components: {len(sizes)}, sizes: {sizes} "
                 f"(dropped {len(drop)} images in components < 3)"
             )
@@ -1813,14 +1821,13 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
         self.max_edges = max_edges_to_retain
 
-        if self.verbose:
-            print(
-                "Edges stats:\n",
-                f"{images_with_more_than_max:,} images have more than {max_edges_to_retain:,} edges. \n",
-                f"max: {max_edges:,} |",
-                f"min: {min_edges:,} | avg: {int(avg_edges):,} |",
-                f"std: {std_edges:,.2f} |",
-                f"quantiles (0.5, 0.9): {median_edges:,}, {q90:,}",
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"Edges stats: {images_with_more_than_max:,} images have more than "
+                f"{max_edges_to_retain:,} edges. max: {max_edges:,} | "
+                f"min: {min_edges:,} | avg: {int(avg_edges):,} | "
+                f"std: {std_edges:,.2f} | "
+                f"quantiles (0.5, 0.9): {median_edges:,}, {q90:,}"
             )
 
     @torch.no_grad()

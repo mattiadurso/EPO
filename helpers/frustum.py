@@ -6,12 +6,15 @@ view direction (cosine threshold) and lie within a scaled distance of each
 other. Used to seed the EPO viewgraph when no precomputed pairs are given.
 """
 
+import logging
 from pathlib import Path
 
 import torch
 from tqdm.auto import tqdm
 
 from .load import load_reconstruction
+
+logger = logging.getLogger(__name__)
 
 
 def compute_frustum_corners(K, width, height, z_near, z_far, R, t, device):
@@ -76,7 +79,7 @@ def build_view_graph_from_frustums(
     directions = {}
 
     if verbose is True:
-        print("Building camera frustums and computing metadata...")
+        logger.info("Building camera frustums and computing metadata...")
         bar = tqdm(imgs.values())
     else:
         bar = imgs.values()
@@ -126,7 +129,7 @@ def build_view_graph_from_frustums(
     )
 
     if verbose:
-        print(f"\nChecking {len(ids)} cameras for tight frustum overlaps...")
+        logger.info(f"Checking {len(ids)} cameras for tight frustum overlaps...")
 
     for i_idx, i in enumerate(ids):
         a_min, a_max = aabbs[i]
@@ -153,7 +156,7 @@ def build_view_graph_from_frustums(
             pairs.append([i, j])
 
     if verbose:
-        print(f"\nFound {len(pairs):,} tight overlapping pairs.")
+        logger.info(f"Found {len(pairs):,} tight overlapping pairs.")
 
     # Link image names
     out_pairs = []
