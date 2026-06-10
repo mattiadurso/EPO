@@ -134,6 +134,8 @@ def build_view_graph_from_frustums(
     for i_idx, i in enumerate(ids):
         a_min, a_max = aabbs[i]
         ci, di = centers[i], directions[i]
+        # depends only on i — keep out of the O(N) inner loop
+        scene_scale = torch.norm(a_max - a_min)
         for j in ids[i_idx + 1 :]:
             b_min, b_max = aabbs[j]
             cj, dj = centers[j], directions[j]
@@ -149,7 +151,6 @@ def build_view_graph_from_frustums(
 
             # Step 3: distance filter
             dist = torch.norm(ci - cj)
-            scene_scale = torch.norm(a_max - a_min)
             if dist > distance_factor * scene_scale:
                 continue
 

@@ -44,10 +44,11 @@ def evaluate_R_err(R_gt, R, deg=True):
         err_q = np.rad2deg(err_q)  # rad*180/np.pi
 
     if np.sum(np.isnan(err_q)):
-        # This should never happen! Debug here
-        import IPython
-
-        IPython.embed()
+        # This should never happen — fail loudly instead of hanging
+        # unattended batch runs in an interactive shell.
+        raise FloatingPointError(
+            f"NaN rotation error (q={q}, q_gt={q_gt}, loss_q={loss_q})"
+        )
 
     return err_q.item()
 
@@ -69,10 +70,11 @@ def evaluate_t_err(t_gt, t, deg=True):
     # err_t = np.arccos(np.clip(np.inner(t,t_gt), -1.0, 1.0)) # Equivalent to above
 
     if np.sum(np.isnan(err_t)):
-        # This should never happen! Debug here
-        import IPython
-
-        IPython.embed()
+        # This should never happen — fail loudly instead of hanging
+        # unattended batch runs in an interactive shell.
+        raise FloatingPointError(
+            f"NaN translation error (t={t}, t_gt={t_gt}, loss_t={loss_t})"
+        )
 
     if deg:
         err_t = np.rad2deg(err_t)  # rad*180/np.pi

@@ -9,6 +9,9 @@ import json
 import logging
 import os
 import random
+import shutil
+import subprocess
+import warnings
 
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
@@ -49,18 +52,19 @@ class ReconstructAndVizModule:
             custom_viewgraph: Explicit list of ``(img_i, img_j)`` pairs to
                 process instead of sampling from ``self.viewgraph``.
         """
-        import os
-
         os.makedirs(output_dir, exist_ok=True)
 
-        # Select viewgraph pairs
+        # Select viewgraph pairs (random.sample: without replacement, so no
+        # pair is visualised twice)
         if custom_viewgraph:
             viewgraph = custom_viewgraph
         else:
             viewgraph = (
                 self.viewgraph
                 if max_images < 0
-                else random.choices(self.viewgraph, k=max_images)
+                else random.sample(
+                    self.viewgraph, k=min(max_images, len(self.viewgraph))
+                )
             )
         num_pairs = len(viewgraph)
         if self.verbose:
@@ -312,7 +316,11 @@ class ReconstructAndVizModule:
             save_depth: If True, write refined depth maps as a single
                 ``depths.pth`` dict (``{image_stem: {"depth": tensor}}``).
         """
-        os.system(f"rm -rf {output_path}/*")
+        # Clear any previous export. shutil instead of `rm -rf {path}/*` shell
+        # interpolation, which breaks on spaces and is dangerous on odd paths.
+        if os.path.isdir(output_path):
+            shutil.rmtree(output_path)
+        os.makedirs(output_path, exist_ok=True)
         recon = build_reconstruction(
             self,
             output_path=output_path,
@@ -326,14 +334,31 @@ class ReconstructAndVizModule:
         )
 
         if gt_path is not None:
-            # align
-            os.system(
-                f"colmap model_aligner \
-                    --input_path {output_path} \
-                    --output_path {output_path} \
-                    --ref_model_path {gt_path} \
-                    --alignment_max_error 1 > /dev/null 2>&1"
+            # Align to GT. A silently failed alignment corrupts every AUC
+            # measurement downstream, so check the exit code and warn.
+            result = subprocess.run(
+                [
+                    "colmap",
+                    "model_aligner",
+                    "--input_path",
+                    output_path,
+                    "--output_path",
+                    output_path,
+                    "--ref_model_path",
+                    gt_path,
+                    "--alignment_max_error",
+                    "1",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
             )
+            if result.returncode != 0:
+                warnings.warn(
+                    f"colmap model_aligner failed (exit {result.returncode}); "
+                    f"GT metrics will be computed on the unaligned model. "
+                    f"stderr tail: {result.stderr[-500:]}"
+                )
 
         if save_depth:
             if self.verbose:

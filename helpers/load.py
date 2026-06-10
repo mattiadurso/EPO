@@ -414,7 +414,9 @@ def load_and_preprocess_depths(
     depth_data = torch.load(depth_file, map_location="cpu", weights_only=False)
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
+        # Map future → image name so failures can be attributed (result()
+        # raises, so the name can't be recovered from the return value).
+        future_names = {
             executor.submit(
                 _process_single_depth,
                 depth_data,
@@ -422,20 +424,19 @@ def load_and_preprocess_depths(
                 images_dict[image_name],
                 target_size,
                 load_with_pad,
-            )
+            ): image_name
             for image_name in images_dict.keys()
-        ]
+        }
 
-        for future in as_completed(futures):
+        for future in as_completed(future_names):
+            image_name = future_names[future]
             try:
-                image_name, depth_tensor, confidence_tensor = future.result()
+                _, depth_tensor, confidence_tensor = future.result()
             except Exception as e:
                 warnings.warn(
                     f"Error processing depth for {image_name}: {e}", stacklevel=2
                 )
-                # Confidence map missing or unreadable: fall back to no confidence.
-                image_name, depth_tensor = future.result()
-                confidence_tensor = None
+                continue
 
             if depth_tensor is not None:
                 images_dict[image_name].update(

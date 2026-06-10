@@ -81,6 +81,9 @@ class CannyEdgeDetector(nn.Module):
             "Input images should be a batch of images with shape (B, C, H, W) "
             + "or (C, H, W)"
         )
+        if images.dim() == 3:
+            # kornia's Canny enforces (B, C, H, W)
+            images = images.unsqueeze(0)
 
         images = images.to(self.device)
         images = images if images.is_floating_point() else images.float()
