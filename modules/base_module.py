@@ -52,13 +52,16 @@ class BaseModule(nn.Module):
             indices = [indices]
 
         elif isinstance(indices, torch.Tensor):
-            return torch.tensor(indices, dtype=torch.long, device=self.device)
+            # .to() instead of torch.tensor(tensor): no copy-construct
+            # UserWarning, and no forced copy when dtype/device already match
+            return indices.to(device=self.device, dtype=torch.long)
 
         try:
             indices = [self.image_to_tensor_idx[name] for name in indices]
         except KeyError as e:
             raise ValueError(
-                f"Image name {e} not found in PoseModel initialization dict."
+                f"Image name {e} not found in {self.__class__.__name__} "
+                f"initialization dict."
             ) from e
 
         return torch.tensor(indices, dtype=torch.long, device=self.device)

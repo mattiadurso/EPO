@@ -2,16 +2,15 @@
 
 Stores intrinsics as a simple-pinhole tuple ``(f, cx, cy)`` per camera and
 optimizes a single scalar focal-length scale per camera (``f_eff = f *
-(1 + alpha)``). With ``direct_backprop=True``, ``f`` is learned directly as
-a raw parameter instead of via ``alpha``. Principal points are kept fixed;
-``PINHOLE`` cameras are collapsed to ``SIMPLE_PINHOLE`` by averaging ``fx``
-and ``fy``. Skew (``gamma``) stays at 0 and non-learnable.
+(1 + alpha)``). With ``direct_backprop=True`` (ablations), ``f`` is learned
+directly as a raw parameter instead of via ``alpha``. Principal points are
+kept fixed; ``PINHOLE`` cameras are collapsed to ``SIMPLE_PINHOLE`` by
+averaging ``fx`` and ``fy``. Skew (``gamma``) stays at 0 and non-learnable.
 """
 
 import torch
 import torch.nn as nn
 
-from helpers.reprojection import invert_K
 from modules.base_module import BaseModule
 
 
@@ -45,7 +44,8 @@ class CameraModule(BaseModule):
             max_num_iterations: total iterations used to shape the cosine schedule.
             direct_backprop: if True, learn ``f`` directly as a raw parameter
                 (initialized from ``k_params``). If False (default), learn the
-                scale ``alpha`` such that ``f_eff = f * (1 + alpha)``.
+                scale ``alpha`` such that ``f_eff = f * (1 + alpha)``. Used
+                for ablations.
             device: torch device for parameters and cached matrices.
             dtype: torch dtype for parameters and cached matrices.
         """
@@ -81,6 +81,10 @@ class CameraModule(BaseModule):
             self.init_optimizer(lr=self.lr)
             self.init_scheduler(warmup_steps, max_num_iterations)
 
+        # Constant full-fetch index set used by update_all_matrices — avoids
+        # re-mapping all names (dict lookups + H2D copy) every iteration.
+        self._all_indices = torch.arange(self.k_params.shape[0], device=self.device)
+
         self.update_all_matrices()  # Pre-compute all intrinsic matrices
 
     def get_all_intrinsic_matrix(self) -> tuple[list[str], torch.Tensor]:
@@ -96,16 +100,6 @@ class CameraModule(BaseModule):
             return self.cameras[indices]
 
         return self._build_K(indices)
-
-    def get_inverse_intrinsic_matrix(self, indices) -> torch.Tensor:
-        """Return ``(B, 3, 3)`` inverse intrinsic matrices for the given cameras."""
-        if isinstance(indices[0], str):
-            indices = self.map_names_to_indices(indices)
-
-        if self.cameras_inv is not None:
-            return self.cameras_inv[indices]
-
-        return invert_K(self.get_intrinsic_matrix(indices))
 
     def _build_K(self, tensor_indices: torch.Tensor) -> torch.Tensor:
         """Compose ``(B, 3, 3)`` intrinsic matrices from base params + learned focal."""
@@ -151,8 +145,7 @@ class CameraModule(BaseModule):
     def update_all_matrices(self) -> None:
         """Refresh the cached intrinsic matrices after parameters change."""
         self.cameras = None
-        self.cameras = self.get_intrinsic_matrix(self.keys)
-        self.cameras_inv = None
+        self.cameras = self.get_intrinsic_matrix(self._all_indices)
 
     def __repr__(self) -> str:
         """Return a short summary listing the first few cameras and their params."""

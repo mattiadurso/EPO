@@ -89,7 +89,7 @@ class PoseRefinementMLP(nn.Module):
 
         # Initialize the last layer to near-zero to start with small updates
         # at step 0: mlp(x) = x
-        nn.init.normal_(self.fc6.weight, mean=0, std=1e-12)
+        nn.init.normal_(self.fc6.weight, mean=0, std=1e-8)
         nn.init.constant_(self.fc6.bias, 0)
 
     def gram_schmidt(self, poses):
@@ -146,8 +146,8 @@ if __name__ == "__main__":
     except ImportError:
         torchinfo_available = False
 
-    # Simple test
-    mlp = PoseRefinementMLP()
+    # Simple test (12 = flattened 3x4 pose, matching PoseModule's usage)
+    mlp = PoseRefinementMLP(input_dim=12, output_dim=12)
     if torchinfo_available:
         summary(mlp, input_size=(16, 3, 4))
     else:

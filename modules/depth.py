@@ -113,13 +113,14 @@ class DepthModule(BaseModule):
             return torch.clamp(self.params[indices], min=self.min_depth)
         # Need to return depth, not inverse depth
         z = self.depth[indices]
+        ab = self.params[indices]  # single gather instead of one per channel
         if self.per_pixel:
-            a = self.params[indices][:, :, 0]
-            b = self.params[indices][:, :, 1]
+            a = ab[:, :, 0]
+            b = ab[:, :, 1]
         else:
             # broadcast a single (scale, shift) pair across all pixels
-            a = self.params[indices][:, 0:1]
-            b = self.params[indices][:, 1:2]
+            a = ab[:, 0:1]
+            b = ab[:, 1:2]
         # clamp to keep depths in front of the camera (z > 0)
         return torch.clamp(z * (1 + a) + b, min=self.min_depth)
 

@@ -109,12 +109,20 @@ class PoseModule(BaseModule):
             R_init.clone().detach(),
             requires_grad=grad_R,
         )
+        # When R_param is frozen (use_mlp or grad_R=False) Gram-Schmidt of a
+        # constant is constant — orthonormalize once here instead of on every
+        # fetch (saves ~6 kernel launches per iteration).
+        self._R_orth = (
+            gram_schmidt_rotation(self.R_param).detach() if not grad_R else None
+        )
 
         # --- Translation Prep ---
+        # t_mean / t_scale are registered as buffers so checkpointing and
+        # .to(device) moves keep the translation rescale consistent.
         t_init = t.reshape(num_cams, 3).to(self.device, dtype=self.dtype)
-        self.t_mean = t_init.mean(dim=0, keepdim=True)
+        self.register_buffer("t_mean", t_init.mean(dim=0, keepdim=True))
         dist = torch.norm(t_init - self.t_mean, dim=1)
-        self.t_scale = torch.clamp(torch.mean(dist), min=1e-10)
+        self.register_buffer("t_scale", torch.clamp(torch.mean(dist), min=1e-10))
         t_init = (t_init - self.t_mean) / self.t_scale
 
         # Store as Raw Parameter
@@ -146,6 +154,10 @@ class PoseModule(BaseModule):
         self.init_scheduler(
             warmup_steps, int(max_num_iterations * iter_coeff)
         )  # 1.5x to allow higher lr for more iterations
+
+        # Constant full-fetch index set used by update_all_matrices — avoids
+        # re-mapping all names (dict lookups + H2D copy) every iteration.
+        self._all_indices = torch.arange(num_cams, device=self.device)
 
         # Precompute all extrinsic matrices
         self.update_all_matrices()
@@ -199,6 +211,8 @@ class PoseModule(BaseModule):
         """Returns (B, 3, 3) rotation matrices for the requested images,
         re-orthonormalized via Gram-Schmidt so the result is always on SO(3).
         """
+        if self._R_orth is not None:  # frozen R: precomputed at init
+            return self._R_orth[indices]
         return gram_schmidt_rotation(self.R_param[indices])
 
     def get_translation(self, indices) -> torch.Tensor:
@@ -324,9 +338,8 @@ class PoseModule(BaseModule):
 
     def update_all_matrices(self):
         """Init/Update all extrinsic matrices for all images and store them internally."""
-        all_names = list(self.image_to_tensor_idx.keys())
         self.poses = None  # Invalidate cache before recomputing
-        self.poses = self.get_projection_matrix(all_names)
+        self.poses = self.get_projection_matrix(self._all_indices)
 
     def get_all_matrices(self):
         """Get all extrinsic matrices for all images."""
