@@ -46,6 +46,7 @@
 
 | Version | Description |
 |---------|-------------|
+| **1.0.3** | Fused the Huber loss epilogue into the Triton kernel (bit-identical, faster); optional `fuse_reduction=True` fuses the loss reduction too (faster, fp-reordering only).<br>Per-step logging now syncs GPU→CPU once per iteration; `log_granular_time` now defaults to `False`.<br>Torch backend now masks behind-camera/non-finite points identically to Triton. |
 | **1.0.2** | Added `EPO.from_ff(...)` — initialize directly from a 3DFM's in-memory output (no COLMAP/`.h5` round-trip). |
 | **1.0.1** | Fixed a bug in the loss function — outliers are now handled more robustly, resulting in slightly higher scores.<br>Added Triton kernel for point reprojection (~1.5× faster); enable with `backend="triton"`.<br>Added mixed-precision (BF16) support for the pose-refinement MLP via `use_amp=True`.<br>Improved per-stage time logging; can be disabled with `log_granular_time=False`. |
 | **1.0.0** | Initial release. |
