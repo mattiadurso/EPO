@@ -39,7 +39,7 @@ def _project_sample_fwd_kernel(
     DT_IDX_ptr,  # (B,) int64 — maps batch row → image index in DT_ptr
     IMG_HW_ptr,  # (B, 2) int32 — per-row real (H, W) of the target image
     OUT_ptr,  # (B, N) float — residuals
-    MASK_ptr,  # (B, N) uint8 — 1 if inside
+    MASK_ptr,  # (B, N) uint8 — 1 if inside (FUSE_LOSS: 1 if inside & pad-valid)
     # Saved intermediates for backward. xc/yc/zc are NOT saved — the fused
     # bwd kernel (cycle 19) re-derives them from (xyz_world, P) using the
     # same source expression, then uses them for *both* the per-point grad
@@ -48,6 +48,15 @@ def _project_sample_fwd_kernel(
     # consumer kernel now.
     DSDU_ptr,
     DSDV_ptr,
+    # Loss-epilogue fusion — only touched when FUSE_LOSS (dummy ptrs otherwise)
+    PAD_ptr,  # (B, N) uint8 — edge-padding validity mask
+    RHO_ptr,  # (B, N) float — robustified residual (clamp → Huber → mask)
+    clamp_max,  # float — per-sample upper bound on the raw residual
+    huber_delta,  # float — Huber quadratic/linear transition
+    # Reduction fusion — only touched when FUSE_REDUCE (dummy ptrs otherwise)
+    RSUM_ptr,  # (B, n_tiles) float — per-tile partial sums of rho
+    CNT_ptr,  # (B, n_tiles) float — per-tile partial counts of valid
+    s_rsum_b,  # stride between batch rows of the (B, n_tiles) partials
     # Sizes — H, W here are the *padded* canvas (DT memory layout)
     B,
     N,
@@ -63,6 +72,8 @@ def _project_sample_fwd_kernel(
     s_hw_b,
     s_out_b,
     BLOCK_N: tl.constexpr,
+    FUSE_LOSS: tl.constexpr,
+    FUSE_REDUCE: tl.constexpr,
 ):
     """Forward: project xyz_world → pixel → bilinear-sample dt_field.
 
@@ -188,7 +199,36 @@ def _project_sample_fwd_kernel(
     # already guarantee it (sampled = 0 for !inside via tl.where).
     sampled = tl.where(sampled == sampled, sampled, 0.0)  # NaN ⇒ 0
     tl.store(OUT_ptr + out_off, sampled, mask=n_mask)
-    tl.store(MASK_ptr + out_off, inside.to(tl.uint8), mask=n_mask)
+    if FUSE_LOSS:
+        # Loss epilogue fused in-register: replicate the torch chain
+        # ``pad & inside → clamp(max) → Huber(δ) → where(valid, ·, 0)``
+        # op-for-op (compute_chunk_loss_logic) so the stored rho is
+        # bit-identical to the unfused path. ``(0.5 * r) * r`` keeps torch's
+        # left-associative order; ``0.5 * huber_delta`` is hoisted so no
+        # per-element mul can be FMA-contracted into the subtraction.
+        pad = tl.load(PAD_ptr + out_off, mask=n_mask, other=0)
+        valid = inside & (pad != 0)
+        r_c = tl.minimum(sampled, clamp_max)
+        half_delta = 0.5 * huber_delta
+        rho = tl.where(
+            r_c <= huber_delta,
+            (0.5 * r_c) * r_c,
+            huber_delta * (r_c - half_delta),
+        )
+        rho = tl.where(valid, rho, 0.0)
+        if FUSE_REDUCE:
+            # Per-tile partial reductions instead of the (B, N) rho store;
+            # the (B, n_tiles) partials are summed in torch. NOT bit-equal
+            # to torch's row-sum (different accumulation order). Ghost
+            # lanes contribute exact 0 (valid=0 ⇒ rho=0).
+            part_off = pid_b * s_rsum_b + pid_n
+            tl.store(RSUM_ptr + part_off, tl.sum(rho, axis=0))
+            tl.store(CNT_ptr + part_off, tl.sum(valid.to(tl.float32), axis=0))
+        else:
+            tl.store(RHO_ptr + out_off, rho, mask=n_mask)
+        tl.store(MASK_ptr + out_off, valid.to(tl.uint8), mask=n_mask)
+    else:
+        tl.store(MASK_ptr + out_off, inside.to(tl.uint8), mask=n_mask)
     # xc/yc/zc are NOT stored — see kernel-signature comment. The fused bwd
     # kernel reads xyz_world+P and recomputes them. ds_du/ds_dv ARE stored
     # because recomputing them in bwd would re-do the 4 random DT gathers,
@@ -226,10 +266,15 @@ def _project_sample_bwd_kernel(
     XYZW_ptr,  # (B, N, 3) world points — used for xc/yc/zc derive + grad_R
     DSDU_ptr,  # (B, N) fwd-saved bilinear gradient
     DSDV_ptr,
-    MASK_ptr,  # (B, N) uint8 — inside mask
-    GR_ptr,  # (B, N) grad_residuals (upstream cotangent)
+    MASK_ptr,  # (B, N) uint8 — inside mask (FUSE_LOSS: inside & pad-valid)
+    GR_ptr,  # (B, N) grad_residuals / grad_rho; FUSE_REDUCE: (B, n_tiles)
     K_ptr,  # (B, 3, 3)
     P_ptr,  # (B, 4, 4)
+    # Loss-epilogue fusion — only read when FUSE_LOSS (dummy ptr otherwise)
+    RES_ptr,  # (B, N) float — fwd-saved raw residuals
+    clamp_max,
+    huber_delta,
+    s_gr_b,  # batch stride of GR_ptr when FUSE_REDUCE ((B, n_tiles) layout)
     # Outputs
     GXYZ_ptr,  # (B, N, 3) grad_xyz_world (per-point)
     PK_ptr,  # (B, n_tiles, 9) per-tile K-grad partials
@@ -253,6 +298,8 @@ def _project_sample_bwd_kernel(
     s_pt_b,
     s_pt_t,
     BLOCK_N: tl.constexpr,
+    FUSE_LOSS: tl.constexpr,
+    FUSE_REDUCE: tl.constexpr,
 ):
     """Fused per-point bwd + per-tile K/R/t partial reductions.
 
@@ -302,8 +349,25 @@ def _project_sample_bwd_kernel(
     zc = tl.where(inside, zc, 1.0)
 
     # ---- Load grad_residuals + ds_du/ds_dv → grad_u/grad_v -------------
-    gr = tl.load(GR_ptr + row, mask=n_mask, other=0.0)
-    gr = tl.where(inside, gr, 0.0)
+    if FUSE_REDUCE:
+        # Upstream cotangent is per-tile (sum backward = broadcast): one
+        # scalar per program instead of a (B, N) load.
+        gr_tile = tl.load(GR_ptr + pid_b * s_gr_b + pid_n)
+        gr = tl.where(inside, gr_tile, 0.0)
+    else:
+        gr = tl.load(GR_ptr + row, mask=n_mask, other=0.0)
+        gr = tl.where(inside, gr, 0.0)
+    if FUSE_LOSS:
+        # Backward of the fused loss epilogue. Replicates torch autograd's
+        # tie rules exactly: the quadratic Huber branch is taken at
+        # r_c == δ, and clamp(max) passes gradient at r == clamp_max.
+        # (The quadratic branch's two autograd contributions sum to a
+        # single ``g · r_c`` bit-exactly — power-of-two scaling commutes
+        # with fp32 rounding.)
+        r = tl.load(RES_ptr + row, mask=n_mask, other=0.0)
+        r_c = tl.minimum(r, clamp_max)
+        gr = tl.where(r_c <= huber_delta, gr * r_c, gr * huber_delta)
+        gr = tl.where(r <= clamp_max, gr, 0.0)
     ds_du = tl.load(DSDU_ptr + row, mask=n_mask, other=0.0)
     ds_dv = tl.load(DSDV_ptr + row, mask=n_mask, other=0.0)
     grad_u = gr * ds_du
@@ -516,7 +580,19 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, xyz_world, K, P, dt_fields_src, dt_indices, img_hw):
+    def forward(
+        ctx,
+        xyz_world,
+        K,
+        P,
+        dt_fields_src,
+        dt_indices,
+        img_hw,
+        pad_mask=None,
+        clamp_max=None,
+        huber_delta=None,
+        fuse_reduce=False,
+    ):
         """Args
         xyz_world: (B, N, 3)
         K: (B, 3, 3), P: (B, 4, 4)
@@ -528,6 +604,18 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
             to gate the inside-mask against the unpadded image extent
             rather than the padded DT canvas. Accepts any numeric dtype;
             cast to int32 internally.
+        pad_mask: optional (B, N) bool — edge-padding validity. When given,
+            the loss epilogue (clamp → Huber → mask-zeroing) is fused into
+            the kernel and the op returns ``(rho, valid_mask)`` instead of
+            ``(residuals, inside_mask)``; ``clamp_max``/``huber_delta``
+            must then be provided.
+        clamp_max: per-sample residual upper bound (fused mode only).
+        huber_delta: Huber transition point (fused mode only).
+        fuse_reduce: also fuse the row reduction (requires ``pad_mask``).
+            The op then returns per-tile partials ``(rho_partials,
+            cnt_partials)`` of shape ``(B, n_tiles)`` to be row-summed by
+            the caller. NOT bit-equal to ``rho.sum(dim=1)`` (different
+            fp accumulation order), but deterministic run-to-run.
         """
         assert xyz_world.is_cuda and K.is_cuda and P.is_cuda
         assert dt_fields_src.is_cuda and dt_indices.is_cuda
@@ -562,12 +650,42 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
         ds_du = torch.empty((B, N), device=device, dtype=dtype)
         ds_dv = torch.empty((B, N), device=device, dtype=dtype)
 
+        fuse_loss = pad_mask is not None
+        assert not (fuse_reduce and not fuse_loss), "fuse_reduce requires pad_mask"
+        if fuse_loss:
+            pad_c = pad_mask.contiguous()
+            # bool and uint8 share itemsize — reinterpret instead of copying.
+            pad_u8 = (
+                pad_c.view(torch.uint8)
+                if pad_c.dtype == torch.bool
+                else pad_c.to(torch.uint8)
+            )
+            assert pad_u8.shape == (B, N), f"pad_mask must be ({B}, {N})"
+            rho = (
+                residuals  # dummy — FUSE_REDUCE keeps rho in-register
+                if fuse_reduce
+                else torch.empty((B, N), device=device, dtype=dtype)
+            )
+        else:
+            # Dummy pointers — the kernel never touches them (FUSE_LOSS=False
+            # dead-code-eliminates every PAD/RHO access at compile time).
+            pad_u8 = mask
+            rho = residuals
+
         BLOCK_N = 256
         # Grid axes order matters: axis 0 (CUDA blockIdx.x) varies fastest in
         # hardware dispatch, so we put ``N / BLOCK_N`` first and ``B`` second.
         # Consecutive blocks then share ``pid_b`` (and DT image), keeping the
         # 1 MB DT field hot in L2 across the ~48 tiles of one batch row.
         grid = (triton.cdiv(N, BLOCK_N), B)
+        if fuse_reduce:
+            n_tiles_fwd = grid[0]
+            rho_partials = torch.empty((B, n_tiles_fwd), device=device, dtype=dtype)
+            cnt_partials = torch.empty((B, n_tiles_fwd), device=device, dtype=dtype)
+        else:
+            # Dummy pointers — never touched when FUSE_REDUCE=False.
+            rho_partials = residuals
+            cnt_partials = residuals
         # Triton launches against the current CUDA device, not the tensors'
         # device — pin it so multi-GPU callers (e.g. ``device="cuda:4"``) work.
         with torch.cuda.device(device):
@@ -582,6 +700,13 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 mask,
                 ds_du,
                 ds_dv,
+                pad_u8,
+                rho,
+                float(clamp_max) if fuse_loss else 0.0,
+                float(huber_delta) if fuse_loss else 1.0,
+                rho_partials,
+                cnt_partials,
+                rho_partials.stride(0),
                 B,
                 N,
                 H,
@@ -595,6 +720,8 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 hw_c.stride(0),
                 residuals.stride(0),
                 BLOCK_N=BLOCK_N,
+                FUSE_LOSS=fuse_loss,
+                FUSE_REDUCE=fuse_reduce,
                 # Single fixed launch config (no autotune dispatch overhead).
                 # ``num_warps=8`` matches BLOCK_N=256 → 1 element/thread (vs
                 # default 4 warps × 32 threads = 128 threads, 2 elements each).
@@ -609,18 +736,40 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
         # Save references for backward. Neither u/v nor xc/yc/zc are saved
         # — the fused bwd kernel (cycle 19) derives all of them once per
         # point from (xyz_world, P) and uses them for both the per-point
-        # grad_xyz_world and the per-tile K/R/t partial reductions.
-        ctx.save_for_backward(xyz_c, K_c, P_c, ds_du, ds_dv, mask)
-        return residuals, mask.bool()
+        # grad_xyz_world and the per-tile K/R/t partial reductions. Fused
+        # mode additionally saves the raw residuals — the bwd kernel
+        # re-derives the Huber/clamp selectors from them.
+        ctx.fuse_loss = fuse_loss
+        ctx.fuse_reduce = fuse_reduce
+        if fuse_loss:
+            ctx.clamp_max = float(clamp_max)
+            ctx.huber_delta = float(huber_delta)
+            ctx.save_for_backward(xyz_c, K_c, P_c, ds_du, ds_dv, mask, residuals)
+        else:
+            ctx.save_for_backward(xyz_c, K_c, P_c, ds_du, ds_dv, mask)
+        if fuse_reduce:
+            ctx.mark_non_differentiable(cnt_partials)
+            return rho_partials, cnt_partials
+        # uint8 and bool share itemsize and the kernel only writes 0/1, so
+        # reinterpreting is free — `.bool()` would materialise a second
+        # full (B, N) tensor per call.
+        if fuse_loss:
+            return rho, mask.view(torch.bool)
+        return residuals, mask.view(torch.bool)
 
     @staticmethod
     def backward(ctx, grad_residuals, grad_mask_unused):
         """Analytical backward for the fused project+sample op.
 
         Returns gradients w.r.t. ``(xyz_world, K, P)``; the DT field, dt
-        indices, and ``img_hw`` are non-grad inputs and yield ``None``.
+        indices, ``img_hw``, and the loss-fusion inputs are non-grad and
+        yield ``None``.
         """
-        xyz_world, K, P, ds_du, ds_dv, mask = ctx.saved_tensors
+        if ctx.fuse_loss:
+            xyz_world, K, P, ds_du, ds_dv, mask, residuals = ctx.saved_tensors
+        else:
+            xyz_world, K, P, ds_du, ds_dv, mask = ctx.saved_tensors
+            residuals = ds_du  # dummy pointer — never read (FUSE_LOSS=False)
         B, N, _ = xyz_world.shape
         device, dtype = xyz_world.device, xyz_world.dtype
 
@@ -652,6 +801,10 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 gr,
                 K,
                 P,
+                residuals,
+                ctx.clamp_max if ctx.fuse_loss else 0.0,
+                ctx.huber_delta if ctx.fuse_loss else 1.0,
+                gr.stride(0) if ctx.fuse_reduce else 0,
                 grad_xyz_world,
                 partials_K,
                 partials_R,
@@ -672,6 +825,8 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 partials_t.stride(0),
                 partials_t.stride(1),
                 BLOCK_N=BLOCK_N,
+                FUSE_LOSS=ctx.fuse_loss,
+                FUSE_REDUCE=ctx.fuse_reduce,
                 # Same launch config as cycle 14 bwd — load chain grew by
                 # only xyz_world (3 loads) vs the dropped xc/yc/zc loads
                 # (also 3), so register pressure is similar. num_stages=3
@@ -713,8 +868,20 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
         grad_P[:, :3, :3] = grad_R
         grad_P[:, :3, 3] = grad_t
 
-        # dt_fields_src, dt_indices, img_hw do not require gradients.
-        return grad_xyz_world, grad_K, grad_P, None, None, None
+        # dt_fields_src, dt_indices, img_hw, pad_mask, clamp_max, huber_delta,
+        # fuse_reduce do not require gradients.
+        return (
+            grad_xyz_world,
+            grad_K,
+            grad_P,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def project_and_sample_triton(
@@ -749,6 +916,97 @@ def project_and_sample_triton(
     return _ProjectAndSampleTriton.apply(
         xyz_world, K1, P1, dt_fields_src, dt_indices, img_hw
     )
+
+
+def project_sample_huber_triton(
+    xyz_world: torch.Tensor,
+    K1: torch.Tensor,
+    P1: torch.Tensor,
+    dt_fields_src: torch.Tensor,
+    dt_indices: torch.Tensor,
+    img_hw: torch.Tensor,
+    pad_mask: torch.Tensor,
+    clamp_max: float,
+    huber_delta: float = 1.0,
+):
+    """Project + DT sample with the loss epilogue fused into the kernel.
+
+    Same projection/sampling as :func:`project_and_sample_triton`, but the
+    per-point chain ``valid = pad_mask & inside → clamp(max=clamp_max) →
+    Huber(huber_delta) → zero-where-invalid`` runs in-register instead of as
+    separate torch elementwise kernels. Forward values and all gradients are
+    bit-identical to composing the unfused op with
+    :func:`losses.dt_loss.compute_chunk_loss_logic` (tie rules included);
+    only the reductions stay outside.
+
+    Args:
+        xyz_world: ``(B, N, 3)`` 3D points in world coords.
+        K1: ``(B, 3, 3)`` intrinsics.
+        P1: ``(B, 4, 4)`` world-to-camera extrinsics.
+        dt_fields_src: ``(N_img, [1,] H, W)`` *source* distance fields.
+        dt_indices: ``(B,)`` int64 image index per batch row.
+        img_hw: ``(B, 2)`` per-row real ``(H, W)`` of the target image.
+        pad_mask: ``(B, N)`` bool — edge-padding validity per point.
+        clamp_max: per-sample upper bound on the raw DT residual (pixels).
+        huber_delta: Huber quadratic/linear transition point.
+
+    Returns:
+        ``(rho, valid_mask)``: ``(B, N)`` robustified residuals (zero at
+        invalid/padded points) and the combined ``(B, N)`` bool mask.
+        ``rho.sum(dim=1)`` and ``valid_mask.sum(dim=1)`` reproduce the
+        ``(sum_val, count_val)`` of ``compute_chunk_loss_logic``.
+    """
+    return _ProjectAndSampleTriton.apply(
+        xyz_world,
+        K1,
+        P1,
+        dt_fields_src,
+        dt_indices,
+        img_hw,
+        pad_mask,
+        clamp_max,
+        huber_delta,
+    )
+
+
+def project_sample_huber_sum_triton(
+    xyz_world: torch.Tensor,
+    K1: torch.Tensor,
+    P1: torch.Tensor,
+    dt_fields_src: torch.Tensor,
+    dt_indices: torch.Tensor,
+    img_hw: torch.Tensor,
+    pad_mask: torch.Tensor,
+    clamp_max: float,
+    huber_delta: float = 1.0,
+):
+    """Like :func:`project_sample_huber_triton` but with the row reduction
+    fused too: the per-point rho never leaves registers; the kernel emits
+    ``(B, n_tiles)`` partial sums that are row-summed here.
+
+    Args: same as :func:`project_sample_huber_triton`.
+
+    Returns:
+        ``(total_sum, total_count)`` of shape ``(B,)`` — the masked Huber sum
+        and valid count per row (``count`` is float32). **Not bit-equal** to
+        ``rho.sum(dim=1)`` / ``valid.sum(dim=1)`` of the unfused-reduction
+        path (different fp accumulation order), but deterministic
+        run-to-run. Expect a one-time per-scene benchmark reshuffle when
+        switching.
+    """
+    rho_partials, cnt_partials = _ProjectAndSampleTriton.apply(
+        xyz_world,
+        K1,
+        P1,
+        dt_fields_src,
+        dt_indices,
+        img_hw,
+        pad_mask,
+        clamp_max,
+        huber_delta,
+        True,
+    )
+    return rho_partials.sum(dim=1), cnt_partials.sum(dim=1)
 
 
 # ===========================================================================

@@ -96,10 +96,8 @@ def grid_sample_nan(xy: Tensor, img: Tensor, mode="nearest") -> tuple[Tensor, Te
     mask_img_nan = torch.isnan(sampled.sum(1))  # BxN or BxN0xN1
     # ? set to nan the sampled values for points xy that were nan (grid_sample consider those as (-1, -1))
     xy_invalid = xy_norm.isnan().any(-1)  # BxN or BxN0xN1
-    # if xy.ndim == 3:
-    sampled[xy_invalid[:, None, :].repeat(1, C, 1)] = float("nan")
-    # else:
-    #     sampled[xy_invalid[:, None, :, :].repeat(1, C, 1, 1)] = float("nan")
+    # masked_fill_ broadcasts over C, handling both 3D and 4D xy inputs
+    sampled.masked_fill_(xy_invalid.unsqueeze(1), float("nan"))
 
     if squeeze_result:
         img = img.squeeze(1)
@@ -198,9 +196,10 @@ def compute_121_reprojection(  # noqa: D417
     #     print(kpts0.shape, kpts1.shape, kpts0_back.shape, "projected")
 
     # detect nans and remove if any, no need for kpts0
-    # it should be a problem, invalid points are set to (0,0)
-    nan_mask = torch.logical_and(
-        torch.isnan(kpts1).any(dim=-1), torch.isnan(kpts0_back)[0].any(dim=-1)
+    # a nan in either projection direction invalidates the point (same rule
+    # as filter_viewgraph_by_reprojection_batched)
+    nan_mask = torch.logical_or(
+        torch.isnan(kpts1).any(dim=-1), torch.isnan(kpts0_back).any(dim=-1)
     )
     kpts0 = kpts0[~nan_mask]
     kpts1 = kpts1[~nan_mask]
@@ -231,7 +230,7 @@ def compute_121_reprojection(  # noqa: D417
 def change_reference_3D_points(
     xyz0: Tensor,
     P0: Tensor,
-    P1: Tensor,  # cast_to_double: bool = True
+    P1: Tensor,
 ) -> Tensor:
     """Move 3D points from P0 to P1 reference systems
     Args:
@@ -241,7 +240,6 @@ def change_reference_3D_points(
             B,4,4
         P1: the destination coordinate system
             B,4,4
-        cast_to_double: if true, cast to double before computation and cast back to the original type afterward
     Returns
         xyz1: the 3D points in the P1 coordinate system
             B,n,3
@@ -258,17 +256,13 @@ def change_reference_3D_points(
         raise AssertionError(f"Expected P1 shape Bx4x4, got {P1.shape}")
 
     xyz0_hom = to_homogeneous(xyz0)  # B,n,4
-    # if cast_to_double:
-    original_dtype = xyz0.dtype
-    P0_inv = invert_P(P0.to(torch.double))
-    xyz1_hom = (
-        P1.to(torch.double) @ P0_inv @ xyz0_hom.permute(0, 2, 1).to(torch.double)
-    )  # B,4,n
-    xyz1 = from_homogeneous(xyz1_hom.permute(0, 2, 1)).to(original_dtype)  # B,n,3
-    # else:
-    #     P0_inv = invert_P(P0)
-    #     xyz1_hom = P1 @ P0_inv @ xyz0_hom.permute(0, 2, 1)  # B,4,n
-    #     xyz1 = from_homogeneous(xyz1_hom.permute(0, 2, 1))  # B,n,3
+    # Compose the relative transform in FP64 (cheap: 4x4 matrices only), then
+    # apply it to the points in their working precision. Keeps the stability
+    # of the double-precision composition without paying FP64 throughput on
+    # the (B,4,n) matmul, and matches the Triton path's FP32 point math.
+    P_rel = (P1.to(torch.double) @ invert_P(P0.to(torch.double))).to(xyz0.dtype)
+    xyz1_hom = P_rel @ xyz0_hom.permute(0, 2, 1)  # B,4,n
+    xyz1 = from_homogeneous(xyz1_hom.permute(0, 2, 1))  # B,n,3
 
     return xyz1
 
@@ -284,10 +278,13 @@ def reproject_2D_2D(
     border: int = 0,
     mode: str = "nearest",
     backend: str = "torch",
-) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, Tensor]:
+) -> Tensor:
     """Projects xy0 points from img0 to img1 using depth0. Points that have an invalid depth='nan' are
         set to 'nan' (if bilinear sampling is used, all the 4 closest depth values must be valid to get a valid projection).
         If img1_shape is provided, also the points that project out of the second image are set to Nan
+        (torch backend only — the Triton backend ignores img1_shape/border and relies on the caller's
+        downstream nan/border masks, see filter_viewgraph_by_reprojection_batched).
+
     Args:
         xy0: xy points in img0 (with convention top-left pixel coordinate (0.5, 0.5)
             B,n,2
@@ -304,14 +301,12 @@ def reproject_2D_2D(
         img1_shape: shape of img1 (H, W)
         border: if > 0, the points that project closer to the image borders are set to nan
         mode: depthmap interpolation mode, can be 'nearest' or 'bilinear'
+        backend: 'torch' (reference chain) or 'triton' (fused kernel, no-grad)
+
     Returns:
-        xy0_proj: the projected keypoints in img1
+        xy0_proj: the projected keypoints in img1; invalid points (invalid depth,
+            out of bounds) are NaN
             B,n,2
-        mask_invalid_depth: mask of points that had invalid depth
-            B,n  bool
-        mask_outside: optional (if img1_shape is provided) mask of points that had valid depth but project out of the
-            second image
-            B,n  bool
     """
     if backend == "triton":
         if depthmap0.dim() != 3:
@@ -327,9 +322,7 @@ def reproject_2D_2D(
         raise ValueError(f"Unknown backend {backend!r}; expected 'torch' or 'triton'")
 
     if depthmap0.dim() == 3:
-        selected_depths0, mask_invalid_depth0 = grid_sample_nan(
-            xy0, depthmap0, mode=mode
-        )  # Bxn, Bxn
+        selected_depths0, _ = grid_sample_nan(xy0, depthmap0, mode=mode)  # Bxn
     else:
         # pre-sampled depths
         if depthmap0.shape != xy0.shape[:2]:
@@ -346,16 +339,16 @@ def reproject_2D_2D(
     # ? change the ref system of the 3d point to camera1
     xyz0_proj = change_reference_3D_points(xyz0, P0, P1)  # B,n,3
 
-    # ? project the point in the destination image
+    # ? project the point in the destination image. Invalid-depth points are
+    # already NaN; mark out-of-bounds points as NaN too, matching the Triton
+    # branch's invalid-encoding (reproject_2D_2D_triton).
+    xy0_proj = project_to_2D(xyz0_proj, K1)  # B,n,2
     if img1_shape is not None:
-        xy0_proj, mask_outside0 = project_to_2D(
-            xyz0_proj, K1, img1_shape, border
-        )  # B,n,2, B,n,2
-        return xy0_proj
+        _, outside_mask = filter_outside_safe(xy0_proj, img1_shape, border)
+        xy0_proj = xy0_proj.masked_fill(outside_mask[..., None], float("nan"))
     else:
         assert border == 0, "border must be 0 if img1_shape is not provided"
-        xy0_proj = project_to_2D(xyz0_proj, K1)  # B,n,2, B,n,2
-        return xy0_proj
+    return xy0_proj
 
 
 @torch.no_grad()
@@ -694,10 +687,9 @@ def filter_outside_safe(
     )
 
     # Replace outside points with 0.0 (valid coordinate, but masked later)
-    # This prevents NaNs from propagating through the graph
-    xy_safe = torch.where(
-        outside_mask[..., None], torch.tensor(0.0, device=xy.device, dtype=xy.dtype), xy
-    )
+    # This prevents NaNs from propagating through the graph. The scalar
+    # overload avoids building a 0-d CUDA tensor (H2D copy) per call.
+    xy_safe = torch.where(outside_mask[..., None], 0.0, xy)
 
     return xy_safe, outside_mask
 
@@ -741,9 +733,10 @@ def project_world_to_2D(
         border: Pixels excluded around the image boundary.
 
     Returns:
-        ``(uv, outside_mask)`` where ``uv`` is ``(B, N, 2)`` (with values
-        zeroed for points falling outside) and ``outside_mask`` is the
-        boolean mask of those invalid points.
+        ``(uv, invalid_mask)`` where ``uv`` is ``(B, N, 2)`` (with values
+        zeroed for invalid points) and ``invalid_mask`` is the boolean mask
+        of points that fall outside the image, sit behind the camera
+        (``zc <= 0``), or project to non-finite coordinates.
     """
     # Extract R, t
     R1 = P1[:, :3, :3]
@@ -756,7 +749,15 @@ def project_world_to_2D(
 
     xy_proj, outside_mask = project_to_2D(xyz_camera1, K1, img1_shape, border)
 
-    return xy_proj, outside_mask
+    # Match the Triton inside test (_project_sample_fwd_kernel): points behind
+    # the camera (zc <= 0) or with non-finite projections are invalid even if
+    # the perspective divide mirrors them into the image bounds.
+    invalid_mask = (
+        outside_mask | (xyz_camera1[..., 2] <= 0) | ~torch.isfinite(xy_proj).all(dim=-1)
+    )
+    xy_proj = torch.where(invalid_mask[..., None], 0.0, xy_proj)
+
+    return xy_proj, invalid_mask
 
 
 ### Forward step
@@ -813,8 +814,9 @@ def project_and_sample_logic(  # noqa: D417
         dt_fields = dt_fields[dt_indices]
 
     # 1. Project World Points to 2D
-    # uv_proj contains safe values (0.0) where points are outside
-    uv_proj, outside_mask = project_world_to_2D(xyz_world, P1, K1, img1_shape, border)
+    # uv_proj contains safe values (0.0) where points are invalid (outside,
+    # behind the camera, or non-finite — same test as the Triton kernel)
+    uv_proj, invalid_mask = project_world_to_2D(xyz_world, P1, K1, img1_shape, border)
 
     # 2. Prepare Distance Fields
     # Ensure 4D shape (B, C, H, W) for grid_sample
@@ -824,5 +826,8 @@ def project_and_sample_logic(  # noqa: D417
     # 3. Sample Distance Field
     # uv_proj is guaranteed safe, so we don't need NaN checks inside
     sampled_vals = sample_distance_field(dt_fields, uv_proj)
+    # Zero residuals at invalid points, matching the Triton kernel's output
+    # (otherwise they hold the DT value sampled at the zeroed coordinate).
+    sampled_vals = sampled_vals.masked_fill(invalid_mask, 0.0)
 
-    return sampled_vals, ~outside_mask
+    return sampled_vals, ~invalid_mask

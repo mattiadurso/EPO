@@ -174,23 +174,24 @@ def compute_chunk_loss_logic(
         clamp_max: per-sample upper bound on the raw distance (pixels).
         huber_delta: Huber transition between quadratic and linear regimes.
     """
-    zero = torch.tensor(0.0, device=residuals_chunk.device, dtype=residuals_chunk.dtype)
-
     # Per-sample clamp (residuals are >= 0 by construction; only the upper tail matters)
-    r_clamped = residuals_chunk.clamp(min=0.0, max=clamp_max)
+    r_clamped = residuals_chunk.clamp(max=clamp_max)
 
-    # Per-sample Huber: rho(r) = 0.5*r^2 if r<=delta else delta*(r - 0.5*delta)
-    rho = F.huber_loss(
-        r_clamped,
-        torch.zeros_like(r_clamped),
-        reduction="none",
-        delta=huber_delta,
+    # Per-sample Huber against a zero target:
+    # rho(r) = 0.5*r^2 if r<=delta else delta*(r - 0.5*delta).
+    # Written as a direct branch (valid since r >= 0) instead of
+    # F.huber_loss(r, zeros_like(r)) — avoids materialising a full-size zero
+    # target and the |r - 0| subtraction pass on the (B, n) chunk.
+    rho = torch.where(
+        r_clamped <= huber_delta,
+        0.5 * r_clamped * r_clamped,
+        huber_delta * (r_clamped - 0.5 * huber_delta),
     )
 
     # Mask out invalid samples *after* robustification so they contribute nothing.
-    valid_rho = torch.where(mask_chunk, rho, zero)
+    valid_rho = torch.where(mask_chunk, rho, 0.0)
 
     sum_val = valid_rho.sum(dim=1)
-    count_val = mask_chunk.sum(dim=1).to(torch.long)
+    count_val = mask_chunk.sum(dim=1)
 
     return sum_val, count_val

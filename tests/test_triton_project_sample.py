@@ -266,6 +266,81 @@ def test_no_nan_when_points_behind_camera():
     )
 
 
+def test_torch_matches_triton_behind_camera_and_nan():
+    """Adversarial parity: behind-camera and NaN world points.
+
+    The torch reference path historically lacked the ``zc > 0`` and
+    finiteness gating of the Triton kernel, so behind-camera points that the
+    perspective divide mirrors into the frame counted as inside (with live
+    gradients) and NaN points passed as "inside". Locks in the parity fix in
+    ``project_world_to_2D``.
+
+    Backward is checked on the no-NaN variant only: with NaN *inputs* the
+    torch autograd chain unavoidably produces NaN grads through 0·NaN
+    products, while the Triton backward selects exact zeros for masked
+    points (covered by ``test_no_nan_when_points_behind_camera``).
+    """
+    xyz, K, P, dt, dt_idx, img_hw = _make_inputs(B=4, N=512, H=64, W=80, seed=17)
+    g = torch.Generator(device=dt.device).manual_seed(23)
+    xyz = xyz.clone()
+    # ~30% behind the camera, a few at zc ≈ 0.
+    bad = torch.rand(xyz.shape[:2], device=dt.device, generator=g) < 0.3
+    xyz[..., 2] = torch.where(bad, -xyz[..., 2].abs(), xyz[..., 2])
+    tiny = torch.rand(xyz.shape[:2], device=dt.device, generator=g) < 0.02
+    xyz[..., 2] = torch.where(tiny, torch.full_like(xyz[..., 2], 1e-9), xyz[..., 2])
+
+    # --- Backward parity on the no-NaN adversarial input -------------------
+    xa, ka, pa = (
+        xyz.clone().requires_grad_(True),
+        K.clone().requires_grad_(True),
+        P.clone().requires_grad_(True),
+    )
+    res_ref, mask_ref = project_and_sample_logic(
+        xa, ka, pa, img_hw, dt, dt_indices=dt_idx, border=0
+    )
+    xb, kb, pb = (
+        xyz.clone().requires_grad_(True),
+        K.clone().requires_grad_(True),
+        P.clone().requires_grad_(True),
+    )
+    res_tri, mask_tri = project_and_sample_triton(xb, kb, pb, dt, dt_idx, img_hw)
+
+    assert torch.equal(mask_ref, mask_tri), "inside-mask mismatch (behind-camera)"
+    behind = bad & ~tiny
+    assert not mask_ref[behind].any(), "behind-camera point marked inside"
+    assert torch.isfinite(res_ref).all(), "torch forward produced non-finite residuals"
+    d_fwd = (res_ref - res_tri).abs()
+    msg = "residuals differ (invalid points must be 0 in both)"
+    assert d_fwd.max().item() < 1e-3, msg
+
+    (res_ref * mask_ref.to(res_ref.dtype)).sum().backward()
+    (res_tri * mask_tri.to(res_tri.dtype)).sum().backward()
+    for name, a, b in [
+        ("xyz", xa.grad, xb.grad),
+        ("K[:,:2,:]", ka.grad[:, :2, :], kb.grad[:, :2, :]),
+        ("P[:,:3,:]", pa.grad[:, :3, :], pb.grad[:, :3, :]),
+    ]:
+        assert torch.isfinite(a).all(), f"torch grad {name} has non-finite values"
+        assert torch.allclose(a, b, atol=5e-3, rtol=2e-3), f"grad {name} mismatch"
+
+    # --- Forward parity with NaN world points sprinkled in -----------------
+    nan_pts = torch.rand(xyz.shape[:2], device=dt.device, generator=g) < 0.05
+    xyz_nan = torch.where(nan_pts[..., None], torch.full_like(xyz, float("nan")), xyz)
+    res_ref_n, mask_ref_n = project_and_sample_logic(
+        xyz_nan, K, P, img_hw, dt, dt_indices=dt_idx, border=0
+    )
+    res_tri_n, mask_tri_n = project_and_sample_triton(xyz_nan, K, P, dt, dt_idx, img_hw)
+    assert torch.equal(mask_ref_n, mask_tri_n), "inside-mask mismatch (NaN points)"
+    assert not mask_ref_n[nan_pts].any(), "NaN point marked inside"
+    assert torch.isfinite(res_ref_n).all(), "NaN leaked into torch residuals"
+    d_nan = (res_ref_n - res_tri_n).abs()
+    assert d_nan.max().item() < 1e-3
+    print(
+        f"  {behind.sum().item()} behind-camera, {tiny.sum().item()} zc≈0, "
+        f"{nan_pts.sum().item()} NaN pts — masks equal, residuals/grads match ✓"
+    )
+
+
 def test_per_row_img_hw_gates_padded_region():
     """Mixed per-row real H/W: projections into the padded zone must be rejected.
 
@@ -350,6 +425,132 @@ def test_per_row_img_hw_gates_padded_region():
     )
 
 
+def test_fused_loss_epilogue_bit_exact():
+    """Fused loss epilogue ≡ unfused kernel + torch chain, bit-for-bit.
+
+    Replicates the exact downstream of ``EPO.compute_forward_step``
+    (clamp → Huber → mask → per-direction mean → per-pair sum → mean) on
+    both paths and requires ``torch.equal`` on the loss AND on every input
+    gradient. Inputs include behind-camera points (inside=False), padded
+    points (pad_mask=False), residuals above ``clamp_max`` (clamped branch)
+    and on both sides of ``huber_delta`` (both Huber branches).
+    """
+    from helpers.triton_ops import project_sample_huber_triton
+    from losses.dt_loss import compute_chunk_loss_logic
+
+    xyz, K, P, dt, dt_idx, img_hw = _make_inputs(B=4, N=512, H=64, W=80, seed=11)
+    g = torch.Generator(device=xyz.device).manual_seed(99)
+    # ~20% of points behind the camera, ~15% pad-masked.
+    behind = torch.rand(xyz.shape[:2], device=xyz.device, generator=g) < 0.2
+    xyz[..., 2] = torch.where(behind, -xyz[..., 2].abs() - 0.5, xyz[..., 2])
+    pad_mask = torch.rand(xyz.shape[:2], device=xyz.device, generator=g) >= 0.15
+    # DT in [0, 5] with clamp_max=3.0 exercises the clamped branch;
+    # huber_delta=1.0 exercises both Huber branches.
+    clamp_max, huber_delta = 3.0, 1.0
+
+    def downstream(rho_sum, count, dtype):
+        mean_losses = torch.where(
+            count > 0,
+            rho_sum / count.to(dtype).clamp(min=1.0),
+            rho_sum.new_zeros(()),
+        )
+        return mean_losses.view(-1, 2).sum(dim=1).mean()
+
+    # Reference: unfused Triton op + torch loss chain
+    xyz_a = xyz.clone().requires_grad_(True)
+    K_a = K.clone().requires_grad_(True)
+    P_a = P.clone().requires_grad_(True)
+    res_a, inside_a = project_and_sample_triton(xyz_a, K_a, P_a, dt, dt_idx, img_hw)
+    valid_a = pad_mask & inside_a
+    sum_a, count_a = compute_chunk_loss_logic(
+        res_a, valid_a, clamp_max=clamp_max, huber_delta=huber_delta
+    )
+    loss_a = downstream(sum_a, count_a, res_a.dtype)
+    loss_a.backward()
+
+    # Fused path
+    xyz_b = xyz.clone().requires_grad_(True)
+    K_b = K.clone().requires_grad_(True)
+    P_b = P.clone().requires_grad_(True)
+    rho_b, valid_b = project_sample_huber_triton(
+        xyz_b, K_b, P_b, dt, dt_idx, img_hw, pad_mask, clamp_max, huber_delta
+    )
+    loss_b = downstream(rho_b.sum(dim=1), valid_b.sum(dim=1), rho_b.dtype)
+    loss_b.backward()
+
+    n_clamped = (res_a[valid_a] > clamp_max).sum().item()
+    n_linear = (res_a[valid_a].clamp(max=clamp_max) > huber_delta).sum().item()
+    print(
+        f"  valid={valid_a.sum().item()}/{valid_a.numel()}  clamped={n_clamped}  "
+        f"linear-branch={n_linear}  loss={loss_a.item():.6f}"
+    )
+    assert n_clamped > 0 and n_linear > 0, "test is vacuous: branches not exercised"
+
+    assert torch.equal(valid_a, valid_b), "valid mask mismatch"
+    rho_a = torch.where(
+        valid_a,
+        torch.where(
+            res_a.clamp(max=clamp_max) <= huber_delta,
+            0.5 * res_a.clamp(max=clamp_max) * res_a.clamp(max=clamp_max),
+            huber_delta * (res_a.clamp(max=clamp_max) - 0.5 * huber_delta),
+        ),
+        torch.zeros_like(res_a),
+    )
+    assert torch.equal(rho_a, rho_b), "per-point rho not bit-identical"
+    assert torch.equal(loss_a, loss_b), "loss not bit-identical"
+    assert torch.equal(xyz_a.grad, xyz_b.grad), "grad_xyz not bit-identical"
+    assert torch.equal(K_a.grad, K_b.grad), "grad_K not bit-identical"
+    assert torch.equal(P_a.grad, P_b.grad), "grad_P not bit-identical"
+    print("  loss + all grads bit-identical (torch.equal)")
+
+
+def test_fused_reduction_matches_within_tolerance():
+    """Fully-fused reduction ≡ torch row-sum up to fp reordering noise.
+
+    The fused row reduction accumulates in a different order than torch's
+    ``sum(dim=1)``, so exact equality is impossible by design — but counts
+    are integer-valued (exact in fp32) and sums/grads must agree to fp32
+    reduction tolerance.
+    """
+    from helpers.triton_ops import (
+        project_sample_huber_sum_triton,
+        project_sample_huber_triton,
+    )
+
+    xyz, K, P, dt, dt_idx, img_hw = _make_inputs(B=4, N=512, H=64, W=80, seed=23)
+    g = torch.Generator(device=xyz.device).manual_seed(5)
+    pad_mask = torch.rand(xyz.shape[:2], device=xyz.device, generator=g) >= 0.15
+    clamp_max, huber_delta = 3.0, 1.0
+
+    def downstream(rho_sum, count, dtype):
+        mean_losses = torch.where(
+            count > 0,
+            rho_sum / count.to(dtype).clamp(min=1.0),
+            rho_sum.new_zeros(()),
+        )
+        return mean_losses.view(-1, 2).sum(dim=1).mean()
+
+    xyz_a = xyz.clone().requires_grad_(True)
+    rho_a, valid_a = project_sample_huber_triton(
+        xyz_a, K, P, dt, dt_idx, img_hw, pad_mask, clamp_max, huber_delta
+    )
+    sum_a, count_a = rho_a.sum(dim=1), valid_a.sum(dim=1)
+    downstream(sum_a, count_a, rho_a.dtype).backward()
+
+    xyz_b = xyz.clone().requires_grad_(True)
+    sum_b, count_b = project_sample_huber_sum_triton(
+        xyz_b, K, P, dt, dt_idx, img_hw, pad_mask, clamp_max, huber_delta
+    )
+    downstream(sum_b, count_b, sum_b.dtype).backward()
+
+    assert torch.equal(count_a.to(count_b.dtype), count_b), "counts must be exact"
+    assert torch.allclose(sum_a, sum_b, rtol=1e-5, atol=1e-4), "row sums diverged"
+    grad_msg = "grad_xyz diverged"
+    assert torch.allclose(xyz_a.grad, xyz_b.grad, rtol=1e-4, atol=1e-6), grad_msg
+    d = (sum_a - sum_b).abs().max().item()
+    print(f"  counts exact; max|Δsum|={d:.3e} (fp32 reordering envelope)")
+
+
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "CUDA required for the Triton op"
     print("== Forward parity ==")
@@ -362,6 +563,12 @@ if __name__ == "__main__":
     test_nonidentity_indices_match_gather()
     print("\n== Stability: points behind camera / zc≈0 ==")
     test_no_nan_when_points_behind_camera()
+    print("\n== Torch ≡ Triton on behind-camera / NaN points ==")
+    test_torch_matches_triton_behind_camera_and_nan()
     print("\n== Per-row img_hw gates padded region ==")
     test_per_row_img_hw_gates_padded_region()
+    print("\n== Fused loss epilogue bit-exactness ==")
+    test_fused_loss_epilogue_bit_exact()
+    print("\n== Fused reduction tolerance ==")
+    test_fused_reduction_matches_within_tolerance()
     print("\nAll tests passed.")
