@@ -151,16 +151,20 @@ class MiscModule:
             ("early_stop_check", "convergence check"),
         ]
         accounted = 0.0
+        granular = getattr(self, "log_granular_time", True)
         for key, label in per_iter_keys:
+            if not granular:
+                print(f"{'  ' + label:<{KW}}{'N/A':>{VW}}{'N/A':>{PW}}{'N/A':>{AW}}")
+                continue
             v = t.get(key, 0.0)
             avg = (v / num_iters) if num_iters > 0 else None
             print(row(label, v, pct(v, total_opt), avg, indent=1))
             accounted += v
 
         # Unaccounted gap (untimed overhead between stages, rerun if not
-        # use_rerun, sync overhead etc.)
+        # use_rerun, sync overhead etc.) — only computable when stages are timed.
         unaccounted = total_opt - accounted
-        if abs(unaccounted) > 0.001:
+        if granular and abs(unaccounted) > 0.001:
             print(
                 row("unaccounted", unaccounted, pct(unaccounted, total_opt), indent=1)
             )
@@ -230,9 +234,10 @@ class MiscModule:
             print(f"  {'total steps':<{KW - 2}}{num_iters:>{VW}d}")
 
             if hasattr(self, "mre") and self.mre is not None:
+                # robustified (clamp + Huber) edge-DT residual, not raw pixels
                 print(
-                    f"  {'mean reprojection error':<{KW - 2}}"
-                    f"{float(np.mean(self.mre)):>{VW}.3f} px"
+                    f"  {'mean edge-DT residual':<{KW - 2}}"
+                    f"{float(np.mean(self.mre)):>{VW}.3f}"
                 )
 
         print(sep + "\n")
@@ -304,7 +309,7 @@ class MiscModule:
 
         total_params = 0
         params_to_optimize = self._collect_parameters_to_optimize()
-        for key in ["k", "t", "q", "z"]:
+        for key in ["k", "t", "R", "mlp", "z"]:
             if key in params_to_optimize:
                 set_params = sum(p.numel() for p in params_to_optimize[key])
                 total_params += set_params
@@ -347,7 +352,7 @@ class MiscModule:
         print("\nTotal parameters to optimize:")
         for key, params in params_to_optimize.items():
             set_params = sum(p.numel() for p in params)
-            print(f"  {key}: {set_params:>16,}")
+            print(f"  {key + ':':<7}{set_params:>14,}")
             total_params += set_params
         print("-" * 23)
-        print(f"  {'Total':}: {total_params:>12,}\n")
+        print(f"  {'Total:':<7}{total_params:>14,}\n")

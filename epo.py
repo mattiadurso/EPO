@@ -136,6 +136,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             kernels with analytical backwards for *both* paths (numerically
             equivalent up to fp32 accumulation noise; requires CUDA + the
             ``triton`` package). Toggles forward and backward in lockstep.
+        fuse_reduction: (triton backend only) also fuse the per-pair loss
+            reduction into the project+sample kernel. Faster, but the row
+            sum uses a different fp accumulation order than torch, so
+            results are NOT bit-identical to ``fuse_reduction=False`` —
+            expect a one-time per-scene benchmark reshuffle (zero-mean).
+            Deterministic run-to-run either way. Default False.
         mlp_hidden_dim: Hidden dimension for the pose-refinement MLP. Default
         use_amp: If True, run the pose-refinement MLP's linear layers in BF16
             via ``torch.autocast``. Gram-Schmidt orthonormalisation stays in
@@ -146,15 +152,15 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         warmup_steps: Number of iterations for the learning rate warmup.
         max_num_iterations: Hard cap on optimization steps.
         verbose: If True, log progress and statistics during the run.
-        log_granular_time: If True (default), record per-stage timings in
-            ``self.timings`` (loading sub-buckets + per-iter accumulators).
-            If False, only ``total_loading``, ``total_optimization`` and
-            ``total`` are populated; every other timing key stays at 0.0 for
-            backward compatibility with downstream consumers
-            (``print_summary``, ``timings.txt``, ``training_logs.json``,
-            ``benchmark_plotting``). Disabling also skips the timing-only
-            ``cuda.synchronize`` calls in the inner loop, removing the
-            per-step CPU↔GPU serialization.
+        log_granular_time: If True, record per-stage timings in
+            ``self.timings`` (loading sub-buckets + per-iter accumulators)
+            at the cost of several timing-only ``cuda.synchronize`` calls
+            per mini-batch, which serialize the CPU↔GPU pipeline. Default
+            False (profiling only): only ``total_loading``,
+            ``total_optimization`` and ``total`` are populated; every other
+            timing key stays at 0.0 for backward compatibility with
+            downstream consumers (``print_summary``, ``timings.txt``,
+            ``training_logs.json``, ``benchmark_plotting``).
         min_points: Minimum reprojection-inlier count to keep a viewgraph pair.
         sampling_factor: Oversampling factor used when building the viewgraph.
         reprojection_error: Threshold (px) used to filter viewgraph pairs.
@@ -195,13 +201,14 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         grad_z=True,
         use_mlp_pose_refinement=True,
         backend="torch",
+        fuse_reduction=False,
         mlp_hidden_dim=128,
         use_amp=False,
         auc_saving_freq=50,
         warmup_steps=25,
         max_num_iterations=2000,
         verbose=False,
-        log_granular_time=True,
+        log_granular_time=False,
         # viewgraph params
         min_points=750,
         sampling_factor=5,
@@ -278,6 +285,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         if backend not in ("torch", "triton"):
             raise ValueError(f"backend must be 'torch' or 'triton', got {backend!r}")
         self.backend = backend
+        self.fuse_reduction = fuse_reduction
 
         # Edge extractor
         # Default detector params used when caller passes ``detector_params=None``.
@@ -441,8 +449,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         dt_fields = (
             torch.stack(dt_fields, dim=0).to(self.device, dtype=self.dtype).unsqueeze(1)
         )
+        # int32: consumed as integer H/W bounds by both backends; matches the
+        # Triton wrapper's expected dtype so its per-call .to(int32) is a no-op.
         images_shapes = torch.stack(images_shapes, dim=0).to(
-            self.device, dtype=self.dtype
+            self.device, dtype=torch.int32
         )
         sampled_depth = torch.stack(sampled_depth, dim=0).to(
             self.device, dtype=self.dtype
@@ -464,13 +474,17 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             dtype=self.dtype,
         )
 
-        # Prepare viewgraph with indices for faster access during optimization
+        # Prepare viewgraph with indices for faster access during optimization.
+        # Plain-int dict lookups: map_names_to_indices would build a 1-element
+        # CUDA tensor per call, and torch.tensor() below would then trigger one
+        # GPU→CPU sync per element to read each back.
+        cam_idx = self.intrinsics.image_to_tensor_idx
         viewgraph_ids = [
             (
                 self.image_id_map[i],
                 self.image_id_map[j],
-                self.intrinsics.map_names_to_indices(self.images[i]["cam_id"]),
-                self.intrinsics.map_names_to_indices(self.images[j]["cam_id"]),
+                cam_idx[self.images[i]["cam_id"]],
+                cam_idx[self.images[j]["cam_id"]],
             )
             for i, j in self.viewgraph
         ]
@@ -479,7 +493,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         images_cams_ids = [
             (
                 self.image_id_map[image_name],
-                self.intrinsics.map_names_to_indices(self.images[image_name]["cam_id"]),
+                cam_idx[self.images[image_name]["cam_id"]],
             )
             for image_name in sorted(self.images.keys())
         ]
@@ -512,7 +526,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
         self.loss_list = []
         self.residuals = {}
-        self.lr_list = {"q": [], "t": [], "mlp": [], "k": [], "z": []}
+        self.lr_list = {"R": [], "t": [], "mlp": [], "k": [], "z": []}
         self.auc_list = {"auc": {th: [] for th in self.auc_th}, "steps": []}
         self.convergence = False
         self.changes = {"q": [], "t": [], "max": [], "steps": [], "z": []}
@@ -687,6 +701,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             self.compute_auc(opt, gt_path, 0)
 
         # Forward and backward loop
+        # `step` must exist even if the loop body never runs (e.g. a second
+        # forward() call after a completed run) — it is read after the loop.
+        step = self.completed_iterations
         bar = tqdm(
             range(self.completed_iterations, self.max_num_iterations),
             total=self.max_num_iterations,
@@ -767,23 +784,17 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             # ============================================================
             # Logging
             # ============================================================
-            self.loss_list.append(loss.detach().item())
-            self.collect_lrs(len(self.loss_list) - 1)
+            # Defer the loss read: it is merged with the pose-change
+            # quantiles below into a single GPU→CPU transfer per step.
+            loss_det = loss.detach()
+            self.collect_lrs(step)
 
-            # Evaluate AUC if GT available
-            if gt_path is not None and step % self.auc_saving_freq == 0:
+            # Evaluate AUC if GT available (step 0 was already evaluated
+            # before the loop — skip it here to avoid a duplicate export +
+            # `colmap model_aligner` run and a doubled step-0 AUC entry)
+            if gt_path is not None and step > 0 and step % self.auc_saving_freq == 0:
                 self.to_colmap(opt, save_points=False, verbose=False)
                 self.compute_auc(opt, gt_path, step)
-
-            if self.verbose:
-                bar.set_postfix(
-                    loss=f"{self.loss_list[-1]:.4f}",
-                    auc5=(
-                        f"{self.auc_list['auc'][5][-1]:.4f}"
-                        if len(self.auc_list["auc"][5]) > 0
-                        else "n/a"
-                    ),
-                )
 
             # rerun tracking
             if use_rerun:
@@ -803,14 +814,28 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
             # collect pose changes for convergence evaluation
             current_poses = self.poses.get_all_matrices().detach().clone()
-            err_q, err_t, max_err = evaluate_pose_changes(
+            err_qt = evaluate_pose_changes(
                 past_poses,
                 current_poses,
                 quantile=quantile,
             )
+            # Single GPU→CPU transfer for all per-step scalars (loss +
+            # rotation/translation change quantiles) instead of three
+            # separate .item() syncs.
+            loss_val, err_q, err_t = torch.cat([loss_det.reshape(1), err_qt]).tolist()
+            self.loss_list.append(loss_val)
+            max_err = max(err_q, err_t)
             if self.verbose:
                 self.changes["q"].append(err_q)
                 self.changes["t"].append(err_t)
+                bar.set_postfix(
+                    loss=f"{loss_val:.4f}",
+                    auc5=(
+                        f"{self.auc_list['auc'][5][-1]:.4f}"
+                        if len(self.auc_list["auc"][5]) > 0
+                        else "n/a"
+                    ),
+                )
             self.changes["max"].append(max_err)
             self.changes["steps"].append(step)
             past_poses = current_poses
@@ -1007,12 +1032,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     (step, self.poses.scheduler.get_last_lr()[0])
                 )
             else:
-                # get for group with name 't' and 'q'
+                # get for group with name 't' and 'R' (rotation)
                 for param_group in self.poses.optimizer.param_groups:
                     if param_group["name"] == "t":
                         self.lr_list["t"].append((step, param_group["lr"]))
-                    elif param_group["name"] == "q":
-                        self.lr_list["q"].append((step, param_group["lr"]))
+                    elif param_group["name"] == "R":
+                        self.lr_list["R"].append((step, param_group["lr"]))
 
         if hasattr(self.intrinsics, "scheduler"):
             self.lr_list["k"].append((step, self.intrinsics.scheduler.get_last_lr()[0]))
@@ -1164,28 +1189,66 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             s_time = time.perf_counter()
 
             # projection and sampling
-            residuals, inside_mask = project_and_sample_logic(
-                batch["xyz_world"],
-                batch["K1"],
-                batch["P1"],
-                batch["img1_shape"],
-                dt_fields_src,
-                dt_indices=dt_indices,
-                border=0,
-                backend=self.backend,
-            )
+            if self.backend == "triton":
+                # Loss epilogue (pad&inside → clamp → Huber → mask-zeroing)
+                # fused into the kernel; bit-identical to the unfused chain
+                # below (incl. gradients), only the reductions stay in torch.
+                # With fuse_reduction the row sums move in-kernel too —
+                # faster, but no longer bit-equal (see __init__ docstring).
+                from helpers.triton_ops import (
+                    project_sample_huber_sum_triton,
+                    project_sample_huber_triton,
+                )
 
-            # compute loss over all residuals at once (no chunking)
-            valid_mask = pad_masks & inside_mask
+                if self.fuse_reduction:
+                    total_sum, total_count = project_sample_huber_sum_triton(
+                        batch["xyz_world"],
+                        batch["K1"],
+                        batch["P1"],
+                        dt_fields_src,
+                        dt_indices,
+                        batch["img1_shape"],
+                        pad_masks,
+                        clamp_max=clamp_max,
+                        huber_delta=huber_delta,
+                    )
+                else:
+                    rho, valid_mask = project_sample_huber_triton(
+                        batch["xyz_world"],
+                        batch["K1"],
+                        batch["P1"],
+                        dt_fields_src,
+                        dt_indices,
+                        batch["img1_shape"],
+                        pad_masks,
+                        clamp_max=clamp_max,
+                        huber_delta=huber_delta,
+                    )
+                    total_sum = rho.sum(dim=1)
+                    total_count = valid_mask.sum(dim=1)
+            else:
+                residuals, inside_mask = project_and_sample_logic(
+                    batch["xyz_world"],
+                    batch["K1"],
+                    batch["P1"],
+                    batch["img1_shape"],
+                    dt_fields_src,
+                    dt_indices=dt_indices,
+                    border=0,
+                    backend=self.backend,
+                )
 
-            total_sum, total_count = compute_chunk_loss_logic(
-                residuals,
-                valid_mask,
-                clamp_max=clamp_max,
-                huber_delta=huber_delta,
-            )
+                # compute loss over all residuals at once (no chunking)
+                valid_mask = pad_masks & inside_mask
 
-            zero = residuals.new_zeros(())
+                total_sum, total_count = compute_chunk_loss_logic(
+                    residuals,
+                    valid_mask,
+                    clamp_max=clamp_max,
+                    huber_delta=huber_delta,
+                )
+
+            zero = total_sum.new_zeros(())
             mean_losses = torch.where(
                 total_count > 0,
                 total_sum / total_count.to(self.dtype).clamp(min=1.0),
@@ -1223,7 +1286,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         s_time = time.perf_counter()
 
         if residuals.numel() == 0:
-            return torch.tensor(0.0, device=self.device)
+            # A graph-less zero would make loss.backward() fail with a
+            # cryptic "does not require grad" error — fail loudly instead.
+            raise RuntimeError(
+                "No residuals to optimize: the viewgraph is empty "
+                "(see the 'Viewgraph contains no valid pairs' warning at init)."
+            )
 
         # Each consecutive pair of entries corresponds to (i->j, j->i) for one
         # viewgraph pair; sum the two directions to get the per-pair loss.
@@ -1594,9 +1662,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             for i in range(len(image_names) - self.sequential_matcher_window):
                 for j in range(1, self.sequential_matcher_window + 1):
                     viewgraph.append((image_names[i], image_names[i + j]))
-            min_points = 200
-            sampling_factor = 5
-            reprojection_error = 3.0
+            # Sequential matching uses looser filtering; mirror the values on
+            # self so training_logs.json records what was actually used.
+            min_points = self.min_points = 200
+            sampling_factor = self.sampling_factor = 5
+            reprojection_error = self.reprojection_error = 3.0
 
         elif type == "exhaustive":
             # Build exhaustive viewgraph (all pairs)
@@ -1730,9 +1800,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             edges_map = edges_maps[image_name]
             if "confidence" in self.images[image_name] and self.use_depth_confidence:
                 confidence = self.images[image_name]["confidence"]
+                # clamp the denominator: a constant confidence map would
+                # otherwise divide by zero and NaN-drop every edge
                 confidence = (confidence - confidence.min()) / (
                     confidence.max() - confidence.min()
-                )
+                ).clamp(min=1e-8)
                 valid_depth_mask = (confidence > confidence_threshold) & (
                     ~torch.isnan(confidence)
                 )
@@ -1870,7 +1942,13 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
     @torch.no_grad()
     def compute_mre(self):
-        """Measuring how far each image_i's edges are projected to the closest edges in image_j"""
+        """Mean robustified edge-DT residual per viewgraph pair.
+
+        Each value is the per-pair mean of the two directional residuals from
+        ``compute_forward_step`` (clamp + Huber applied per edge sample, then
+        averaged per direction) — i.e. the optimization objective per pair,
+        not a raw pixel reprojection error.
+        """
         # Update geometric modules
         self.poses.update_all_matrices()
         self.intrinsics.update_all_matrices()
@@ -1885,21 +1963,20 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             drop_last=False,
         )
 
-        sampled_viewgraphs = sampled_viewgraphs[0][:, :2].tolist()
+        # ``residuals`` interleaves the two directions of each pair
+        # (i->j at 2k, j->i at 2k+1); fold them into one value per pair.
+        # Single bulk GPU→CPU transfer instead of one .item() per pair.
+        self.mre = residuals.view(-1, 2).mean(dim=1).cpu().numpy()
 
-        for _ in range(len(sampled_viewgraphs)):
-            i, j = sampled_viewgraphs[_]
-            sampled_viewgraphs[_] = [
+        pairs = sampled_viewgraphs[0][:, :2].tolist()
+        return [
+            (
                 self.poses.tensor_idx_to_image[i],
                 self.poses.tensor_idx_to_image[j],
-                residuals[_].item(),
-            ]
-        sampled_viewgraphs = np.array(sampled_viewgraphs)
-        sampled_viewgraphs[:, 2] = sampled_viewgraphs[:, 2].astype(np.float32)
-
-        self.mre = sampled_viewgraphs[:, 2].astype(np.float32)
-
-        return sampled_viewgraphs
+                float(r),
+            )
+            for (i, j), r in zip(pairs, self.mre, strict=True)
+        ]
 
 
 if __name__ == "__main__":
