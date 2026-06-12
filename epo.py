@@ -184,7 +184,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         detector_params=None,
         seed=42,
         max_edges_points=1024 * 12,  # hard constraint due to memory on 24GB
-        max_viewgraph_pairs=1024 * 4,  # hard constraint due to memory on 24GB
+        max_viewgraph_pairs=1024,  # hard constraint due to memory on 24GB
         matcher_type="exhaustive",  # or "sequential"
         sequential_matcher_window=5,  # only for sequential matcher
         scene_type="outdoor",  # or "indoor", "object_centric" (not used yet)
@@ -1506,16 +1506,17 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         - ``"intrinsic"``: ``(3, 3)`` pinhole intrinsics matrix
         - ``"confidence"`` (optional): ``(H, W)`` float tensor
 
-        Images and depths must already be at ``self.images_size``. One camera
-        per image: each entry gets a unique ``cam_id`` derived from the key.
+        Images and depths must already be at ``self.images_size``. Cameras
+        follow ``single_camera_per_folder``: when True, all images under the
+        same ``"cam_id/..."`` folder share one (jointly optimized) camera with
+        averaged init intrinsics; when False, each image gets its own camera.
         """
         if not ff_data:
             raise ValueError("ff_data is empty")
 
         self.images = {}
-        cam_ids_ordered = []
         R_list, t_list = [], []
-        k_params_list = []
+        cam_params = {}  # cam_id -> list of per-image [f, cx, cy] (averaged below)
 
         for name in sorted(ff_data.keys()):
             entry = ff_data[name]
@@ -1542,8 +1543,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     f"{name}: 'intrinsic' must be (3, 3), got {tuple(K.shape)}"
                 )
 
-            # One camera per image; cam_id = full key (guaranteed unique).
-            cam_id = name
+            # cam_id is shared per folder when single_camera_per_folder
+            # (e.g. all "1/..." images share one camera, matching the disk
+            # path), otherwise unique per image.
+            cam_id = name.split("/")[0] if self.single_camera_per_folder else name
             self.images[name] = {
                 "image": img,
                 "depth": dep,
@@ -1558,19 +1561,26 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
             R_list.append(pose[:3, :3].contiguous())
             t_list.append(pose[:3, 3].reshape(3, 1).contiguous())
-            # SIMPLE_PINHOLE params: [f, cx, cy]; average fx/fy.
-            f = (K[0, 0] + K[1, 1]) / 2.0
-            k_params_list.append(torch.stack([f, K[0, 2], K[1, 2]]))
-            cam_ids_ordered.append(cam_id)
+            # PINHOLE params [fx, fy, cx, cy] taken from K as provided. The
+            # VGGT wrapper supplies the disk path's convention (principal
+            # point at the float image centre, see `process_camera`).
+            cam_params.setdefault(cam_id, []).append(
+                torch.stack([K[0, 0], K[1, 1], K[0, 2], K[1, 2]])
+            )
 
         self.num_images = len(self.images)
 
-        # Build CameraModule (one cam per image, SIMPLE_PINHOLE).
-        cam_id_to_tensor_id = {cid: i for i, cid in enumerate(cam_ids_ordered)}
+        # Build CameraModule: one entry per unique cam_id, init params averaged
+        # over the images that share it (shared cameras are optimized jointly).
+        cam_ids_sorted = sorted(cam_params.keys())
+        cam_id_to_tensor_id = {cid: i for i, cid in enumerate(cam_ids_sorted)}
+        k_params = torch.stack(
+            [torch.stack(cam_params[cid]).mean(dim=0) for cid in cam_ids_sorted]
+        )
         self.intrinsics = CameraModule(
             image_id_map=cam_id_to_tensor_id,
-            k_models=["SIMPLE_PINHOLE"] * self.num_images,
-            k_params=torch.stack(k_params_list),
+            k_models=["PINHOLE"] * len(cam_ids_sorted),
+            k_params=k_params,
             lr=self.k_lr,
             device=self.device,
             dtype=self.dtype,
