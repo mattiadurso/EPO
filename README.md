@@ -46,6 +46,7 @@
 
 | Version | Description |
 |---------|-------------|
+| **1.0.4** | `EPO.from_ff(...)` now mirrors the disk loaders exactly (image resampling, depth crop, intrinsics), so in-memory and disk init converge to the same result; the principal point is taken from the provided `K`; shared cameras per folder are supported via `single_camera_per_folder`.<br>Added [demo_epo.py](demo_epo.py) — end-to-end VGGT → EPO demo with optional `--vggt_output` bypass. |
 | **1.0.3** | Fused the Huber loss epilogue into the Triton kernel (bit-identical, faster); optional `fuse_reduction=True` fuses the loss reduction too (faster, fp-reordering only).<br>Per-step logging now syncs GPU→CPU once per iteration; `log_granular_time` now defaults to `False`.<br>Torch backend now masks behind-camera/non-finite points identically to Triton. |
 | **1.0.2** | Added `EPO.from_ff(...)` — initialize directly from a 3DFM's in-memory output (no COLMAP/`.h5` round-trip). |
 | **1.0.1** | Fixed a bug in the loss function — outliers are now handled more robustly, resulting in slightly higher scores.<br>Added Triton kernel for point reprojection (~1.5× faster); enable with `backend="triton"`.<br>Added mixed-precision (BF16) support for the pose-refinement MLP via `use_amp=True`.<br>Improved per-stage time logging; can be disabled with `log_granular_time=False`. |
@@ -64,7 +65,7 @@
 ### Option A — Conda Environment File
 
 ```bash
-git clone https://github.com/mattiadurso/epo.git
+git clone --recursive https://github.com/mattiadurso/epo.git
 cd epo
 
 conda env create -f environment.yml
@@ -90,30 +91,15 @@ pip install kornia \
             git+https://github.com/mattiadurso/mylib.git
 ```
 
-### Option C — Pip + venv (no Conda required)
+> ℹ️ `triton` is Linux-only and requires a CUDA build of `torch`. On systems without CUDA, install `torch` from the [official selector](https://pytorch.org/get-started/locally/) first, then run the rest of the `pip install` line without `triton` — EPO will fall back to the PyTorch reference path (`backend="torch"`).
+
+### Submodules
+
+[third_party/vggt](third_party/vggt) ([mattiadurso/vggt](https://github.com/mattiadurso/vggt), the fork producing EPO-ready reconstructions) and [third_party/lightglue](third_party/lightglue) (used by VGGT's Bundle-Adjustment path) are git submodules. They are only needed to run VGGT itself (e.g., [demo_epo.py](demo_epo.py)); EPO refines any reconstruction in the expected layout without them. If you cloned without `--recursive`:
 
 ```bash
-git clone https://github.com/mattiadurso/epo.git
-cd epo
-
-python3.10 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install --upgrade pip
-
-pip install kornia \
-            matplotlib \
-            numpy \
-            opencv-python \
-            pandas \
-            pycolmap==3.11 \
-            torch \
-            torchvision \
-            triton \
-            tqdm \
-            git+https://github.com/mattiadurso/mylib.git
+git submodule update --init --recursive
 ```
-
-> ℹ️ `triton` is Linux-only and requires a CUDA build of `torch`. On systems without CUDA, install `torch` from the [official selector](https://pytorch.org/get-started/locally/) first, then run the rest of the `pip install` line without `triton` — EPO will fall back to the PyTorch reference path (`backend="torch"`).
 
 ## Usage
 
@@ -153,17 +139,35 @@ bicycle/
 
 ### Step 3 — Run EPO
 
-```bash
-python epo.py \
-    --images_path <path_to_images> \
-    --rec_path    ./sparse \
-    --depth_path  ./depths \
-    --gt_path     <path_to_ground_truth>   # Optional — enables quantitative evaluation
+```python
+from epo import EPO
+
+epo = EPO(
+    reconstruction_path="bicycle/sparse",
+    images_path="bicycle/images",
+    depths_path="bicycle/sparse/depths.pth",
+    backend="triton",          # "torch" for the reference path
+)
+epo(early_stop="pose", gt_path="<path_to_gt>")  # gt_path optional — enables evaluation
+epo.to_colmap("out/sparse", save_points=True)
 ```
+
+### End-to-end demo (VGGT → EPO)
+
+[demo_epo.py](demo_epo.py) runs steps 2–3 for you: VGGT on a folder of images, then EPO directly on its in-memory output (`EPO.from_ff`), writing `sparse_vggt` and `sparse_epo` under `--output_path`:
+
+```bash
+python demo_epo.py \
+    --images_path bicycle/images \
+    --output_path out/demo \
+    --gt_path <path_to_gt>      # Optional — enables quantitative evaluation
+```
+
+Pass `--vggt_output <dir>` to reuse a previous run's reconstruction + `depths.pth` instead of re-running VGGT; both modes produce the same refinement.
 
 ### Notes
 
-- Image and depth map directories must mirror the same folder structure.
+- `depths.pth` keys must match the relative image paths without extension (e.g., `1/_DSC8679`).
 - Ground truth data must be provided in COLMAP format, with matching image names (e.g., `cam/images.jpg`).
 
 ### Programmatic use — feed-forward output 
@@ -195,7 +199,7 @@ epo()
 epo.to_colmap("out/sparse", save_points=True)
 ```
 
-All other `EPO(...)` kwargs are forwarded. Images and depths must already be at `images_size` (no internal resize). One camera per image.
+All other `EPO(...)` kwargs are forwarded. Images and depths must already be at `images_size` (no internal resize). With `single_camera_per_folder=True` (default) all images under the same `"cam_id/"` folder share one jointly-optimized camera; otherwise each image gets its own. The [VGGT fork](https://github.com/mattiadurso/vggt)'s `VGGTWrapper.forward()` returns an EPO-ready `ff_data` built this way (see [demo_epo.py](demo_epo.py)).
 
 ## Citation
 
