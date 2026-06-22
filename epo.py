@@ -191,7 +191,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         use_depth_confidence=False,
         R_lr=1e-4,
         t_lr=1e-3,
-        k_lr=1e-3,
+        k_lr=3e-3,
         z_lr=3e-3,
         mlp_pose_lr=3e-3,
         grad_R=False,
@@ -573,7 +573,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             window_loss (int, optional): Window size for loss-plateau convergence evaluation. Default is 100.
             convergence_tol_pose (float, optional): Tolerance for pose convergence. Default is 0.5.
             convergence_tol_depth (float, optional): Tolerance for depth convergence. Default is 0.1. Not used when early_stop is False.
-            convergence_tol_loss (float, optional): Relative-loss-change tolerance for early stop when ``early_stop="loss"``. Default is 5e-5.
+            convergence_tol_loss (float, optional): Relative-loss-change tolerance for early stop when ``early_stop="loss"``. Default is 5e-4.
             early_stop (str, optional): Whether to stop early if depth convergence is reached. Default is 'pose'.
             drop_last (bool, optional): Whether to drop the last batch if smaller than batch_size. Default is False.
             debug (bool, optional): Whether to enable debug mode. Default is False.
