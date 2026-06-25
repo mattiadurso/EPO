@@ -1133,6 +1133,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         clamp_end=6.0,
         clamp_warmup_iters=1000,
         step=None,
+        robust=True,
     ):
         """Compute one optimization step over the sampled_viewgraph in a batched manner and return the loss.
 
@@ -1142,6 +1143,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         ``clamp_max`` is annealed linearly from ``clamp_start`` to ``clamp_end``
         over ``clamp_warmup_iters``. When ``step`` is ``None`` (e.g. eval),
         the end clamp is used.
+
+        When ``robust`` is ``False`` the clamp + Huber are skipped and each
+        per-direction value is the plain masked mean of the *raw* DTF distances
+        (Eq. (8)) — i.e. a true pixel reprojection error, directly comparable to
+        the L2 reprojection error reported for BA. Used by ``compute_mre`` for
+        reporting; the optimization loop always calls with ``robust=True``.
         """
         if step is None or step >= clamp_warmup_iters:
             clamp_max = clamp_end
@@ -1189,7 +1196,25 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             s_time = time.perf_counter()
 
             # projection and sampling
-            if self.backend == "triton":
+            if not robust:
+                # Raw (un-clamped, un-Huber'd) DTF distances per edge — the
+                # quantity Eq. (8) calls RE. Masked mean per direction, no
+                # robustification, so the reported value is a true pixel
+                # reprojection error uniform with the BA L2 numbers.
+                residuals, inside_mask = project_and_sample_logic(
+                    batch["xyz_world"],
+                    batch["K1"],
+                    batch["P1"],
+                    batch["img1_shape"],
+                    dt_fields_src,
+                    dt_indices=dt_indices,
+                    border=0,
+                    backend=self.backend,
+                )
+                valid_mask = pad_masks & inside_mask
+                total_sum = torch.where(valid_mask, residuals, 0.0).sum(dim=1)
+                total_count = valid_mask.sum(dim=1)
+            elif self.backend == "triton":
                 # Loss epilogue (pad&inside → clamp → Huber → mask-zeroing)
                 # fused into the kernel; bit-identical to the unfused chain
                 # below (incl. gradients), only the reductions stay in torch.
@@ -1952,12 +1977,13 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
     @torch.no_grad()
     def compute_mre(self):
-        """Mean robustified edge-DT residual per viewgraph pair.
+        """Mean raw edge-DT residual (reprojection error) per viewgraph pair.
 
         Each value is the per-pair mean of the two directional residuals from
-        ``compute_forward_step`` (clamp + Huber applied per edge sample, then
-        averaged per direction) — i.e. the optimization objective per pair,
-        not a raw pixel reprojection error.
+        ``compute_forward_step`` called with ``robust=False`` — the plain masked
+        mean of the *raw* DTF distances (Eq. (8)), with no clamp/Huber. This is
+        a true pixel reprojection error, directly comparable to the L2
+        reprojection error reported for BA (not the optimization objective).
         """
         # Update geometric modules
         self.poses.update_all_matrices()
@@ -1966,11 +1992,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # Unproject point to world coordinates
         self.unproject_edges_to_3D()
 
-        # Compute residuals
+        # Compute raw (un-robustified) residuals
         residuals, sampled_viewgraphs = self.compute_forward_step(
             self.viewgraph_ids,
             batch_size=10_000,
             drop_last=False,
+            robust=False,
         )
 
         # ``residuals`` interleaves the two directions of each pair

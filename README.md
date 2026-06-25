@@ -3,18 +3,14 @@
 # Boosting 3D Foundation Models with Featureless Pose Optimization
 
 <p>
-  <a href="https://scholar.google.com/citations?user=9FjTo3YAAAAJ&hl=en">Mattia D'Urso</a><sup>1</sup>&ensp;·&ensp;
-  <a href="https://scholar.google.com/citations?user=6uZVF04AAAAJ&hl=en">Christian Sormann</a><sup>2</sup>&ensp;·&ensp;
-  <a href="https://scholar.google.com/citations?user=DA3nSvgAAAAJ&hl=en">Mattia Rossi</a><sup>2</sup>&ensp;·&ensp;
-  <a href="https://scholar.google.com/citations?user=M0boL5kAAAAJ&hl=en">Friedrich Fraundorfer</a><sup>1</sup>
+  <a href="https://scholar.google.com/citations?user=9FjTo3YAAAAJ&hl=en">Mattia D'Urso</a>&ensp;·&ensp;
+  <a href="https://scholar.google.com/citations?user=6uZVF04AAAAJ&hl=en">Christian Sormann</a>&ensp;·&ensp;
+  <a href="https://scholar.google.com/citations?user=DA3nSvgAAAAJ&hl=en">Mattia Rossi</a>&ensp;·&ensp;
+  <a href="https://scholar.google.com/citations?user=M0boL5kAAAAJ&hl=en">Friedrich Fraundorfer</a>
 </p>
 
 <p>
-  <sup>1</sup>Graz University of Technology&emsp;·&emsp;<sup>2</sup>Sony Europe
-</p>
-
-<p>
-  👀
+  ECCV 2026 🇸🇪
 </p>
 
 <p>
@@ -39,18 +35,6 @@
 ## Overview
 
 **EPO** (Edge-based Pose Optimization) is a trackless method for refining camera poses and depth produced by 3D Foundation Models (3DFMs) such as VGGT. Rather than relying on hand-crafted/learned feature matching, EPO directly optimizes camera poses and depth maps using edges reprojection, improving reconstruction quality in a lightweight and generalizable manner.
-
-
-
-## Changelog
-
-| Version | Description |
-|---------|-------------|
-| **1.0.4** | `EPO.from_ff(...)` now mirrors the disk loaders exactly (image resampling, depth crop, intrinsics), so in-memory and disk init converge to the same result; the principal point is taken from the provided `K`; shared cameras per folder are supported via `single_camera_per_folder`.<br>Added [demo_epo.py](demo_epo.py) — end-to-end VGGT → EPO demo with optional `--vggt_output` bypass. |
-| **1.0.3** | Fused the Huber loss epilogue into the Triton kernel (bit-identical, faster); optional `fuse_reduction=True` fuses the loss reduction too (faster, fp-reordering only).<br>Per-step logging now syncs GPU→CPU once per iteration; `log_granular_time` now defaults to `False`.<br>Torch backend now masks behind-camera/non-finite points identically to Triton. |
-| **1.0.2** | Added `EPO.from_ff(...)` — initialize directly from a 3DFM's in-memory output (no COLMAP/`.h5` round-trip). |
-| **1.0.1** | Fixed a bug in the loss function — outliers are now handled more robustly, resulting in slightly higher scores.<br>Added Triton kernel for point reprojection (~1.5× faster); enable with `backend="triton"`.<br>Added mixed-precision (BF16) support for the pose-refinement MLP via `use_amp=True`.<br>Improved per-stage time logging; can be disabled with `log_granular_time=False`. |
-| **1.0.0** | Initial release. |
 
 
 
@@ -217,5 +201,5 @@ If you find this work useful, please consider citing:
 ---
 
 <div align="center">
-  <sub>Graz University of Technology · Sony Europe · 2026</sub>
+  <sub>Graz University of Technology · 2026</sub>
 </div>

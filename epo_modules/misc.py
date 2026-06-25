@@ -234,9 +234,9 @@ class MiscModule:
             print(f"  {'total steps':<{KW - 2}}{num_iters:>{VW}d}")
 
             if hasattr(self, "mre") and self.mre is not None:
-                # robustified (clamp + Huber) edge-DT residual, not raw pixels
+                # raw (un-clamped, un-Huber'd) edge-DT residual in pixels
                 print(
-                    f"  {'mean edge-DT residual':<{KW - 2}}"
+                    f"  {'mean reproj error (px)':<{KW - 2}}"
                     f"{float(np.mean(self.mre)):>{VW}.3f}"
                 )
 
