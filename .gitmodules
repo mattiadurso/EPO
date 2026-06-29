@@ -1,6 +1,6 @@
 [submodule "third_party/vggt"]
 	path = third_party/vggt
-	url = https://github.com/mattiadurso/vggt.git
+	url = https://github.com/facebookresearch/vggt.git
 [submodule "third_party/lightglue"]
 	path = third_party/lightglue
 	url = https://github.com/jytime/LightGlue.git

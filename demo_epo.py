@@ -34,7 +34,7 @@ for _pkg in ("vggt", "lightglue"):
         sys.path.insert(0, _p)
 
 from epo import EPO  # noqa: E402
-from third_party.vggt.vggt.wrapper import VGGTWrapper  # noqa: E402
+from wrapper.vggt_wrapper import VGGTWrapper  # noqa: E402
 
 
 def main():
@@ -90,9 +90,19 @@ def main():
         "of the in-memory feed-forward path.",
     )
     parser.add_argument("--cuda_id", type=int, default=0)
+    parser.add_argument(
+        "--vggt_weights",
+        type=str,
+        default="https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt",
+        help="Path to VGGT weights (.pt), or a URL (downloaded/cached via "
+        "torch.hub). Required by VGGTWrapper; override to use a local checkpoint.",
+    )
     args = parser.parse_args()
 
-    t_total_start = time.perf_counter()
+    t_wall_start = time.perf_counter()  # wall-clock incl. all I/O
+    vggt_fwd_time = 0.0  # VGGT model forward (set in the VGGT branch)
+    vggt_ff_time = 0.0  # building EPO feed-forward data (decode/resize/crop)
+    deferred_writes = []  # disk writes run AFTER the timed inference
 
     # Shared EPO settings for both the in-memory and disk init paths.
     epo_kwargs = dict(
@@ -112,18 +122,29 @@ def main():
         # disk round-trip). `_build_ff_data` mirrors EPO's disk loaders, so
         # this is equivalent to reloading the saved reconstruction.
         vggt_out = os.path.join(args.output_path, "sparse_vggt")
-        vggt = VGGTWrapper(cuda_id=args.cuda_id)
-        ff_data, _ = vggt.forward(
+        vggt = VGGTWrapper(args.vggt_weights, cuda_id=args.cuda_id)
+        # save=False: defer VGGT's disk writes until after the timed inference.
+        ff_data, vggt_recon, vggt_depths = vggt.forward(
             args.images_path,
             vggt_out,
             max_images=args.max_images,
             use_ba=False,
             save_depth=True,
+            save=False,
         )
+        vggt_fwd_time = vggt.last_timings.get("run_vggt", 0.0)
+        vggt_ff_time = vggt.last_timings.get("build_ff_data", 0.0)
         del vggt  # free GPU memory before EPO refinement
         gc.collect()
         torch.cuda.empty_cache()
         epo = EPO.from_ff(ff_data, **epo_kwargs)
+
+        def _write_vggt():
+            os.makedirs(vggt_out, exist_ok=True)
+            vggt_recon.write_text(vggt_out)
+            torch.save(vggt_depths, os.path.join(vggt_out, "depths.pth"))
+
+        deferred_writes.append(_write_vggt)
     else:
         # Bypass VGGT: load a previous run's reconstruction + depths from disk.
         vggt_out = args.vggt_output
@@ -135,11 +156,12 @@ def main():
             **epo_kwargs,
         )
 
-    # ── 2. EPO refinement ────────────────────────────────────
+    # ── 2. EPO refinement (timed) ────────────────────────────────────────
     print("\nRunning EPO refinement...")
     epo(early_stop=args.early_stop)
+    epo_opt_time = epo.timings.get("total_optimization", 0.0)
 
-    # ── 3. Export refined reconstruction ────────────────────────────────
+    # ── 3. Deferred I/O: write all COLMAP outputs AFTER the timed inference ─
     epo_out = os.path.join(args.output_path, "sparse_epo")
     epo.to_colmap(
         epo_out,
@@ -148,11 +170,22 @@ def main():
         save_points=True,
         final_dbscan_filtering=False,
     )
+    for _write in deferred_writes:
+        _write()
 
     epo.print_summary()
 
-    total = time.perf_counter() - t_total_start
-    print(f"\nEnd-to-end (VGGT + EPO) total time: {total:.2f} s")
+    # ── Timing report ─────────────────────────────────────────────────────
+    inference_total = vggt_fwd_time + vggt_ff_time + epo_opt_time
+    wall_total = time.perf_counter() - t_wall_start
+    print(
+        f"\nInference time   (VGGT fwd {vggt_fwd_time:.2f}s + ff-build "
+        f"{vggt_ff_time:.2f}s + EPO opt {epo_opt_time:.2f}s): {inference_total:.2f} s"
+    )
+    print(
+        f"Total wall-clock (incl. I/O — model load, image load, writes): "
+        f"{wall_total:.2f} s"
+    )
 
     # AUC evaluation if GT provided
     if args.gt_path is not None:
