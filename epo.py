@@ -160,7 +160,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             ``total_optimization`` and ``total`` are populated; every other
             timing key stays at 0.0 for backward compatibility with
             downstream consumers (``print_summary``, ``timings.txt``,
-            ``training_logs.json``, ``benchmark_plotting``).
+            ``training_logs.json``).
         min_points: Minimum reprojection-inlier count to keep a viewgraph pair.
         sampling_factor: Oversampling factor used when building the viewgraph.
         reprojection_error: Threshold (px) used to filter viewgraph pairs.

@@ -114,9 +114,9 @@ def _load_pose_dict_cached(abs_path):
     writing intermediate poses to the same folder every
     ``auc_saving_freq`` steps) invalidates the cache automatically.
 
-    For multi-call workflows like :func:`helpers.benchmark_plotting.read_results`
-    — which evaluate the same target reconstruction against many input
-    models — :func:`eval_colmap_model_all_scenes` pre-parses all unique
+    For multi-call workflows — e.g. evaluating the same target reconstruction
+    against many input models — :func:`eval_colmap_model_all_scenes` pre-parses
+    all unique
     paths in the parent process (populating this cache) and ships the
     resulting pose dicts to joblib workers via the closure, so workers
     never call ``pycolmap.Reconstruction`` themselves. Cached entries are
@@ -490,9 +490,9 @@ def eval_colmap_model_all_scenes(
     All unique reconstruction paths are parsed **once in the parent process**
     via :func:`_load_pose_dict_cached`, then the resulting pose dicts are
     shipped to joblib workers through the call closure. Workers never call
-    ``pycolmap.Reconstruction`` themselves. For multi-call flows like
-    :func:`helpers.benchmark_plotting.read_results` — which evaluate many
-    models against the same target — target paths are cache hits on the
+    ``pycolmap.Reconstruction`` themselves. For multi-call flows — e.g.
+    evaluating many models against the same target — target paths are cache
+    hits on the
     second model onwards, cutting per-dataset wall time roughly in half.
     """
     if thrs is None:

@@ -390,10 +390,9 @@ class ReconstructAndVizModule:
             torch.save(depths_out, os.path.join(output_path, "depths.pth"))
 
         # Keep `total` consistent whether or not `forward()` has been called
-        # (e.g. if print_summary is skipped).  benchmark_plotting.py reads
-        # the last line of timings.txt as `total: <s>`, and benchmark.ipynb
-        # reads training_logs.json["timings"]["total"], so both files must
-        # have this key.
+        # (e.g. if print_summary is skipped).  Downstream tooling reads the
+        # last line of timings.txt as `total: <s>` and
+        # training_logs.json["timings"]["total"], so this key must exist.
         self.timings["total"] = self.timings.get(
             "total_loading", 0.0
         ) + self.timings.get("total_optimization", 0.0)
@@ -409,7 +408,7 @@ class ReconstructAndVizModule:
                     f.write(f"{key}: {value:.4f} s\n")
                 except (TypeError, ValueError):
                     f.write(f"{key}: {value}\n")
-            # ── totals (must end with `total:` for benchmark_plotting) ─
+            # ── totals (timings.txt must end with `total:` for parsing) ─
             f.write(f"total_loading: {self.timings.get('total_loading', 0.0):.4f} s\n")
             f.write(
                 f"total_optimization: {self.timings.get('total_optimization', 0.0):.4f} s\n"
