@@ -484,8 +484,8 @@ class VGGTWrapper:
             ]
 
             intr = torch.from_numpy(intrinsic[i].copy()).float()
-            intr[0, 2] = width * scale / 2.0
-            intr[1, 2] = height * scale / 2.0
+            intr[0, 2] = float(width * scale / 2.0)
+            intr[1, 2] = float(height * scale / 2.0)
 
             return base, {
                 "image": img_t,
