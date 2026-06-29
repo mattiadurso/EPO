@@ -82,7 +82,7 @@ pip install git+https://github.com/mattiadurso/mylib.git
 
 ### Submodules
 
-[third_party/vggt](third_party/vggt) (the **unmodified** [facebookresearch/vggt](https://github.com/facebookresearch/vggt)) is a git submodule. EPO-ready reconstructions are produced by the local wrapper [wrapper/vggt_wrapper.py](wrapper/vggt_wrapper.py) — a thin driver over the stock vggt package, plus its pycolmap-4 conversion helper [wrapper/np_to_colmap.py](wrapper/np_to_colmap.py) — so no VGGT fork is needed. It is only needed to run VGGT itself (e.g., [demo_epo.py](demo_epo.py)); EPO refines any reconstruction in the expected layout without it. [third_party/lightglue](third_party/lightglue) is a second submodule needed **only** for VGGT's optional Bundle-Adjustment path (`use_ba=True`); the default feed-forward path — including [demo_epo.py](demo_epo.py) — never imports it. If you cloned without `--recursive`:
+[third_party/vggt](third_party/vggt) is a git submodule. EPO-ready reconstructions are produced by the local wrapper [wrapper/vggt_wrapper.py](wrapper/vggt_wrapper.py) — a thin driver over the stock vggt package, plus its pycolmap-4 conversion helper [wrapper/np_to_colmap.py](wrapper/np_to_colmap.py). It is only needed to run VGGT itself (e.g., [demo_epo.py](demo_epo.py)); EPO refines any reconstruction in the expected layout without it. [third_party/lightglue](third_party/lightglue) is a second submodule needed **only** for VGGT's optional Bundle-Adjustment path (`use_ba=True`); the default feed-forward path — including [demo_epo.py](demo_epo.py) — never imports it. If you cloned without `--recursive`:
 
 ```bash
 git submodule update --init --recursive
