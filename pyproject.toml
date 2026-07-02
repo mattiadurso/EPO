@@ -90,6 +90,11 @@ ignore = [
 "modules/__init__.py" = ["F401"]           # re-exports
 "epo_modules/__init__.py" = ["F401"]       # re-exports
 
+[tool.ruff.lint.isort]
+# ``rerun`` is a third-party dep; pin it so a local ``rerun/`` output dir
+# doesn't get auto-detected as first-party (which diverges from CI).
+known-third-party = ["rerun"]
+
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 

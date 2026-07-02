@@ -17,11 +17,11 @@ import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 import numpy as np
 import pycolmap
+import rerun as rr
 import torch
 from matplotlib.colors import Normalize
 from tqdm import tqdm
 
-import rerun as rr
 from helpers.reconstruction import build_reconstruction
 from helpers.reprojection import project_world_to_2D
 from losses.dt_loss import sample_distance_field
