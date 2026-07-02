@@ -14,7 +14,7 @@
 </p>
 
 <p>
-  <a href="#"><img src="https://img.shields.io/badge/arXiv-w%2F%20SM-blue?style=flat-square" alt="arXiv w/ SM"></a>
+  <a href="https://arxiv.org/abs/2607.00579"><img src="https://img.shields.io/badge/arXiv-w%2F%20SM-blue?style=flat-square" alt="arXiv w/ SM"></a>
   &nbsp;
   <a href="https://mattiadurso.github.io/epo/"><img src="https://img.shields.io/badge/Project-Page-orange?style=flat-square" alt="Project Page"></a>
   &nbsp;
