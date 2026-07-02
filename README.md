@@ -98,7 +98,7 @@ pip install huggingface_hub einops safetensors
 
 ### Step 1 — Prepare Input Images
 
-> 📦 A few demo scenes can be downloaded [here](https://cloud.tugraz.at/index.php/s/dNfD96WNJ64kZCS). These are already pre-processed with VGGt, thus sep 1 and 2 can be skipped.
+> 📦 A few demo scenes can be downloaded [here](https://cloud.tugraz.at/index.php/s/dNfD96WNJ64kZCS). These are already pre-processed with VGGT, thus steps 1 and 2 can be skipped.
 
 Organize your images using the following structure. Images can be grouped by camera if multiple cameras are used:
 
