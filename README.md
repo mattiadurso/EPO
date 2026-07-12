@@ -104,6 +104,9 @@ To actually **run** a model (e.g. via [demo_epo.py](demo_epo.py)), also install 
 ```bash
 pip install huggingface_hub einops safetensors
 ```
+### 3DFM Results
+
+We report models results averaged by dataset at [mattiadurso.com/epo](https://mattiadurso.com/epo).
 
 ## Usage
 
