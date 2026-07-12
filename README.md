@@ -82,13 +82,24 @@ pip install git+https://github.com/mattiadurso/mylib.git
 
 ### Submodules
 
-[third_party/vggt](third_party/vggt) is a git submodule. EPO-ready reconstructions are produced by the local wrapper [wrapper/vggt_wrapper.py](wrapper/vggt_wrapper.py) — a thin driver over the stock vggt package, plus its pycolmap-4 conversion helper [wrapper/np_to_colmap.py](wrapper/np_to_colmap.py). It is only needed to run VGGT itself (e.g., [demo_epo.py](demo_epo.py)); EPO refines any reconstruction in the expected layout without it. [third_party/lightglue](third_party/lightglue) is a second submodule needed **only** for VGGT's optional Bundle-Adjustment path (`use_ba=True`); the default feed-forward path — including [demo_epo.py](demo_epo.py) — never imports it. If you cloned without `--recursive`:
+[wrapper/](wrapper) provides swappable drivers for several 3D foundation models, each a thin driver over a pristine git submodule under [third_party/](third_party) plus the shared pycolmap-4 conversion helper [wrapper/np_to_colmap.py](wrapper/np_to_colmap.py). Select one via `--model` on [demo_epo.py](demo_epo.py) (default `vggt`); the full list lives in the `WRAPPERS` registry in [wrapper/\_\_init\_\_.py](wrapper/__init__.py):
+
+| `--model`     | Submodule                                                     | Wrapper                                                           |
+|---------------|----------------------------------------------------------------|--------------------------------------------------------------------|
+| `vggt`        | [third_party/vggt](third_party/vggt)                           | [wrapper/vggt_wrapper.py](wrapper/vggt_wrapper.py)                 |
+| `vggt_omega`  | [third_party/vggt-omega](third_party/vggt-omega)                | [wrapper/vggt_omega_wrapper.py](wrapper/vggt_omega_wrapper.py)     |
+| `dvlt`        | [third_party/dvlt](third_party/dvlt)                            | [wrapper/dvlt_wrapper.py](wrapper/dvlt_wrapper.py)                 |
+| `da3`         | [third_party/depth_anything_3](third_party/depth_anything_3)    | [wrapper/da3_wrapper.py](wrapper/da3_wrapper.py)                   |
+| `mapanything` | [third_party/mapanything](third_party/mapanything)              | [wrapper/mapanything_wrapper.py](wrapper/mapanything_wrapper.py)   |
+| `pi3x`        | [third_party/pi3](third_party/pi3)                              | [wrapper/pi3x_wrapper.py](wrapper/pi3x_wrapper.py)                 |
+
+Only `vggt`'s submodule is needed to run EPO's own demo/reconstructions; EPO refines any reconstruction in the expected layout without any of them. [third_party/lightglue](third_party/lightglue) is a further submodule needed **only** for VGGT's optional Bundle-Adjustment path (`use_ba=True`); the default feed-forward path — including [demo_epo.py](demo_epo.py) — never imports it. If you cloned without `--recursive`:
 
 ```bash
 git submodule update --init --recursive
 ```
 
-To actually **run** VGGT (e.g. via [demo_epo.py](demo_epo.py)), also install its model dependencies. Install only these extras — do **not** run `pip install -r third_party/vggt/requirements.txt`, as its pinned `torch`/`numpy` versions would downgrade and break the EPO environment:
+To actually **run** a model (e.g. via [demo_epo.py](demo_epo.py)), also install its dependencies — see the top of each wrapper module for the exact extras and any model-specific gotchas (e.g. `vggt_omega`'s checkpoint is gated on Hugging Face: request access, then pass a local path via `--model_path`). For VGGT itself, install only these extras — do **not** run `pip install -r third_party/vggt/requirements.txt`, as its pinned `torch`/`numpy` versions would downgrade and break the EPO environment:
 
 ```bash
 pip install huggingface_hub einops safetensors
@@ -145,18 +156,19 @@ epo(early_stop="pose", gt_path="<path_to_gt>")  # gt_path optional — enables e
 epo.to_colmap("out/sparse", save_points=True)
 ```
 
-### End-to-end demo (VGGT → EPO)
+### End-to-end demo (3DFM → EPO)
 
-[demo_epo.py](demo_epo.py) runs steps 2–3 for you: VGGT on a folder of images, then EPO directly on its in-memory output (`EPO.from_ff`), writing `sparse_vggt` and `sparse_epo` under `--output_path`:
+[demo_epo.py](demo_epo.py) runs steps 2–3 for you: the selected `--model` (`vggt` by default; see the [Submodules](#submodules) table for the full list) on a folder of images, then EPO directly on its in-memory output (`EPO.from_ff`), writing `sparse_<model>` and `sparse_<model>_epo` under `--output_path`:
 
 ```bash
 python demo_epo.py \
     --images_path bicycle/images \
     --output_path out/demo \
+    --model vggt \               # or vggt_omega, dvlt, da3, mapanything, pi3x
     --gt_path <path_to_gt>      # Optional — enables quantitative evaluation at runtime
 ```
 
-Pass `--vggt_output <dir>` to reuse a previous run's reconstruction + `depths.pth` instead of re-running VGGT; both modes produce the same refinement. Pass `--vggt_weights <path.pt>` to load VGGT from a local checkpoint instead of the default Hugging Face download.
+Pass `--model_output <dir>` to reuse a previous run's reconstruction + `depths.pth` instead of re-running the model; both modes produce the same refinement. Pass `--model_path <path/or/repo-id>` to load the model from a local checkpoint instead of its default Hugging Face download.
 
 ### Notes
 
@@ -192,7 +204,7 @@ epo()
 epo.to_colmap("out/sparse", save_points=True)
 ```
 
-All other `EPO(...)` kwargs are forwarded. Images and depths must already be at `images_size` (no internal resize). With `single_camera_per_folder=True` (default) all images under the same `"cam_id/"` folder share one jointly-optimized camera; otherwise each image gets its own. The local wrapper [`wrapper/vggt_wrapper.py`](wrapper/vggt_wrapper.py)'s `VGGTWrapper.forward()` returns an EPO-ready `ff_data` built this way (see [demo_epo.py](demo_epo.py)).
+All other `EPO(...)` kwargs are forwarded. Images and depths must already be at `images_size` (no internal resize). With `single_camera_per_folder=True` (default) all images under the same `"cam_id/"` folder share one jointly-optimized camera; otherwise each image gets its own. Every wrapper in [wrapper/](wrapper) (see the [Submodules](#submodules) table) returns an EPO-ready `ff_data` built this way from its `forward()` method (see [demo_epo.py](demo_epo.py)).
 
 ## Citation
 
