@@ -1,0 +1,12 @@
+{
+  "mipnerf360_local": {
+    "base_path": "/path/to/datasets/mipnerf360",
+    "images_path": "images_150",
+    "output_path": "/path/to/batchsfm/benchmarks"
+  },
+  "eth3d_local": {
+    "base_path": "/path/to/datasets/eth3d",
+    "images_path": "images",
+    "output_path": "/path/to/batchsfm/benchmarks"
+  }
+}

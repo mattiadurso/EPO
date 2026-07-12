@@ -1,9 +1,10 @@
-"""End-to-end demo: VGGT reconstruction → EPO refinement.
+"""End-to-end demo: 3D foundation model reconstruction → EPO refinement.
 
-Runs the VGGT wrapper on a folder of images, then feeds the resulting
-COLMAP reconstruction + dense depths to EPO for pose/depth refinement.
-Writes the refined reconstruction to ``<output_path>/sparse_epo`` and
-prints EPO's own timing summary plus the total end-to-end runtime.
+Runs one of the wrapper/ models (VGGT by default) on a folder of images,
+then feeds the resulting COLMAP reconstruction + dense depths to EPO for
+pose/depth refinement. Writes the refined reconstruction to
+``<output_path>/sparse_epo`` and prints EPO's own timing summary plus the
+total end-to-end runtime.
 
 Example:
 python demo_epo.py \
@@ -11,34 +12,27 @@ python demo_epo.py \
     --output_path optimized_reconstruction/demo \
     --gt_path ~/Desktop/datasets/mipnerf360/kitchen/sparse_150
 
-Pass ``--vggt_output <dir>`` to skip VGGT and reuse a previous run's
-reconstruction + depths.pth (EPO's disk path) instead of running VGGT.
-The feed-forward init mirrors the disk loaders, so both modes produce
-the same refinement.
+Pass ``--model`` to pick a different wrapper/ 3D foundation model (see
+``wrapper/__init__.py``'s ``WRAPPERS`` registry for the full list).
+Pass ``--model_output <dir>`` to skip the model and reuse a previous run's
+reconstruction + depths.pth (EPO's disk path) instead of running it. The
+feed-forward init mirrors the disk loaders, so both modes produce the same
+refinement.
 """
 
 import argparse
 import gc
 import os
-import sys
 import time
 
 import torch
 
-# Make the vendored VGGT + LightGlue submodules importable.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_THIRD_PARTY = os.path.join(_HERE, "third_party")
-for _pkg in ("vggt", "lightglue"):
-    _p = os.path.join(_THIRD_PARTY, _pkg)
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-from epo import EPO  # noqa: E402
-from wrapper.vggt_wrapper import VGGTWrapper  # noqa: E402
+from epo import EPO
+from wrapper import WRAPPERS, load_wrapper_class
 
 
 def main():
-    """Run VGGT (or load a previous run), refine with EPO, report AUC."""
+    """Run the selected model (or load a previous run), refine with EPO, report AUC."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--images_path",
@@ -50,14 +44,21 @@ def main():
         "--output_path",
         type=str,
         required=True,
-        help="Output dir; VGGT writes <output_path>/sparse, "
-        "EPO writes <output_path>/sparse_epo.",
+        help="Output dir; --model writes <output_path>/sparse_<model>, "
+        "EPO writes <output_path>/sparse_<model>_epo.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="vggt",
+        choices=sorted(WRAPPERS),
+        help="Which wrapper/ 3D foundation model to run.",
     )
     parser.add_argument(
         "--max_images",
         type=int,
         default=150,
-        help="Cap on images fed to VGGT (random sample if exceeded). Max on my 4090",
+        help="Cap on images fed to the model (random sample if exceeded). Max on my 4090",
     )
     parser.add_argument(
         "--edges", type=str, default="canny", help="Edge detector for EPO."
@@ -82,26 +83,27 @@ def main():
         help="Optional COLMAP GT reconstruction for final AUC eval.",
     )
     parser.add_argument(
-        "--vggt_output",
+        "--model_output",
         type=str,
         default=None,
-        help="Skip VGGT and load a previous run from this dir (expects the "
-        "COLMAP reconstruction + depths.pth). Uses EPO's disk path instead "
-        "of the in-memory feed-forward path.",
+        help="Skip --model and load a previous run from this dir (expects "
+        "the COLMAP reconstruction + depths.pth). Uses EPO's disk path "
+        "instead of the in-memory feed-forward path.",
     )
     parser.add_argument("--cuda_id", type=int, default=0)
     parser.add_argument(
-        "--vggt_weights",
+        "--model_path",
         type=str,
-        default="https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt",
-        help="Path to VGGT weights (.pt), or a URL (downloaded/cached via "
-        "torch.hub). Required by VGGTWrapper; override to use a local checkpoint.",
+        default=None,
+        help="Weights path/URL for --model (downloaded/cached via torch.hub, "
+        "or a HF repo id, depending on the wrapper). Defaults to the "
+        "WRAPPERS registry entry for --model.",
     )
     args = parser.parse_args()
 
     t_wall_start = time.perf_counter()  # wall-clock incl. all I/O
-    vggt_fwd_time = 0.0  # VGGT model forward (set in the VGGT branch)
-    vggt_ff_time = 0.0  # building EPO feed-forward data (decode/resize/crop)
+    model_fwd_time = 0.0  # model forward (set in the live-run branch)
+    model_ff_time = 0.0  # building EPO feed-forward data (decode/resize/crop)
     deferred_writes = []  # disk writes run AFTER the timed inference
 
     # Shared EPO settings for both the in-memory and disk init paths.
@@ -117,42 +119,49 @@ def main():
     )
 
     # ── 1. Reconstruction → EPO init ─────────────────────────────────────
-    if args.vggt_output is None:
-        # Run VGGT, then init EPO directly from the feed-forward output (no
-        # disk round-trip). `_build_ff_data` mirrors EPO's disk loaders, so
-        # this is equivalent to reloading the saved reconstruction.
-        vggt_out = os.path.join(args.output_path, "sparse_vggt")
-        vggt = VGGTWrapper(args.vggt_weights, cuda_id=args.cuda_id)
-        # save=False: defer VGGT's disk writes until after the timed inference.
-        ff_data, vggt_recon, vggt_depths = vggt.forward(
+    if args.model_output is None:
+        # Run the model, then init EPO directly from the feed-forward output
+        # (no disk round-trip). `_build_ff_data` mirrors EPO's disk loaders,
+        # so this is equivalent to reloading the saved reconstruction.
+        model_out = os.path.join(args.output_path, f"sparse_{args.model}")
+        wrapper_cls = load_wrapper_class(args.model)
+        model_path = args.model_path or WRAPPERS[args.model][2]
+        model = wrapper_cls(model_path, cuda_id=args.cuda_id)
+        # save=False: defer the model's disk writes until after the timed inference.
+        ff_data, model_recon, model_depths = model.forward(
             args.images_path,
-            vggt_out,
+            model_out,
             max_images=args.max_images,
             use_ba=False,
             save_depth=True,
             save=False,
         )
-        vggt_fwd_time = vggt.last_timings.get("run_vggt", 0.0)
-        vggt_ff_time = vggt.last_timings.get("build_ff_data", 0.0)
-        del vggt  # free GPU memory before EPO refinement
+        # last_timings has exactly one "run_<model>" key for the forward pass.
+        model_fwd_time = next(
+            (v for k, v in model.last_timings.items() if k.startswith("run_")), 0.0
+        )
+        model_ff_time = model.last_timings.get("build_ff_data", 0.0)
+        del model  # free GPU memory before EPO refinement
         gc.collect()
         torch.cuda.empty_cache()
         epo = EPO.from_ff(ff_data, **epo_kwargs)
 
-        def _write_vggt():
-            os.makedirs(vggt_out, exist_ok=True)
-            vggt_recon.write_text(vggt_out)
-            torch.save(vggt_depths, os.path.join(vggt_out, "depths.pth"))
+        def _write_model():
+            os.makedirs(model_out, exist_ok=True)
+            model_recon.write_text(model_out)
+            torch.save(model_depths, os.path.join(model_out, "depths.pth"))
 
-        deferred_writes.append(_write_vggt)
+        deferred_writes.append(_write_model)
     else:
-        # Bypass VGGT: load a previous run's reconstruction + depths from disk.
-        vggt_out = args.vggt_output
-        print(f"Bypassing VGGT; loading reconstruction + depths from {vggt_out}")
+        # Bypass the model: load a previous run's reconstruction + depths from disk.
+        model_out = args.model_output
+        print(
+            f"Bypassing {args.model}; loading reconstruction + depths from {model_out}"
+        )
         epo = EPO(
-            reconstruction_path=vggt_out,
+            reconstruction_path=model_out,
             images_path=args.images_path,
-            depths_path=os.path.join(vggt_out, "depths.pth"),
+            depths_path=os.path.join(model_out, "depths.pth"),
             **epo_kwargs,
         )
 
@@ -162,7 +171,7 @@ def main():
     epo_opt_time = epo.timings.get("total_optimization", 0.0)
 
     # ── 3. Deferred I/O: write all COLMAP outputs AFTER the timed inference ─
-    epo_out = os.path.join(args.output_path, "sparse_epo")
+    epo_out = os.path.join(args.output_path, f"sparse_{args.model}_epo")
     epo.to_colmap(
         epo_out,
         verbose=False,
@@ -176,11 +185,11 @@ def main():
     epo.print_summary()
 
     # ── Timing report ─────────────────────────────────────────────────────
-    inference_total = vggt_fwd_time + vggt_ff_time + epo_opt_time
+    inference_total = model_fwd_time + model_ff_time + epo_opt_time
     wall_total = time.perf_counter() - t_wall_start
     print(
-        f"\nInference time   (VGGT fwd {vggt_fwd_time:.2f}s + ff-build "
-        f"{vggt_ff_time:.2f}s + EPO opt {epo_opt_time:.2f}s): {inference_total:.2f} s"
+        f"\nInference time   ({args.model} fwd {model_fwd_time:.2f}s + ff-build "
+        f"{model_ff_time:.2f}s + EPO opt {epo_opt_time:.2f}s): {inference_total:.2f} s"
     )
     print(
         f"Total wall-clock (incl. I/O — model load, image load, writes): "
@@ -195,14 +204,19 @@ def main():
         print("AUC@", thresholds)
 
         AUC_score_max, _, _ = eval_colmap_model(
-            vggt_out, args.gt_path, return_df=True, thrs=thresholds
+            model_out, args.gt_path, return_df=True, thrs=thresholds
         )
-        print(f"{'VGGT AUC:':<16}", [float(round(_, 2)) for _ in AUC_score_max])
+        print(
+            f"{args.model + ' AUC:':<16}", [float(round(_, 2)) for _ in AUC_score_max]
+        )
 
         AUC_score_max, _, _ = eval_colmap_model(
             epo_out, args.gt_path, return_df=True, thrs=thresholds
         )
-        print(f"{'VGGT + EPO AUC:':<16}", [float(round(_, 2)) for _ in AUC_score_max])
+        print(
+            f"{args.model + ' + EPO AUC:':<16}",
+            [float(round(_, 2)) for _ in AUC_score_max],
+        )
 
 
 if __name__ == "__main__":

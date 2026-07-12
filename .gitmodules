@@ -4,3 +4,18 @@
 [submodule "third_party/lightglue"]
 	path = third_party/lightglue
 	url = https://github.com/jytime/LightGlue.git
+[submodule "third_party/vggt-omega"]
+	path = third_party/vggt-omega
+	url = https://github.com/facebookresearch/vggt-omega.git
+[submodule "third_party/dvlt"]
+	path = third_party/dvlt
+	url = https://github.com/nv-tlabs/dvlt.git
+[submodule "third_party/mapanything"]
+	path = third_party/mapanything
+	url = https://github.com/facebookresearch/map-anything.git
+[submodule "third_party/pi3"]
+	path = third_party/pi3
+	url = https://github.com/yyfz/Pi3.git
+[submodule "third_party/depth_anything_3"]
+	path = third_party/depth_anything_3
+	url = https://github.com/ByteDance-Seed/Depth-Anything-3.git
