@@ -215,7 +215,7 @@ If you find this work useful, please consider citing:
 
 ```bibtex
 @inproceedings{durso2026epo,
-  title     = {Boosting 3D Foundation Models with Featureless Pose Optimization},
+  title     = {Boosting 3D Foundation Models with Edge-Based Pose Optimization},
   author    = {Mattia D'Urso and Christian Sormann and Mattia Rossi and Friedrich Fraundorfer},
   booktitle = {European Conference on Computer Vision (ECCV)},
   year      = {2026},
