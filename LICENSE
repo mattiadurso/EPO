@@ -1,0 +1,34 @@
+SOFTWARE LICENSE AGREEMENT
+
+IVC Software - 2023, all rights reserved, hereinafter "the Software".
+
+This software has been developed by researchers of IVC (Institute of Visual Computing).
+
+Institute of Visual Computing (IVC), Inffeldgasse 16/II, 8010 Graz, Austria
+
+IVC holds all the ownership rights on the Software.
+
+The Software is still being currently developed. It is the IVC's aim for the Software to be used by the scientific community so as to test it and, evaluate it so that IVC may improve it.
+
+For these reasons IVC has decided to distribute the Software.
+
+The academic user explicitly acknowledges having received from IVC all information allowing him to appreciate the adequacy between of the Software and his needs and to undertake all necessary precautions for his execution and use.
+
+The Software is provided only as a source.
+
+In case of using the Software for a publication or other results obtained through the use of the Software, user should cite the Software as follows:
+
+@inproceedings{durso2026epo,
+  title     = {Boosting 3D Foundation Models with Edge-Based Pose Optimization},
+  author    = {Mattia D'Urso and Christian Sormann and Mattia Rossi and Friedrich Fraundorfer},
+  booktitle = {European Conference on Computer Vision (ECCV)},
+  year      = {2026},
+}
+
+Every user of the Software could communicate to the developers [mattia.durso@tugraz.at, friederich.fraundorfer@tugraz.at] his or her remarks as to the use of the Software.
+
+EVERY USER CAN USE, EXPLOIT OR COMMERCIALLY DISTRIBUTE THE SOFTWARE AFTER INFORMATION TO IVC (friederich.fraundorfer@tugraz.at). IN ANY CASE OF USE, THE SOFTWARE HAS TO BE CITED AS STATED ABOVE.
+
+THIS SOFTWARE IS PROVIDED "AS IS" WITHOUT ANY WARRANTIES OF ANY NATURE AND ANY EXPRESS OR IMPLIED WARRANTIES, WITH REGARDS TO COMMERCIAL USE, PROFESSIONAL USE, LEGAL OR NOT, OR OTHER, OR COMMERCIALIZATION OR ADAPTATION. NO BACKGROUND OF IVC IS TRANSFERRED OR LICENCED UNDER THIS AGREEMENT.
+
+UNLESS EXPLICITLY PROVIDED BY LAW, IN NO EVENT, SHALL IVC OR THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES, LOSS OF USE, DATA, OR PROFITS OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
