@@ -109,6 +109,12 @@ pip install git+https://github.com/mattiadurso/mylib.git
 | `mapanything` | [third_party/mapanything](third_party/mapanything)              | [wrapper/mapanything_wrapper.py](wrapper/mapanything_wrapper.py)   |
 | `pi3x`        | [third_party/pi3](third_party/pi3)                              | [wrapper/pi3x_wrapper.py](wrapper/pi3x_wrapper.py)                 |
 
+Each wrapper is also runnable on its own for a quick smoke test — handy to check a single model end-to-end without going through [demo_epo.py](demo_epo.py) or a dataset config. It writes a COLMAP model + `depths.pth` to `--output_path` using the model's registered weights (override with `--model_path`); for batch runs across benchmark datasets use [wrapper/run_for_dataset.py](wrapper/run_for_dataset.py) instead:
+
+```bash
+python wrapper/vggt_wrapper.py --images_path scene/images/1 --output_path out/sparse
+```
+
 Only `vggt`'s submodule is needed to run EPO's own demo/reconstructions; EPO refines any reconstruction in the expected layout without any of them. [third_party/lightglue](third_party/lightglue) is a further submodule needed **only** for VGGT's optional Bundle-Adjustment path (`use_ba=True`); the default feed-forward path — including [demo_epo.py](demo_epo.py) — never imports it. If you cloned without `--recursive`:
 
 [wrapper/any2full_wrapper.py](wrapper/any2full_wrapper.py) (over [third_party/Any2Full](third_party/Any2Full)) is a different kind of driver and is therefore **not** in the `WRAPPERS` registry: it takes an existing COLMAP reconstruction whose depths are sparse — EPO's own export, whose `depths.pth` only carries depth at the sampled edge pixels — and completes them into dense maps, passing the poses through untouched. See [Densifying EPO's depths](#densifying-epos-depths).

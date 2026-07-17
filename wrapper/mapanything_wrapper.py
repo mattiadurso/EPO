@@ -41,32 +41,19 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import gc  # noqa: E402
-import glob  # noqa: E402
-import random  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+from base_wrapper import BaseWrapper  # noqa: E402
 from mapanything.models import MapAnything  # noqa: E402
 from mapanything.utils.image import load_images  # noqa: E402
-from np_to_colmap import batch_np_matrix_to_pycolmap_wo_track  # noqa: E402
 from PIL import Image  # noqa: E402
 from PIL.ImageOps import exif_transpose  # noqa: E402
 
 
-def _randomly_limit_trues(mask: np.ndarray, max_trues: int) -> np.ndarray:
-    """Keep at most ``max_trues`` True entries of ``mask``, chosen uniformly."""
-    true_idx = np.flatnonzero(mask)
-    if true_idx.size <= max_trues:
-        return mask
-    keep = np.random.choice(true_idx, size=max_trues, replace=False)
-    limited = np.zeros(mask.size, dtype=bool)
-    limited[keep] = True
-    return limited.reshape(mask.shape)
-
-
-class MapAnythingWrapper:
+class MapAnythingWrapper(BaseWrapper):
     """Wrapper class for MapAnything to perform 3D reconstruction."""
 
     def __init__(
@@ -98,15 +85,6 @@ class MapAnythingWrapper:
 
         print(f"MapAnythingWrapper initialized on {self.device}")
 
-    def _set_seed(self, seed: int):
-        """Set random seeds for reproducibility."""
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-
     def _load_model(self, model_path: str) -> MapAnything:
         """Load MapAnything from a Hugging Face repo id."""
         model = MapAnything.from_pretrained(model_path)
@@ -114,54 +92,6 @@ class MapAnythingWrapper:
         model.eval()
         print(f"MapAnything model loaded from {model_path}")
         return model
-
-    def _find_images(self, images_path: str) -> list[str]:
-        """Find all images in the given path, including subdirectories.
-
-        Args:
-            images_path: Path to directory containing images.
-
-        Returns:
-            List of image file paths.
-        """
-        valid_extensions = ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG"]
-        image_paths = []
-
-        for ext in valid_extensions:
-            # Search in root and one level deep
-            image_paths.extend(glob.glob(os.path.join(images_path, f"*.{ext}")))
-            image_paths.extend(glob.glob(os.path.join(images_path, "*", f"*.{ext}")))
-
-        # Remove duplicates and sort
-        image_paths = sorted(list(set(image_paths)))
-
-        if len(image_paths) == 0:
-            raise ValueError(
-                f"No images found in {images_path}. Path {images_path} is invalid or empty."
-            )
-
-        print(f"Found {len(image_paths)} images in {images_path}")
-        return image_paths
-
-    def _sample_images(
-        self, image_paths: list[str], max_images: int | None = None
-    ) -> list[str]:
-        """Randomly sample images if needed.
-
-        Args:
-            image_paths: List of all image paths.
-            max_images: Maximum number of images to use. None means use all.
-
-        Returns:
-            Sampled list of image paths.
-        """
-        max_images = max_images if max_images > 0 else 100_000
-        if max_images is not None and len(image_paths) > max_images:
-            sampled_paths = random.sample(image_paths, max_images)
-            sampled_paths = sorted(sampled_paths)  # Keep sorted order
-            print(f"Randomly sampled {max_images} images from {len(image_paths)}")
-            return sampled_paths
-        return image_paths
 
     @staticmethod
     def _crop_geometry(
@@ -233,6 +163,26 @@ class MapAnythingWrapper:
             "processed_images": np.stack(images),
         }
 
+    def _rescale_camera_params(
+        self,
+        params: np.ndarray,
+        orig_wh: tuple[int, int],
+        proc_hw: tuple[int, int],
+    ) -> np.ndarray:
+        """Per-axis rescale that also undoes MapAnything's centered crop.
+
+        The principal point is first shifted into the uncropped resized frame,
+        then everything is scaled by the per-axis resized→original ratios.
+        """
+        orig_w, orig_h = orig_wh
+        proc_h, proc_w = proc_hw
+        resized_w, resized_h, left, top = self._crop_geometry(
+            orig_w, orig_h, proc_w, proc_h
+        )
+        return self._rescale_camera_params_per_axis(
+            params, orig_wh, (resized_h, resized_w), crop_offset=(left, top)
+        )
+
     def _pad_to_uncropped(
         self,
         preds: dict,
@@ -275,174 +225,52 @@ class MapAnythingWrapper:
             intrinsics_unc,
         )
 
-    def _reconstruct_without_ba(
-        self,
-        preds: dict,
-        conf_thres_percentile: float,
-        max_points_for_colmap: int,
-    ):
-        """Build a track-less pycolmap reconstruction from MapAnything outputs."""
+    def _conf_mask(self, preds: dict, conf_thres: float) -> np.ndarray:
+        """Depth validity + the model's non-ambiguous mask + a confidence percentile."""
         depth_map = preds["depth_map"]
-        height, width = depth_map.shape[-2:]
-        image_size = np.array([width, height])
+        conf_thresh = np.percentile(preds["depth_conf"], conf_thres)
+        mask = np.isfinite(depth_map) & (depth_map > 0)
+        mask &= preds["valid_mask"]
+        return mask & (preds["depth_conf"] >= conf_thresh)
 
-        conf_thresh = np.percentile(preds["depth_conf"], conf_thres_percentile)
-        conf_mask = np.isfinite(depth_map) & (depth_map > 0)
-        conf_mask &= preds["valid_mask"]
-        conf_mask &= preds["depth_conf"] >= conf_thresh
-        conf_mask = _randomly_limit_trues(conf_mask, max_points_for_colmap)
-
-        points_3d, points_xyf = [], []
-        for i in range(len(depth_map)):
-            v, u = np.nonzero(conf_mask[i])
-            if v.size == 0:
-                continue
-            points_3d.append(preds["points"][i, v, u])
-            points_xyf.append(
-                np.stack([u, v, np.full_like(u, i)], axis=-1).astype(np.float64)
-            )
-        points_3d = np.concatenate(points_3d, axis=0)
-        points_xyf = np.concatenate(points_xyf, axis=0)
-        points_rgb = preds["processed_images"][conf_mask]
-
-        print("Converting to COLMAP format")
-        reconstruction = batch_np_matrix_to_pycolmap_wo_track(
-            points_3d,
-            points_xyf,
-            points_rgb,
-            preds["extrinsic"],
-            preds["intrinsic"],
-            image_size,
-            shared_camera=False,
-            camera_type="PINHOLE",
-        )
-
-        return reconstruction, (height, width)
-
-    def _rescale_reconstruction(
-        self,
-        reconstruction,
-        base_image_paths: list[str],
-        original_sizes: list[tuple[int, int]],
-        proc_hw: tuple[int, int],
-    ):
-        """Rescale cameras to original resolutions and rename images.
-
-        Undoes the cover-resize + center crop: the principal point is first
-        shifted into the uncropped resized frame, then everything is scaled
-        by the per-axis resized→original ratios. Points2D stay in
-        processed-pixel coordinates, mirroring ``VGGTWrapper``'s non-BA
-        behavior.
-        """
-        proc_h, proc_w = proc_hw
-        for pyimageid in reconstruction.images:
-            pyimage = reconstruction.images[pyimageid]
-            pycamera = reconstruction.cameras[pyimage.camera_id]
-            pyimage.name = base_image_paths[pyimageid - 1]
-
-            orig_w, orig_h = original_sizes[pyimageid - 1]
-            resized_w, resized_h, left, top = self._crop_geometry(
-                orig_w, orig_h, proc_w, proc_h
-            )
-            scale_x = orig_w / resized_w
-            scale_y = orig_h / resized_h
-
-            fx, fy, cx, cy = pycamera.params  # PINHOLE, per-image camera
-            pycamera.params = np.array(
-                [
-                    fx * scale_x,
-                    fy * scale_y,
-                    (cx + left) * scale_x,
-                    (cy + top) * scale_y,
-                ]
-            )
-            pycamera.width = orig_w
-            pycamera.height = orig_h
-
-        return reconstruction
-
-    def _build_ff_data(
+    def _ff_entries(
         self,
         preds: dict,
-        padded: dict,
-        intrinsics_unc: list[np.ndarray],
         base_image_paths: list[str],
         image_paths: list[str],
-        original_sizes: list[tuple[int, int]],
-    ):
+    ) -> list[dict]:
         """Assemble EPO's feed-forward dict from raw MapAnything outputs.
 
-        Follows the ``VGGTWrapper._build_ff_data`` recipe: the *original*
-        sharp pixels (torchvision decode, PIL fallback, antialiased BICUBIC
-        resize) feed the edge detector, while depth/confidence/pose/intrinsic
-        come from MapAnything. Everything lives in the *uncropped* resized
-        frame (NaN-padded depth), so image and depth stay pixel-aligned.
-        Keyed by the relative image path (``"cam_id/image_name"``).
+        Normalizes MapAnything's cover-resize + centered-crop frame into the
+        per-image entries ``BaseWrapper._build_ff_data`` consumes.
+        Everything lives in the *uncropped* resized frame: the image is resized
+        (never cropped) and the depth/confidence are the NaN-padded maps
+        (``preds["padded"]``), so image and depth stay pixel-aligned. Keyed by
+        the relative image path (``"cam_id/image_name"``).
         """
-        from concurrent.futures import ThreadPoolExecutor
-
-        from torchvision.io import ImageReadMode, read_image
-        from torchvision.transforms import InterpolationMode
-        from torchvision.transforms.functional import resize as tv_resize
-
         target_h, target_w = preds["depth_map"].shape[-2:]
+        entries = []
 
-        def _process_one(i):
-            """Build one image's ff_data entry (independent per image)."""
-            base = base_image_paths[i]
-            orig_w, orig_h = original_sizes[i]
+        for i, key in enumerate(base_image_paths):
+            orig_w, orig_h = preds["original_sizes"][i]
             resized_w, resized_h, _, _ = self._crop_geometry(
                 orig_w, orig_h, target_w, target_h
             )
 
-            # Decode -> CHW uint8 RGB, same decoder + fallback as VGGTWrapper.
-            try:
-                rgb = read_image(image_paths[i], mode=ImageReadMode.UNCHANGED)
-                if rgb.shape[0] == 1:
-                    rgb = rgb.expand(3, -1, -1).contiguous()
-                elif rgb.shape[0] == 4:
-                    # RGBA -> blend onto white, drop alpha.
-                    a = rgb[3:4].float() / 255.0
-                    rgb = (
-                        (rgb[:3].float() * a + 255.0 * (1.0 - a))
-                        .clamp_(0, 255)
-                        .to(torch.uint8)
-                    )
-                elif rgb.shape[0] != 3:
-                    raise RuntimeError("defer to PIL")
-            except RuntimeError:
-                img = Image.open(image_paths[i])
-                if img.mode == "RGBA":
-                    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
-                    img = Image.alpha_composite(bg, img)
-                arr = np.asarray(img.convert("RGB"))
-                rgb = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-            img_t = (
-                tv_resize(
-                    rgb,
-                    [resized_h, resized_w],
-                    interpolation=InterpolationMode.BICUBIC,
-                    antialias=True,
-                )
-                .float()
-                .div_(255.0)
+            entries.append(
+                {
+                    "key": key,
+                    "image_path": image_paths[i],
+                    "resize_hw": (resized_h, resized_w),
+                    "crop_box": None,
+                    "depth": preds["padded"]["depth"][i],
+                    "confidence": preds["padded"]["confidence"][i],
+                    "pose": preds["extrinsic"][i].copy(),
+                    "intrinsic": preds["intrinsics_unc"][i].copy(),
+                }
             )
 
-            return base, {
-                "image": img_t,
-                "depth": torch.from_numpy(padded["depth"][i]).float(),
-                "confidence": torch.from_numpy(padded["confidence"][i]).float(),
-                "pose": torch.from_numpy(preds["extrinsic"][i].copy()).float(),
-                "intrinsic": torch.from_numpy(intrinsics_unc[i].copy()).float(),
-            }
-
-        # Decode + resize is the bottleneck and releases the GIL, so thread it.
-        n = len(base_image_paths)
-        max_workers = min(8, os.cpu_count() or 1)
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            results = list(ex.map(_process_one, range(n)))
-
-        return {base: entry for base, entry in results}
+        return entries
 
     @torch.no_grad()
     def forward(
@@ -522,10 +350,10 @@ class MapAnythingWrapper:
 
         print("Running reconstruction without Bundle Adjustment...")
         t_start = time.time()
-        reconstruction, proc_hw = self._reconstruct_without_ba(
-            preds,
-            conf_thres_percentile,
-            max_points_for_colmap,
+        proc_hw = preds["depth_map"].shape[-2:]
+        preds["points_rgb"] = preds["processed_images"]
+        reconstruction = self._reconstruct(
+            preds, conf_thres_percentile, max_points_for_colmap
         )
         timings["reconstruction_without_ba"] = time.time() - t_start
 
@@ -545,14 +373,10 @@ class MapAnythingWrapper:
         # Build EPO's feed-forward dict: MapAnything depth/pose/intrinsic
         # plus the original sharp image for the edge detector.
         t_start = time.time()
-        ff_data = self._build_ff_data(
-            preds,
-            padded,
-            intrinsics_unc,
-            base_image_paths,
-            image_paths,
-            original_sizes,
-        )
+        preds["padded"] = padded
+        preds["intrinsics_unc"] = intrinsics_unc
+        preds["original_sizes"] = original_sizes
+        ff_data = self._build_ff_data(preds, base_image_paths, image_paths)
         timings["build_ff_data"] = time.time() - t_start
         gc.collect()
         torch.cuda.empty_cache()
@@ -619,3 +443,7 @@ class MapAnythingWrapper:
         self.last_timings = timings
 
         return ff_data, reconstruction, depths
+
+
+if __name__ == "__main__":
+    MapAnythingWrapper._cli_main(default_model_path="facebook/map-anything")

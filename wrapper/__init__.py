@@ -9,6 +9,41 @@ oom_safe=...)`` and ``forward(images_path, output_path, ...)``.
 """
 
 import importlib
+import logging
+
+# Third-party libraries the wrappers pull in log a lot at INFO (model loading,
+# DINO internals, HF Hub HTTP requests, …). They show up because EPO calls
+# ``logging.basicConfig(level=INFO)``, so these child loggers inherit the root
+# INFO level. Silencing the top-level names here — once, before any wrapper is
+# imported — raises every descendant (e.g. ``dvlt.model.base`` under ``dvlt``)
+# to WARNING. EPO's own loggers are untouched. Append a name if a new model's
+# INFO chatter leaks through.
+_NOISY_LOGGERS = (
+    "httpx",
+    "httpcore",
+    "urllib3",
+    "filelock",
+    "huggingface_hub",
+    "transformers",
+    "timm",
+    "accelerate",
+    "dinov2",
+    "dinov3",
+    "dvlt",
+    "mapanything",
+    "depth_anything_3",
+    "pi3",
+    "vggt_omega",
+)
+
+
+def _quiet_third_party_logging(level: int = logging.WARNING) -> None:
+    """Raise the noisy model-library loggers to ``level`` (default WARNING)."""
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(level)
+
+
+_quiet_third_party_logging()
 
 WRAPPERS = {
     "vggt": (

@@ -21,10 +21,7 @@ for _p in (_HERE, os.path.join(_ROOT, "third_party", "vggt")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import copy  # noqa: E402
 import gc  # noqa: E402
-import glob  # noqa: E402
-import random  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -32,16 +29,10 @@ import numpy as np  # noqa: E402
 import pycolmap  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
-from np_to_colmap import (  # noqa: E402
-    batch_np_matrix_to_pycolmap,
-    batch_np_matrix_to_pycolmap_wo_track,
-)
+from base_wrapper import BaseWrapper  # noqa: E402
+from np_to_colmap import batch_np_matrix_to_pycolmap  # noqa: E402
 from vggt.models.vggt import VGGT  # noqa: E402
 from vggt.utils.geometry import unproject_depth_map_to_point_map  # noqa: E402
-from vggt.utils.helper import (  # noqa: E402
-    create_pixel_coordinate_grid,
-    randomly_limit_trues,
-)
 from vggt.utils.load_fn import load_and_preprocess_images_square  # noqa: E402
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri  # noqa: E402
 
@@ -50,7 +41,7 @@ from vggt.utils.pose_enc import pose_encoding_to_extri_intri  # noqa: E402
 # non-BA / EPO path — and importing this module — never requires lightglue.
 
 
-class VGGTWrapper:
+class VGGTWrapper(BaseWrapper):
     """Wrapper class for VGGT model to perform 3D reconstruction from images."""
 
     def __init__(
@@ -100,15 +91,6 @@ class VGGTWrapper:
 
         print(f"VGGTWrapper initialized on {self.device} with dtype {self.dtype}")
 
-    def _set_seed(self, seed: int):
-        """Set random seeds for reproducibility."""
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-
     def _load_model(self, model_path: str) -> VGGT:
         """Load the VGGT model from a local checkpoint file or a URL."""
         model = VGGT()
@@ -121,54 +103,6 @@ class VGGTWrapper:
         model = model.to(self.device)
         print(f"VGGT model loaded from {model_path}")
         return model
-
-    def _find_images(self, images_path: str) -> list[str]:
-        """Find all images in the given path, including subdirectories.
-
-        Args:
-            images_path: Path to directory containing images.
-
-        Returns:
-            List of image file paths.
-        """
-        valid_extensions = ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG"]
-        image_paths = []
-
-        for ext in valid_extensions:
-            # Search in root and one level deep
-            image_paths.extend(glob.glob(os.path.join(images_path, f"*.{ext}")))
-            image_paths.extend(glob.glob(os.path.join(images_path, "*", f"*.{ext}")))
-
-        # Remove duplicates and sort
-        image_paths = sorted(list(set(image_paths)))
-
-        if len(image_paths) == 0:
-            raise ValueError(
-                f"No images found in {images_path}. Path {images_path} is invalid or empty."
-            )
-
-        print(f"Found {len(image_paths)} images in {images_path}")
-        return image_paths
-
-    def _sample_images(
-        self, image_paths: list[str], max_images: int | None = None
-    ) -> list[str]:
-        """Randomly sample images if needed.
-
-        Args:
-            image_paths: List of all image paths.
-            max_images: Maximum number of images to use. None means use all.
-
-        Returns:
-            Sampled list of image paths.
-        """
-        max_images = max_images if max_images > 0 else 100_000
-        if max_images is not None and len(image_paths) > max_images:
-            sampled_paths = random.sample(image_paths, max_images)
-            sampled_paths = sorted(sampled_paths)  # Keep sorted order
-            print(f"Randomly sampled {max_images} images from {len(image_paths)}")
-            return sampled_paths
-        return image_paths
 
     def _run_vggt(
         self, images: torch.Tensor
@@ -300,55 +234,6 @@ class VGGTWrapper:
 
         return reconstruction, reconstruction_resolution, track_time, ba_time
 
-    def _reconstruct_without_ba(
-        self,
-        images: torch.Tensor,
-        extrinsic: np.ndarray,
-        intrinsic: np.ndarray,
-        depth_conf: np.ndarray,
-        points_3d: np.ndarray,
-        conf_thres_value: float,
-        max_points_for_colmap: int,
-    ):
-        """Reconstruct without bundle adjustment."""
-        image_size = np.array([self.vggt_fixed_resolution, self.vggt_fixed_resolution])
-        num_frames, height, width, _ = points_3d.shape
-
-        # Get RGB values
-        points_rgb = F.interpolate(
-            images,
-            size=(self.vggt_fixed_resolution, self.vggt_fixed_resolution),
-            mode="bilinear",
-            align_corners=False,
-        )
-        points_rgb = (points_rgb.cpu().numpy() * 255).astype(np.uint8)
-        points_rgb = points_rgb.transpose(0, 2, 3, 1)
-
-        # Create coordinate grid
-        points_xyf = create_pixel_coordinate_grid(num_frames, height, width)
-
-        # Filter by confidence
-        conf_mask = depth_conf >= conf_thres_value
-        conf_mask = randomly_limit_trues(conf_mask, max_points_for_colmap)
-
-        points_3d = points_3d[conf_mask]
-        points_xyf = points_xyf[conf_mask]
-        points_rgb = points_rgb[conf_mask]
-
-        print("Converting to COLMAP format")
-        reconstruction = batch_np_matrix_to_pycolmap_wo_track(
-            points_3d,
-            points_xyf,
-            points_rgb,
-            extrinsic,
-            intrinsic,
-            image_size,
-            shared_camera=False,
-            camera_type="PINHOLE",
-        )
-
-        return reconstruction, self.vggt_fixed_resolution
-
     def _rescale_reconstruction(
         self,
         reconstruction,
@@ -358,7 +243,14 @@ class VGGTWrapper:
         shift_point2d: bool,
         shared_camera: bool,
     ):
-        """Rescale and rename reconstruction to match original images."""
+        """Rescale and rename reconstruction to match original images.
+
+        VGGT is the only wrapper with a BA path, so unlike
+        ``BaseWrapper._rescale_reconstruction`` this variant also shifts the 2D
+        observations BA produced (``shift_point2d``) and can share one camera
+        across images. The camera math itself is the shared
+        :meth:`_rescale_camera_params` (square/letterboxed convention).
+        """
         rescale_camera = {
             camera_id: True for camera_id in reconstruction.cameras.keys()
         }  # rescale all cameras but only once each
@@ -368,15 +260,13 @@ class VGGTWrapper:
             pycamera = reconstruction.cameras[pyimage.camera_id]
             pyimage.name = base_image_paths[pyimageid - 1]
 
-            if rescale_camera[pyimage.camera_id]:
-                pred_params = copy.deepcopy(pycamera.params)
-                real_image_size = original_coords[pyimageid - 1, -2:]
-                resize_ratio = max(real_image_size) / img_size
-                pred_params = pred_params * resize_ratio
-                real_pp = real_image_size / 2
-                pred_params[-2:] = real_pp
+            real_image_size = original_coords[pyimageid - 1, -2:]
+            resize_ratio = max(real_image_size) / img_size
 
-                pycamera.params = pred_params
+            if rescale_camera[pyimage.camera_id]:
+                pycamera.params = self._rescale_camera_params(
+                    pycamera.params, tuple(real_image_size), (img_size, img_size)
+                )
                 pycamera.width = real_image_size[0]
                 pycamera.height = real_image_size[1]
 
@@ -390,120 +280,21 @@ class VGGTWrapper:
 
         return reconstruction
 
-    def _build_ff_data(
+    def _ff_entries(
         self,
-        extrinsic: np.ndarray,
-        intrinsic: np.ndarray,
-        depth_map: np.ndarray,
-        depth_conf: np.ndarray,
+        preds: dict,
         base_image_paths: list[str],
         image_paths: list[str],
-        original_coords: np.ndarray,
-    ):
-        """Assemble EPO's feed-forward dict from raw VGGT outputs.
+    ) -> list[dict]:
+        """Place VGGT's outputs relative to the original images.
 
-        Mirrors EPO's disk loaders step for step (``helpers/load.py``:
-        ``_process_single_image``, ``_process_single_depth``,
-        ``process_camera`` with ``load_with_pad=False``), so ``EPO.from_ff``
-        sees the same inputs as a save-to-disk round-trip and lands in the
-        same optimum:
-
-        - ``"image"``: original pixels decoded to CHW uint8 (torchvision,
-          PIL fallback), antialiased BICUBIC resize to
-          ``(int(h*s), int(w*s))`` with ``s = res / max(w, h)``;
-        - ``"depth"``/``"confidence"``: centered ``//2`` crop of VGGT's
-          square map to those same dims (the disk path's follow-up resize
-          is an exact identity at these sizes, so it is skipped);
-        - ``"intrinsic"``: VGGT's square-space focals with the principal
-          point at the float image centre ``(w*s/2, h*s/2)``.
-
-        Extrinsics are untouched. Keyed by the relative image path
-        (``"cam_id/image_name"``).
+        VGGT infers on a square, letterboxed 518 px frame, so this is the shared
+        letterbox recipe (``BaseWrapper._ff_entries_letterbox``); VGGT-Omega
+        uses the same one at 512 px.
         """
-        from concurrent.futures import ThreadPoolExecutor
-
-        from PIL import Image
-        from torchvision.io import ImageReadMode, read_image
-        from torchvision.transforms import InterpolationMode
-        from torchvision.transforms.functional import resize as tv_resize
-
-        res = self.vggt_fixed_resolution
-
-        def _process_one(i):
-            """Build one image's ff_data entry (independent per image)."""
-            base = base_image_paths[i]
-            # original_coords[:, -2:] holds the original (width, height).
-            width, height = original_coords[i, -2:]
-            scale = res / max(width, height)
-            new_w, new_h = int(width * scale), int(height * scale)
-
-            # Decode → CHW uint8 RGB, same decoder + fallback as the disk path.
-            try:
-                rgb = read_image(image_paths[i], mode=ImageReadMode.UNCHANGED)
-                if rgb.shape[0] == 1:
-                    rgb = rgb.expand(3, -1, -1).contiguous()
-                elif rgb.shape[0] == 4:
-                    # RGBA → blend onto white, drop alpha (same float math +
-                    # truncating uint8 cast as the disk decoder).
-                    a = rgb[3:4].float() / 255.0
-                    rgb = (
-                        (rgb[:3].float() * a + 255.0 * (1.0 - a))
-                        .clamp_(0, 255)
-                        .to(torch.uint8)
-                    )
-                elif rgb.shape[0] != 3:
-                    raise RuntimeError("defer to PIL")
-            except RuntimeError:
-                img = Image.open(image_paths[i])
-                if img.mode == "RGBA":
-                    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
-                    img = Image.alpha_composite(bg, img)
-                arr = np.asarray(img.convert("RGB"))
-                rgb = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-            img_t = (
-                tv_resize(
-                    rgb,
-                    [new_h, new_w],
-                    interpolation=InterpolationMode.BICUBIC,
-                    antialias=True,
-                )
-                .float()
-                .div_(255.0)
-            )
-
-            # Centered crop of the square depth/confidence maps.
-            crop_top = max((res - new_h) // 2, 0)
-            crop_left = max((res - new_w) // 2, 0)
-            depth_hw = torch.from_numpy(np.asarray(depth_map[i]).squeeze()).float()
-            conf_hw = torch.from_numpy(np.asarray(depth_conf[i]).squeeze()).float()
-            depth_hw = depth_hw[
-                crop_top : crop_top + new_h, crop_left : crop_left + new_w
-            ]
-            conf_hw = conf_hw[
-                crop_top : crop_top + new_h, crop_left : crop_left + new_w
-            ]
-
-            intr = torch.from_numpy(intrinsic[i].copy()).float()
-            intr[0, 2] = float(width * scale / 2.0)
-            intr[1, 2] = float(height * scale / 2.0)
-
-            return base, {
-                "image": img_t,
-                "depth": depth_hw,
-                "confidence": conf_hw,
-                "pose": torch.from_numpy(extrinsic[i][:3, :4]).float(),
-                "intrinsic": intr,
-            }
-
-        # Decode + resize is the bottleneck and releases the GIL, so thread it.
-        # `map` preserves input order, so the result is identical to the
-        # sequential loop (bit-exact ff_data parity is required).
-        n = len(base_image_paths)
-        max_workers = min(8, os.cpu_count() or 1)
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            results = list(ex.map(_process_one, range(n)))
-
-        return {base: entry for base, entry in results}
+        return self._ff_entries_letterbox(
+            preds, base_image_paths, image_paths, self.vggt_fixed_resolution
+        )
 
     @torch.no_grad()
     def forward(
@@ -622,14 +413,18 @@ class VGGTWrapper:
         else:
             print("Running reconstruction without Bundle Adjustment...")
             t_start = time.time()
-            reconstruction, recon_resolution = self._reconstruct_without_ba(
-                images,
-                extrinsic,
-                intrinsic,
-                depth_conf,
-                points_3d,
-                conf_thres_value,
-                max_points_for_colmap,
+            recon_resolution = self.vggt_fixed_resolution
+            recon_preds = {
+                "extrinsic": extrinsic,
+                "intrinsic": intrinsic,
+                "depth_conf": depth_conf,
+                "points": points_3d,
+                "points_rgb": self._points_rgb(
+                    images, (recon_resolution, recon_resolution)
+                ),
+            }
+            reconstruction = self._reconstruct(
+                recon_preds, conf_thres_value, max_points_for_colmap
             )
             timings["reconstruction_without_ba"] = time.time() - t_start
 
@@ -647,15 +442,14 @@ class VGGTWrapper:
         ff_data = None
         if not use_ba:
             t_start = time.time()
-            ff_data = self._build_ff_data(
-                extrinsic,
-                intrinsic,
-                depth_map,
-                depth_conf,
-                base_image_paths,
-                image_paths,
-                original_coords.cpu().numpy(),
-            )
+            ff_preds = {
+                "extrinsic": extrinsic,
+                "intrinsic": intrinsic,
+                "depth_map": depth_map,
+                "depth_conf": depth_conf,
+                "original_coords": original_coords.cpu().numpy(),
+            }
+            ff_data = self._build_ff_data(ff_preds, base_image_paths, image_paths)
             timings["build_ff_data"] = time.time() - t_start
             del images
             gc.collect()
@@ -773,3 +567,9 @@ class VGGTWrapper:
         # depths: per-image {"depth", "confidence"} dict (the depths.pth
         # contents) — returned so a caller can write it after timing inference.
         return ff_data, reconstruction, depths
+
+
+if __name__ == "__main__":
+    VGGTWrapper._cli_main(
+        default_model_path="https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+    )

@@ -35,35 +35,21 @@ for _p in (_HERE, os.path.join(_ROOT, "third_party", "dvlt", "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import copy  # noqa: E402
 import gc  # noqa: E402
-import glob  # noqa: E402
-import random  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from accelerate import PartialState  # noqa: E402
+from base_wrapper import BaseWrapper  # noqa: E402
 from dvlt.common.constants import DataField, PredictionField  # noqa: E402
 from dvlt.model.dvlt.model import DVLT  # noqa: E402
 from dvlt.util.preprocess import preprocess_images  # noqa: E402
-from np_to_colmap import batch_np_matrix_to_pycolmap_wo_track  # noqa: E402
 from PIL import Image  # noqa: E402
 
 
-def _randomly_limit_trues(mask: np.ndarray, max_trues: int) -> np.ndarray:
-    """Randomly keep at most ``max_trues`` True entries of a boolean mask."""
-    true_indices = np.flatnonzero(mask)
-    if true_indices.size <= max_trues:
-        return mask
-    sampled = np.random.choice(true_indices, size=max_trues, replace=False)
-    limited = np.zeros(mask.size, dtype=bool)
-    limited[sampled] = True
-    return limited.reshape(mask.shape)
-
-
-class DVLTWrapper:
+class DVLTWrapper(BaseWrapper):
     """Wrapper class for DVLT model to perform 3D reconstruction from images."""
 
     def __init__(
@@ -118,15 +104,6 @@ class DVLTWrapper:
 
         print(f"DVLTWrapper initialized on {self.device} with dtype {self.dtype}")
 
-    def _set_seed(self, seed: int):
-        """Set random seeds for reproducibility."""
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-
     def _load_model(self, model_path: str) -> DVLT:
         """Load the DVLT model from a local path, URL, or HF Hub repo id."""
         # The release checkpoint carries the DINOv2 patch-embed weights
@@ -145,54 +122,6 @@ class DVLTWrapper:
         model.model.to(self.device)
         print(f"DVLT model loaded from {model_path}")
         return model
-
-    def _find_images(self, images_path: str) -> list[str]:
-        """Find all images in the given path, including subdirectories.
-
-        Args:
-            images_path: Path to directory containing images.
-
-        Returns:
-            List of image file paths.
-        """
-        valid_extensions = ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG"]
-        image_paths = []
-
-        for ext in valid_extensions:
-            # Search in root and one level deep
-            image_paths.extend(glob.glob(os.path.join(images_path, f"*.{ext}")))
-            image_paths.extend(glob.glob(os.path.join(images_path, "*", f"*.{ext}")))
-
-        # Remove duplicates and sort
-        image_paths = sorted(list(set(image_paths)))
-
-        if len(image_paths) == 0:
-            raise ValueError(
-                f"No images found in {images_path}. Path {images_path} is invalid or empty."
-            )
-
-        print(f"Found {len(image_paths)} images in {images_path}")
-        return image_paths
-
-    def _sample_images(
-        self, image_paths: list[str], max_images: int | None = None
-    ) -> list[str]:
-        """Randomly sample images if needed.
-
-        Args:
-            image_paths: List of all image paths.
-            max_images: Maximum number of images to use. None means use all.
-
-        Returns:
-            Sampled list of image paths.
-        """
-        max_images = max_images if max_images > 0 else 100_000
-        if max_images is not None and len(image_paths) > max_images:
-            sampled_paths = random.sample(image_paths, max_images)
-            sampled_paths = sorted(sampled_paths)  # Keep sorted order
-            print(f"Randomly sampled {max_images} images from {len(image_paths)}")
-            return sampled_paths
-        return image_paths
 
     def _crop_geometry(
         self, original_sizes: np.ndarray
@@ -283,208 +212,87 @@ class DVLTWrapper:
 
         return extrinsic, intrinsic, depth_map, depth_conf, world_points
 
-    def _reconstruct_without_ba(
+    def _conf_mask(self, preds: dict, conf_thres: float) -> np.ndarray:
+        """Absolute confidence threshold, minus the synthetic batch-pad pixels."""
+        return (preds["depth_conf"] >= conf_thres) & preds["valid_pixels"]
+
+    def _ff_entries(
         self,
-        images: torch.Tensor,
-        valid_pixels: np.ndarray,
-        extrinsic: np.ndarray,
-        intrinsic: np.ndarray,
-        depth_conf: np.ndarray,
-        world_points: np.ndarray,
-        conf_thres_value: float,
-        max_points_for_colmap: int,
-    ):
-        """Reconstruct without bundle adjustment (padded model space)."""
-        num_frames, height, width = depth_conf.shape
-        image_size = np.array([width, height])
-
-        # Get RGB values from the model input batch (S, H, W, 3) uint8.
-        points_rgb = (images.cpu().numpy() * 255).astype(np.uint8)
-        points_rgb = points_rgb.transpose(0, 2, 3, 1)
-
-        # Create coordinate grid (x, y, frame_idx)
-        y_grid, x_grid = np.indices((height, width), dtype=np.float32)
-        points_xyf = np.stack(
-            [
-                np.broadcast_to(x_grid, (num_frames, height, width)),
-                np.broadcast_to(y_grid, (num_frames, height, width)),
-                np.broadcast_to(
-                    np.arange(num_frames, dtype=np.float32)[:, None, None],
-                    (num_frames, height, width),
-                ),
-            ],
-            axis=-1,
-        )
-
-        # Filter by confidence; drop synthetic pad pixels.
-        conf_mask = (depth_conf >= conf_thres_value) & valid_pixels
-        conf_mask = _randomly_limit_trues(conf_mask, max_points_for_colmap)
-
-        print("Converting to COLMAP format")
-        reconstruction = batch_np_matrix_to_pycolmap_wo_track(
-            world_points[conf_mask],
-            points_xyf[conf_mask],
-            points_rgb[conf_mask],
-            extrinsic,
-            intrinsic,
-            image_size,
-            shared_camera=False,
-            camera_type="PINHOLE",
-        )
-
-        return reconstruction, self.dvlt_fixed_resolution
-
-    def _rescale_reconstruction(
-        self,
-        reconstruction,
-        base_image_paths: list[str],
-        original_sizes: np.ndarray,
-        img_size: int,
-        shared_camera: bool,
-    ):
-        """Rescale and rename reconstruction to match original images."""
-        rescale_camera = {
-            camera_id: True for camera_id in reconstruction.cameras.keys()
-        }  # rescale all cameras but only once each
-
-        for pyimageid in reconstruction.images:
-            pyimage = reconstruction.images[pyimageid]
-            pycamera = reconstruction.cameras[pyimage.camera_id]
-            pyimage.name = base_image_paths[pyimageid - 1]
-
-            if rescale_camera[pyimage.camera_id]:
-                pred_params = copy.deepcopy(pycamera.params)
-                real_image_size = original_sizes[pyimageid - 1]  # (w, h)
-                resize_ratio = max(real_image_size) / img_size
-                pred_params = pred_params * resize_ratio
-                real_pp = real_image_size / 2
-                pred_params[-2:] = real_pp
-
-                pycamera.params = pred_params
-                pycamera.width = real_image_size[0]
-                pycamera.height = real_image_size[1]
-
-            if shared_camera:
-                rescale_camera[pyimage.camera_id] = False
-
-        return reconstruction
-
-    def _build_ff_data(
-        self,
-        extrinsic: np.ndarray,
-        intrinsic: np.ndarray,
-        depth_map: np.ndarray,
-        depth_conf: np.ndarray,
+        preds: dict,
         base_image_paths: list[str],
         image_paths: list[str],
-        crop_geometry: list[tuple[int, int, int, int]],
-        rotated: list[bool],
-    ):
+    ) -> list[dict]:
         """Assemble EPO's feed-forward dict from raw DVLT outputs.
 
-        Mirrors the VGGT wrapper's convention so ``EPO.from_ff`` sees the same
-        input structure:
+        Normalizes DVLT's padded (and, for portrait frames, rotated) model
+        space into the per-image entries ``BaseWrapper._build_ff_data``
+        consumes:
 
-        - ``"image"``: original pixels decoded to CHW uint8, antialiased
-          BICUBIC resize to DVLT's model dims, then the same center crop to a
-          multiple of ``patch_size`` the preprocessor applies — so it matches
-          the depth maps pixel for pixel while staying sharp for the edge
-          detector;
-        - ``"depth"``/``"confidence"``: the frame's real content cropped out
-          of the padded model output;
-        - ``"intrinsic"``: DVLT's predicted focals with the principal point at
-          the float image centre (the disk-loader convention);
-        - ``"pose"``: world-to-camera (3, 4), as EPO expects.
+        - image: antialiased BICUBIC resize to DVLT's model dims, then the
+          same center crop to a multiple of ``patch_size`` the preprocessor
+          applies — so it matches the depth maps pixel for pixel;
+        - depth/confidence: the frame's real content cropped out of the padded
+          model output, rotated back to portrait where the frame went in
+          rotated;
+        - intrinsic: DVLT's predicted focals with the principal point at the
+          float image centre (the disk-loader convention);
+        - pose: world-to-camera (3, 4), as EPO expects.
 
         Keyed by the relative image path (``"cam_id/image_name"``).
         """
-        from concurrent.futures import ThreadPoolExecutor
-
-        from torchvision.io import ImageReadMode, read_image
-        from torchvision.transforms import InterpolationMode
-        from torchvision.transforms.functional import resize as tv_resize
-
         res = self.dvlt_fixed_resolution
+        entries = []
 
-        def _process_one(i):
-            """Build one image's ff_data entry (independent per image)."""
-            base = base_image_paths[i]
+        for i, key in enumerate(base_image_paths):
             # Model-space crop (landscape for rotated frames) locates the
             # frame in the padded output; image-space dims follow the
             # original orientation (transposed when the frame was rotated).
-            crop_h, crop_w, pad_top, pad_left = crop_geometry[i]
-            img_h, img_w = (crop_w, crop_h) if rotated[i] else (crop_h, crop_w)
-
-            # Decode → CHW uint8 RGB, same decoder + fallback as the disk path.
-            try:
-                rgb = read_image(image_paths[i], mode=ImageReadMode.UNCHANGED)
-                if rgb.shape[0] == 1:
-                    rgb = rgb.expand(3, -1, -1).contiguous()
-                elif rgb.shape[0] == 4:
-                    # RGBA → blend onto white, drop alpha (same float math +
-                    # truncating uint8 cast as the disk decoder).
-                    a = rgb[3:4].float() / 255.0
-                    rgb = (
-                        (rgb[:3].float() * a + 255.0 * (1.0 - a))
-                        .clamp_(0, 255)
-                        .to(torch.uint8)
-                    )
-                elif rgb.shape[0] != 3:
-                    raise RuntimeError("defer to PIL")
-            except RuntimeError:
-                img = Image.open(image_paths[i])
-                if img.mode == "RGBA":
-                    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
-                    img = Image.alpha_composite(bg, img)
-                arr = np.asarray(img.convert("RGB"))
-                rgb = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+            crop_h, crop_w, pad_top, pad_left = preds["crop_geometry"][i]
+            rotated = preds["rotated"][i]
+            img_h, img_w = (crop_w, crop_h) if rotated else (crop_h, crop_w)
 
             # Same resize + divisible center crop as `preprocess_images` (the
             # crop math commutes with rotation), so the image lands on the
             # rotated-back depth map's exact dims.
-            height, width = rgb.shape[-2:]
+            width, height = preds["original_sizes"][i]
             scale = res / max(width, height)
             new_h, new_w = int(round(height * scale)), int(round(width * scale))
-            top = (new_h - img_h) // 2
-            left = (new_w - img_w) // 2
-            img_t = tv_resize(
-                rgb,
-                [new_h, new_w],
-                interpolation=InterpolationMode.BICUBIC,
-                antialias=True,
-            )
-            img_t = img_t[:, top : top + img_h, left : left + img_w]
-            img_t = img_t.float().div_(255.0)
 
             # Crop the frame's real content out of the padded model output;
             # rotate back to portrait where the frame went in rotated.
-            d = depth_map[i, pad_top : pad_top + crop_h, pad_left : pad_left + crop_w]
-            c = depth_conf[i, pad_top : pad_top + crop_h, pad_left : pad_left + crop_w]
-            if rotated[i]:
+            d = preds["depth_map"][
+                i, pad_top : pad_top + crop_h, pad_left : pad_left + crop_w
+            ]
+            c = preds["depth_conf"][
+                i, pad_top : pad_top + crop_h, pad_left : pad_left + crop_w
+            ]
+            if rotated:
                 d = np.rot90(d, k=-1).copy()
                 c = np.rot90(c, k=-1).copy()
-            depth_hw = torch.from_numpy(d).float()
-            conf_hw = torch.from_numpy(c).float()
 
-            intr = torch.from_numpy(intrinsic[i].copy()).float()
-            intr[0, 2] = float(img_w / 2.0)
-            intr[1, 2] = float(img_h / 2.0)
+            intr = preds["intrinsic"][i].copy()
+            intr[0, 2] = img_w / 2.0
+            intr[1, 2] = img_h / 2.0
 
-            return base, {
-                "image": img_t,
-                "depth": depth_hw,
-                "confidence": conf_hw,
-                "pose": torch.from_numpy(extrinsic[i][:3, :4]).float(),
-                "intrinsic": intr,
-            }
+            entries.append(
+                {
+                    "key": key,
+                    "image_path": image_paths[i],
+                    "resize_hw": (new_h, new_w),
+                    "crop_box": (
+                        (new_h - img_h) // 2,
+                        (new_w - img_w) // 2,
+                        img_h,
+                        img_w,
+                    ),
+                    "depth": d,
+                    "confidence": c,
+                    "pose": preds["extrinsic"][i][:3, :4],
+                    "intrinsic": intr,
+                }
+            )
 
-        # Decode + resize is the bottleneck and releases the GIL, so thread it.
-        n = len(base_image_paths)
-        max_workers = min(8, os.cpu_count() or 1)
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            results = list(ex.map(_process_one, range(n)))
-
-        return {base: entry for base, entry in results}
+        return entries
 
     @torch.no_grad()
     def forward(
@@ -596,16 +404,18 @@ class DVLTWrapper:
         # Reconstruct (no BA path for DVLT)
         print("Running reconstruction without Bundle Adjustment...")
         t_start = time.time()
-        valid_pixels = batch["gradio_valid_pixels"][0].cpu().numpy()
-        reconstruction, recon_resolution = self._reconstruct_without_ba(
-            batch[DataField.IMAGES][0],
-            valid_pixels,
-            extrinsic,
-            intrinsic,
-            depth_conf,
-            world_points,
-            conf_thres_value,
-            max_points_for_colmap,
+        recon_resolution = self.dvlt_fixed_resolution
+        recon_preds = {
+            "extrinsic": extrinsic,
+            "intrinsic": intrinsic,
+            "depth_conf": depth_conf,
+            "points": world_points,
+            # DVLT's batch is already at the padded model size, so no resize.
+            "points_rgb": self._points_rgb(batch[DataField.IMAGES][0]),
+            "valid_pixels": batch["gradio_valid_pixels"][0].cpu().numpy(),
+        }
+        reconstruction = self._reconstruct(
+            recon_preds, conf_thres_value, max_points_for_colmap
         )
         timings["reconstruction_without_ba"] = time.time() - t_start
 
@@ -630,16 +440,16 @@ class DVLTWrapper:
         # batch padding cropped out, and the original sharp image for the edge
         # detector. Free the GPU batch afterwards.
         t_start = time.time()
-        ff_data = self._build_ff_data(
-            extrinsic,
-            intrinsic,
-            depth_map,
-            depth_conf,
-            base_image_paths,
-            image_paths,
-            crop_geometry,
-            rotated,
-        )
+        ff_preds = {
+            "extrinsic": extrinsic,
+            "intrinsic": intrinsic,
+            "depth_map": depth_map,
+            "depth_conf": depth_conf,
+            "crop_geometry": crop_geometry,
+            "rotated": rotated,
+            "original_sizes": original_sizes,
+        }
+        ff_data = self._build_ff_data(ff_preds, base_image_paths, image_paths)
         timings["build_ff_data"] = time.time() - t_start
         del batch, pil_images
         gc.collect()
@@ -651,9 +461,8 @@ class DVLTWrapper:
             reconstruction = self._rescale_reconstruction(
                 reconstruction,
                 base_image_paths,
-                original_sizes,
-                recon_resolution,
-                shared_camera=shared_camera,
+                original_sizes,  # per-image (width, height)
+                (recon_resolution, recon_resolution),  # square model frame
             )
             timings["rescale_reconstruction"] = time.time() - t_start
 
@@ -715,7 +524,6 @@ class DVLTWrapper:
             depth_map,
             depth_conf,
             world_points,
-            valid_pixels,
         )
         gc.collect()
         torch.cuda.empty_cache()
@@ -730,3 +538,7 @@ class DVLTWrapper:
         # depths.pth contents) — returned so a caller can write it after
         # timing the inference.
         return ff_data, reconstruction, depths
+
+
+if __name__ == "__main__":
+    DVLTWrapper._cli_main(default_model_path="nvidia/dvlt")

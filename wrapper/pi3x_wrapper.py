@@ -43,15 +43,13 @@ for _p in (_HERE, os.path.join(_ROOT, "third_party", "pi3")):
         sys.path.insert(0, _p)
 
 import gc  # noqa: E402
-import glob  # noqa: E402
-import random  # noqa: E402
 import time  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
-from np_to_colmap import batch_np_matrix_to_pycolmap_wo_track  # noqa: E402
+from base_wrapper import BaseWrapper  # noqa: E402
 from pi3.models.pi3x import Pi3X  # noqa: E402
 from pi3.utils.geometry import (  # noqa: E402
     depth_normal_edge,
@@ -65,18 +63,7 @@ _PIXEL_LIMIT = 255_000
 _PATCH = 14
 
 
-def _randomly_limit_trues(mask: np.ndarray, max_trues: int) -> np.ndarray:
-    """Keep at most ``max_trues`` True entries of ``mask``, chosen uniformly."""
-    true_idx = np.flatnonzero(mask)
-    if true_idx.size <= max_trues:
-        return mask
-    keep = np.random.choice(true_idx, size=max_trues, replace=False)
-    limited = np.zeros(mask.size, dtype=bool)
-    limited[keep] = True
-    return limited.reshape(mask.shape)
-
-
-class Pi3XWrapper:
+class Pi3XWrapper(BaseWrapper):
     """Wrapper class for Pi3X to perform 3D reconstruction."""
 
     def __init__(
@@ -108,15 +95,6 @@ class Pi3XWrapper:
 
         print(f"Pi3XWrapper initialized on {self.device}")
 
-    def _set_seed(self, seed: int):
-        """Set random seeds for reproducibility."""
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-
     def _load_model(self, model_path: str) -> Pi3X:
         """Load Pi3X from a Hugging Face repo id (image-only branch)."""
         model = Pi3X.from_pretrained(model_path).eval()
@@ -126,54 +104,6 @@ class Pi3XWrapper:
         model = model.to(self.device)
         print(f"Pi3X model loaded from {model_path}")
         return model
-
-    def _find_images(self, images_path: str) -> list[str]:
-        """Find all images in the given path, including subdirectories.
-
-        Args:
-            images_path: Path to directory containing images.
-
-        Returns:
-            List of image file paths.
-        """
-        valid_extensions = ["jpg", "jpeg", "png", "JPG", "JPEG", "PNG"]
-        image_paths = []
-
-        for ext in valid_extensions:
-            # Search in root and one level deep
-            image_paths.extend(glob.glob(os.path.join(images_path, f"*.{ext}")))
-            image_paths.extend(glob.glob(os.path.join(images_path, "*", f"*.{ext}")))
-
-        # Remove duplicates and sort
-        image_paths = sorted(list(set(image_paths)))
-
-        if len(image_paths) == 0:
-            raise ValueError(
-                f"No images found in {images_path}. Path {images_path} is invalid or empty."
-            )
-
-        print(f"Found {len(image_paths)} images in {images_path}")
-        return image_paths
-
-    def _sample_images(
-        self, image_paths: list[str], max_images: int | None = None
-    ) -> list[str]:
-        """Randomly sample images if needed.
-
-        Args:
-            image_paths: List of all image paths.
-            max_images: Maximum number of images to use. None means use all.
-
-        Returns:
-            Sampled list of image paths.
-        """
-        max_images = max_images if max_images > 0 else 100_000
-        if max_images is not None and len(image_paths) > max_images:
-            sampled_paths = random.sample(image_paths, max_images)
-            sampled_paths = sorted(sampled_paths)  # Keep sorted order
-            print(f"Randomly sampled {max_images} images from {len(image_paths)}")
-            return sampled_paths
-        return image_paths
 
     def _target_size(self, width: int, height: int) -> tuple[int, int]:
         """Replicate ``pi3.utils.basic.load_images_as_tensor`` sizing.
@@ -268,159 +198,53 @@ class Pi3XWrapper:
         torch.cuda.empty_cache()
         return out
 
-    def _reconstruct_without_ba(
+    def _rescale_camera_params(
         self,
-        preds: dict,
-        processed_images: np.ndarray,
-        conf_thres_prob: float,
-        max_points_for_colmap: int,
-    ):
-        """Build a track-less pycolmap reconstruction from Pi3X outputs."""
-        depth_map = preds["depth_map"]
-        height, width = depth_map.shape[-2:]
-        image_size = np.array([width, height])
-
-        conf_mask = np.isfinite(depth_map) & (depth_map > 0)
-        conf_mask &= preds["depth_conf"] > conf_thres_prob
-        conf_mask &= ~preds["edge_mask"]
-        conf_mask = _randomly_limit_trues(conf_mask, max_points_for_colmap)
-
-        points_3d, points_xyf = [], []
-        for i in range(len(depth_map)):
-            v, u = np.nonzero(conf_mask[i])
-            if v.size == 0:
-                continue
-            points_3d.append(preds["points"][i, v, u])
-            points_xyf.append(
-                np.stack([u, v, np.full_like(u, i)], axis=-1).astype(np.float64)
-            )
-        points_3d = np.concatenate(points_3d, axis=0)
-        points_xyf = np.concatenate(points_xyf, axis=0)
-        points_rgb = processed_images[conf_mask]
-
-        print("Converting to COLMAP format")
-        reconstruction = batch_np_matrix_to_pycolmap_wo_track(
-            points_3d,
-            points_xyf,
-            points_rgb,
-            preds["extrinsic"],
-            preds["intrinsic"],
-            image_size,
-            shared_camera=False,
-            camera_type="PINHOLE",
-        )
-
-        return reconstruction, (height, width)
-
-    def _rescale_reconstruction(
-        self,
-        reconstruction,
-        base_image_paths: list[str],
-        original_sizes: list[tuple[int, int]],
+        params: np.ndarray,
+        orig_wh: tuple[int, int],
         proc_hw: tuple[int, int],
-    ):
-        """Rescale cameras to original resolutions and rename images.
+    ) -> np.ndarray:
+        """Per-axis rescale: Pi3X's frame keeps the aspect ratio and is uncropped."""
+        return self._rescale_camera_params_per_axis(params, orig_wh, proc_hw)
 
-        Pi3's processed frame is non-square (and possibly anisotropically
-        resized), so fx/cx and fy/cy are scaled by the per-axis ratios.
-        Points2D stay in processed-pixel coordinates, mirroring
-        ``VGGTWrapper``'s non-BA behavior.
-        """
-        proc_h, proc_w = proc_hw
-        for pyimageid in reconstruction.images:
-            pyimage = reconstruction.images[pyimageid]
-            pycamera = reconstruction.cameras[pyimage.camera_id]
-            pyimage.name = base_image_paths[pyimageid - 1]
+    def _conf_mask(self, preds: dict, conf_thres: float) -> np.ndarray:
+        """Depth validity + sigmoid probability + Pi3X's depth/normal edge filter."""
+        depth_map = preds["depth_map"]
+        mask = np.isfinite(depth_map) & (depth_map > 0)
+        mask &= preds["depth_conf"] > conf_thres
+        return mask & ~preds["edge_mask"]
 
-            orig_w, orig_h = original_sizes[pyimageid - 1]
-            scale_x = orig_w / proc_w
-            scale_y = orig_h / proc_h
-
-            fx, fy, cx, cy = pycamera.params  # PINHOLE, per-image camera
-            pycamera.params = np.array(
-                [fx * scale_x, fy * scale_y, cx * scale_x, cy * scale_y]
-            )
-            pycamera.width = orig_w
-            pycamera.height = orig_h
-
-        return reconstruction
-
-    def _build_ff_data(
+    def _ff_entries(
         self,
         preds: dict,
         base_image_paths: list[str],
         image_paths: list[str],
-        proc_wh: tuple[int, int],
-    ):
+    ) -> list[dict]:
         """Assemble EPO's feed-forward dict from raw Pi3X outputs.
 
-        Follows the ``VGGTWrapper._build_ff_data`` recipe: the *original*
-        sharp pixels (torchvision decode, PIL fallback, antialiased BICUBIC
-        resize) feed the edge detector, while depth/confidence/pose/intrinsic
-        come straight from Pi3X in its processed-pixel space. Every image is
-        resized to the batch-uniform target size (Pi3 never crops). Keyed by
-        the relative image path (``"cam_id/image_name"``).
+        Normalizes Pi3X's batch-uniform frame into the per-image entries
+        ``BaseWrapper._build_ff_data`` consumes: every image is resized to
+        ``preds["proc_wh"]`` (Pi3 never crops), while depth / confidence /
+        pose / intrinsic come straight from Pi3X in its processed-pixel
+        space. Keyed by the relative image path (``"cam_id/image_name"``).
         """
-        from concurrent.futures import ThreadPoolExecutor
+        target_w, target_h = preds["proc_wh"]
 
-        from torchvision.io import ImageReadMode, read_image
-        from torchvision.transforms import InterpolationMode
-        from torchvision.transforms.functional import resize as tv_resize
-
-        target_w, target_h = proc_wh
-
-        def _process_one(i):
-            """Build one image's ff_data entry (independent per image)."""
-            base = base_image_paths[i]
-
-            # Decode -> CHW uint8 RGB, same decoder + fallback as VGGTWrapper.
-            try:
-                rgb = read_image(image_paths[i], mode=ImageReadMode.UNCHANGED)
-                if rgb.shape[0] == 1:
-                    rgb = rgb.expand(3, -1, -1).contiguous()
-                elif rgb.shape[0] == 4:
-                    # RGBA -> blend onto white, drop alpha.
-                    a = rgb[3:4].float() / 255.0
-                    rgb = (
-                        (rgb[:3].float() * a + 255.0 * (1.0 - a))
-                        .clamp_(0, 255)
-                        .to(torch.uint8)
-                    )
-                elif rgb.shape[0] != 3:
-                    raise RuntimeError("defer to PIL")
-            except RuntimeError:
-                img = Image.open(image_paths[i])
-                if img.mode == "RGBA":
-                    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
-                    img = Image.alpha_composite(bg, img)
-                arr = np.asarray(img.convert("RGB"))
-                rgb = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-            img_t = (
-                tv_resize(
-                    rgb,
-                    [target_h, target_w],
-                    interpolation=InterpolationMode.BICUBIC,
-                    antialias=True,
-                )
-                .float()
-                .div_(255.0)
-            )
-
-            return base, {
-                "image": img_t,
-                "depth": torch.from_numpy(preds["depth_map"][i]).float(),
-                "confidence": torch.from_numpy(preds["depth_conf"][i]).float(),
-                "pose": torch.from_numpy(preds["extrinsic"][i].copy()).float(),
-                "intrinsic": torch.from_numpy(preds["intrinsic"][i].copy()).float(),
+        entries = [
+            {
+                "key": key,
+                "image_path": image_paths[i],
+                "resize_hw": (target_h, target_w),
+                "crop_box": None,
+                "depth": preds["depth_map"][i],
+                "confidence": preds["depth_conf"][i],
+                "pose": preds["extrinsic"][i].copy(),
+                "intrinsic": preds["intrinsic"][i].copy(),
             }
+            for i, key in enumerate(base_image_paths)
+        ]
 
-        # Decode + resize is the bottleneck and releases the GIL, so thread it.
-        n = len(base_image_paths)
-        max_workers = min(8, os.cpu_count() or 1)
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            results = list(ex.map(_process_one, range(n)))
-
-        return {base: entry for base, entry in results}
+        return entries
 
     @torch.no_grad()
     def forward(
@@ -506,11 +330,10 @@ class Pi3XWrapper:
 
         print("Running reconstruction without Bundle Adjustment...")
         t_start = time.time()
-        reconstruction, proc_hw = self._reconstruct_without_ba(
-            preds,
-            processed_images,
-            conf_thres_prob,
-            max_points_for_colmap,
+        proc_hw = preds["depth_map"].shape[-2:]
+        preds["points_rgb"] = processed_images
+        reconstruction = self._reconstruct(
+            preds, conf_thres_prob, max_points_for_colmap
         )
         timings["reconstruction_without_ba"] = time.time() - t_start
 
@@ -526,7 +349,8 @@ class Pi3XWrapper:
         # Build EPO's feed-forward dict: Pi3X depth/pose/intrinsic plus the
         # original sharp image for the edge detector.
         t_start = time.time()
-        ff_data = self._build_ff_data(preds, base_image_paths, image_paths, proc_wh)
+        preds["proc_wh"] = proc_wh
+        ff_data = self._build_ff_data(preds, base_image_paths, image_paths)
         timings["build_ff_data"] = time.time() - t_start
         gc.collect()
         torch.cuda.empty_cache()
@@ -594,3 +418,7 @@ class Pi3XWrapper:
         self.last_timings = timings
 
         return ff_data, reconstruction, depths
+
+
+if __name__ == "__main__":
+    Pi3XWrapper._cli_main(default_model_path="yyfz233/Pi3X")
