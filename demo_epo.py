@@ -8,9 +8,13 @@ total end-to-end runtime.
 
 Example:
 python demo_epo.py \
+    --model vggt \
     --images_path ~/Desktop/datasets/mipnerf360/kitchen/images_150 \
     --output_path optimized_reconstruction/demo \
     --gt_path ~/Desktop/datasets/mipnerf360/kitchen/sparse_150
+    --output_path demo/bicycle \
+    --gt_path demo_scenes/mipnerf360/bicycle/sparse_150 \
+    --densify
 
 Pass ``--model`` to pick a different wrapper/ 3D foundation model (see
 ``wrapper/__init__.py``'s ``WRAPPERS`` registry for the full list).
@@ -89,6 +93,18 @@ def main():
         help="Skip --model and load a previous run from this dir (expects "
         "the COLMAP reconstruction + depths.pth). Uses EPO's disk path "
         "instead of the in-memory feed-forward path.",
+    )
+    parser.add_argument(
+        "--densify",
+        action="store_true",
+        help="After EPO, complete its sparse (edge-only) depth maps with "
+        "Any2Full and write a densified model to <output_path>/dense_<model>_epo.",
+    )
+    parser.add_argument(
+        "--densify_batch_size",
+        type=int,
+        default=4,
+        help="Images per Any2Full forward pass when --densify is set.",
     )
     parser.add_argument("--cuda_id", type=int, default=0)
     parser.add_argument(
@@ -177,7 +193,8 @@ def main():
         verbose=False,
         max_points_per_image=100_000 // max(len(epo.images), 1),
         save_points=True,
-        final_dbscan_filtering=False,
+        final_dbscan_filtering=args.densify,  # Any2Full's prompt: EPO's edge-only points
+        save_depth=args.densify,  # Any2Full's prompt: EPO's edge-only depths
     )
     for _write in deferred_writes:
         _write()
@@ -211,11 +228,36 @@ def main():
         )
 
         AUC_score_max, _, _ = eval_colmap_model(
-            epo_out, args.gt_path, return_df=True, thrs=thresholds
+            epo_out,
+            args.gt_path,
+            return_df=True,
+            thrs=thresholds,
         )
         print(
             f"{args.model + ' + EPO AUC:':<16}",
             [float(round(_, 2)) for _ in AUC_score_max],
+        )
+
+    # ── 4. Optional: densify EPO's edge-only depth maps ───────────────────
+    if args.densify:
+        # Imported here so the Any2Full repo's generic top-level `model` /
+        # `utils` packages only land on sys.path when densification is used.
+        from wrapper.any2full_wrapper import Any2FullWrapper, dense_output_path
+
+        del epo  # free GPU memory before loading Any2Full
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print("\nDensifying depths with Any2Full...")
+        densifier = Any2FullWrapper(cuda_id=args.cuda_id)
+        densifier.forward(
+            reconstruction_path=epo_out,
+            images_path=args.images_path,
+            batch_size=args.densify_batch_size,
+        )
+        print(
+            f"Densification time: {densifier.last_timings['run_any2full']:.2f} s "
+            f"-> {dense_output_path(epo_out)}"
         )
 
 

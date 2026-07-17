@@ -108,7 +108,7 @@ def dbscan_filter(reconstruction, eps=0.5, min_samples=20, verbose: bool = False
         new_frame.frame_id = old_frame.frame_id
         new_frame.rig_id = old_frame.rig_id
         new_frame.rig = filtered_reconstruction.rigs[old_frame.rig_id]
-        new_frame.set_cam_from_world(old_image.camera_id, old_image.cam_from_world)
+        new_frame.set_cam_from_world(old_image.camera_id, old_image.cam_from_world())
         new_frame.add_data_id(pycolmap.data_t(camera.sensor_id, old_image.image_id))
         filtered_reconstruction.add_frame(new_frame)
 
