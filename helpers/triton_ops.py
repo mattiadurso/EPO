@@ -277,12 +277,13 @@ def _project_sample_bwd_kernel(
     s_gr_b,  # batch stride of GR_ptr when FUSE_REDUCE ((B, n_tiles) layout)
     # Outputs
     GXYZ_ptr,  # (B, N, 3) grad_xyz_world (per-point)
-    PK_ptr,  # (B, n_tiles, 9) per-tile K-grad partials
-    PR_ptr,  # (B, n_tiles, 9) per-tile R-grad partials
-    PT_ptr,  # (B, n_tiles, 3) per-tile t-grad partials
+    PK_ptr,  # (B, n_groups, 9) per-group K-grad partials
+    PR_ptr,  # (B, n_groups, 9) per-group R-grad partials
+    PT_ptr,  # (B, n_groups, 3) per-group t-grad partials
     # Sizes
     B,
     N,
+    N_TILES,  # ceil(N / BLOCK_N) — bounds the inner tile loop
     # Strides
     s_xyzw_b,
     s_xyzw_n,
@@ -300,25 +301,27 @@ def _project_sample_bwd_kernel(
     BLOCK_N: tl.constexpr,
     FUSE_LOSS: tl.constexpr,
     FUSE_REDUCE: tl.constexpr,
+    TILES: tl.constexpr,
 ):
-    """Fused per-point bwd + per-tile K/R/t partial reductions.
+    """Fused per-point bwd + per-group K/R/t partial reductions.
 
-    Grid layout: ``(ceil(N / BLOCK_N), B)``. ``pid_n`` is fast-varying
+    Grid layout: ``(ceil(N_TILES / TILES), B)``. ``pid_g`` is fast-varying
     (axis 0 = CUDA ``blockIdx.x``) so consecutive blocks share ``pid_b``
     and reuse the per-batch K/P scalars and per-row (B, N) tensors in L1
-    — same locality argument as cycles 8/9. One tile of BLOCK_N points
-    per program; one row of (PK, PR, PT) partial sums per program.
-    """
-    pid_n = tl.program_id(0)
-    pid_b = tl.program_id(1)
-    n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    n_mask = n_offs < N
+    — same locality argument as cycles 8/9.
 
-    # ---- Load xyz_world (used for xc/yc/zc derive AND for grad_R sums) -
-    xyzw_row = pid_b * s_xyzw_b + n_offs * s_xyzw_n
-    x_w = tl.load(XYZW_ptr + xyzw_row + 0, mask=n_mask, other=0.0)
-    y_w = tl.load(XYZW_ptr + xyzw_row + 1, mask=n_mask, other=0.0)
-    z_w = tl.load(XYZW_ptr + xyzw_row + 2, mask=n_mask, other=0.0)
+    Each program walks ``TILES`` consecutive tiles of BLOCK_N points and
+    keeps the 21 K/R/t reduction operands in *vector* registers across
+    those tiles, so the 21 cross-lane ``tl.sum`` reductions run once per
+    program instead of once per tile. With one element per thread the
+    reductions are pure shuffle + shared-memory traffic (no serial
+    in-register accumulation to amortise them), and they dominated the
+    kernel: amortising them over TILES tiles measured ~1.5x on the kernel
+    in isolation. The win comes from doing less work, not from a
+    hardware-specific launch config, so it carries to other GPUs.
+    """
+    pid_g = tl.program_id(0)
+    pid_b = tl.program_id(1)
 
     # ---- Load P (R + t) once; reused for xc/yc/zc + grad_xyz_world -----
     Pb = P_ptr + pid_b * s_P_b
@@ -335,133 +338,171 @@ def _project_sample_bwd_kernel(
     R22 = tl.load(Pb + 10)
     t2 = tl.load(Pb + 11)
 
-    # ---- Recompute xc/yc/zc (same source expression as fwd) ------------
-    xc = R00 * x_w + R01 * y_w + R02 * z_w + t0
-    yc = R10 * x_w + R11 * y_w + R12 * z_w + t1
-    zc = R20 * x_w + R21 * y_w + R22 * z_w + t2
-
-    # ---- Mask + zc !inside-safe substitution ---------------------------
-    row = pid_b * s_dsdu_b + n_offs
-    inside_u8 = tl.load(MASK_ptr + row, mask=n_mask, other=0)
-    inside = inside_u8 != 0
-    # xc/yc are inherently finite (linear combo of finite world points);
-    # only zc needs the substitution so 1/zc stays finite.
-    zc = tl.where(inside, zc, 1.0)
-
-    # ---- Load grad_residuals + ds_du/ds_dv → grad_u/grad_v -------------
-    if FUSE_REDUCE:
-        # Upstream cotangent is per-tile (sum backward = broadcast): one
-        # scalar per program instead of a (B, N) load.
-        gr_tile = tl.load(GR_ptr + pid_b * s_gr_b + pid_n)
-        gr = tl.where(inside, gr_tile, 0.0)
-    else:
-        gr = tl.load(GR_ptr + row, mask=n_mask, other=0.0)
-        gr = tl.where(inside, gr, 0.0)
-    if FUSE_LOSS:
-        # Backward of the fused loss epilogue. Replicates torch autograd's
-        # tie rules exactly: the quadratic Huber branch is taken at
-        # r_c == δ, and clamp(max) passes gradient at r == clamp_max.
-        # (The quadratic branch's two autograd contributions sum to a
-        # single ``g · r_c`` bit-exactly — power-of-two scaling commutes
-        # with fp32 rounding.)
-        r = tl.load(RES_ptr + row, mask=n_mask, other=0.0)
-        r_c = tl.minimum(r, clamp_max)
-        gr = tl.where(r_c <= huber_delta, gr * r_c, gr * huber_delta)
-        gr = tl.where(r <= clamp_max, gr, 0.0)
-    ds_du = tl.load(DSDU_ptr + row, mask=n_mask, other=0.0)
-    ds_dv = tl.load(DSDV_ptr + row, mask=n_mask, other=0.0)
-    grad_u = gr * ds_du
-    grad_v = gr * ds_dv
-
-    # ---- K (fx, fy, cx, cy) + perspective divide -----------------------
+    # ---- K (fx, fy, cx, cy) -------------------------------------------
     Kb = K_ptr + pid_b * s_K_b
     fx = tl.load(Kb + 0)
     cx = tl.load(Kb + 2)
     fy = tl.load(Kb + 4)
     cy = tl.load(Kb + 5)
-    inv_z = 1.0 / zc
 
-    # ---- grad_xc/yc/zc — used for BOTH per-point AND partial sums ------
-    grad_xc = grad_u * fx * inv_z
-    grad_yc = grad_v * fy * inv_z
-    grad_zc = -(grad_u * fx * xc + grad_v * fy * yc) * inv_z * inv_z
+    # ---- Vector accumulators for the 21 partials -----------------------
+    aK00 = tl.zeros([BLOCK_N], tl.float32)
+    aK01 = tl.zeros([BLOCK_N], tl.float32)
+    aK02 = tl.zeros([BLOCK_N], tl.float32)
+    aK10 = tl.zeros([BLOCK_N], tl.float32)
+    aK11 = tl.zeros([BLOCK_N], tl.float32)
+    aK12 = tl.zeros([BLOCK_N], tl.float32)
+    aK20 = tl.zeros([BLOCK_N], tl.float32)
+    aK21 = tl.zeros([BLOCK_N], tl.float32)
+    aK22 = tl.zeros([BLOCK_N], tl.float32)
+    aR00 = tl.zeros([BLOCK_N], tl.float32)
+    aR01 = tl.zeros([BLOCK_N], tl.float32)
+    aR02 = tl.zeros([BLOCK_N], tl.float32)
+    aR10 = tl.zeros([BLOCK_N], tl.float32)
+    aR11 = tl.zeros([BLOCK_N], tl.float32)
+    aR12 = tl.zeros([BLOCK_N], tl.float32)
+    aR20 = tl.zeros([BLOCK_N], tl.float32)
+    aR21 = tl.zeros([BLOCK_N], tl.float32)
+    aR22 = tl.zeros([BLOCK_N], tl.float32)
+    aT0 = tl.zeros([BLOCK_N], tl.float32)
+    aT1 = tl.zeros([BLOCK_N], tl.float32)
+    aT2 = tl.zeros([BLOCK_N], tl.float32)
 
-    # ---- grad_xyz_world = R^T @ grad_xyz_cam (per-point output) --------
-    g_x = R00 * grad_xc + R10 * grad_yc + R20 * grad_zc
-    g_y = R01 * grad_xc + R11 * grad_yc + R21 * grad_zc
-    g_z = R02 * grad_xc + R12 * grad_yc + R22 * grad_zc
+    for it in tl.range(0, TILES):
+        pid_n = pid_g * TILES + it
+        # N_TILES need not divide evenly by TILES; the tail programs run
+        # with every lane masked off (and a masked GR load, which is a
+        # scalar and therefore not covered by ``n_mask``).
+        tile_ok = pid_n < N_TILES
+        n_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        n_mask = n_offs < N
 
-    # Defensive: mathematically zero for !inside (gr=0), but tl.where
-    # guards against any stray NaN coming through.
-    g_x = tl.where(inside, g_x, 0.0)
-    g_y = tl.where(inside, g_y, 0.0)
-    g_z = tl.where(inside, g_z, 0.0)
+        # ---- Load xyz_world (xc/yc/zc derive AND grad_R sums) ----------
+        xyzw_row = pid_b * s_xyzw_b + n_offs * s_xyzw_n
+        x_w = tl.load(XYZW_ptr + xyzw_row + 0, mask=n_mask, other=0.0)
+        y_w = tl.load(XYZW_ptr + xyzw_row + 1, mask=n_mask, other=0.0)
+        z_w = tl.load(XYZW_ptr + xyzw_row + 2, mask=n_mask, other=0.0)
 
-    gxyz_row = pid_b * s_gxyz_b + n_offs * s_gxyz_n
-    tl.store(GXYZ_ptr + gxyz_row + 0, g_x, mask=n_mask)
-    tl.store(GXYZ_ptr + gxyz_row + 1, g_y, mask=n_mask)
-    tl.store(GXYZ_ptr + gxyz_row + 2, g_z, mask=n_mask)
+        # ---- Recompute xc/yc/zc (same source expression as fwd) --------
+        xc = R00 * x_w + R01 * y_w + R02 * z_w + t0
+        yc = R10 * x_w + R11 * y_w + R12 * z_w + t1
+        zc = R20 * x_w + R21 * y_w + R22 * z_w + t2
 
-    # ---- Per-tile partial reductions (same operand sequence as the old
-    #      reduce kernel's per-tile sums) --------------------------------
-    X0 = xc * inv_z
-    X1 = yc * inv_z
-    X2 = zc * inv_z
-    u = fx * xc * inv_z + cx
-    v = fy * yc * inv_z + cy
-    guv = -(grad_u * u + grad_v * v)
+        # ---- Mask + zc !inside-safe substitution -----------------------
+        row = pid_b * s_dsdu_b + n_offs
+        inside_u8 = tl.load(MASK_ptr + row, mask=n_mask, other=0)
+        inside = inside_u8 != 0
+        # xc/yc are inherently finite (linear combo of finite world points);
+        # only zc needs the substitution so 1/zc stays finite.
+        zc = tl.where(inside, zc, 1.0)
 
-    pK00 = tl.sum(grad_u * X0, axis=0)
-    pK01 = tl.sum(grad_u * X1, axis=0)
-    pK02 = tl.sum(grad_u * X2, axis=0)
-    pK10 = tl.sum(grad_v * X0, axis=0)
-    pK11 = tl.sum(grad_v * X1, axis=0)
-    pK12 = tl.sum(grad_v * X2, axis=0)
-    pK20 = tl.sum(guv * X0, axis=0)
-    pK21 = tl.sum(guv * X1, axis=0)
-    pK22 = tl.sum(guv * X2, axis=0)
+        # ---- Load grad_residuals + ds_du/ds_dv → grad_u/grad_v ---------
+        if FUSE_REDUCE:
+            # Upstream cotangent is per-tile (sum backward = broadcast): one
+            # scalar per tile instead of a (B, N) load.
+            gr_tile = tl.load(GR_ptr + pid_b * s_gr_b + pid_n, mask=tile_ok, other=0.0)
+            gr = tl.where(inside, gr_tile, 0.0)
+        else:
+            gr = tl.load(GR_ptr + row, mask=n_mask, other=0.0)
+            gr = tl.where(inside, gr, 0.0)
+        if FUSE_LOSS:
+            # Backward of the fused loss epilogue. Replicates torch autograd's
+            # tie rules exactly: the quadratic Huber branch is taken at
+            # r_c == δ, and clamp(max) passes gradient at r == clamp_max.
+            # (The quadratic branch's two autograd contributions sum to a
+            # single ``g · r_c`` bit-exactly — power-of-two scaling commutes
+            # with fp32 rounding.)
+            r = tl.load(RES_ptr + row, mask=n_mask, other=0.0)
+            r_c = tl.minimum(r, clamp_max)
+            gr = tl.where(r_c <= huber_delta, gr * r_c, gr * huber_delta)
+            gr = tl.where(r <= clamp_max, gr, 0.0)
+        ds_du = tl.load(DSDU_ptr + row, mask=n_mask, other=0.0)
+        ds_dv = tl.load(DSDV_ptr + row, mask=n_mask, other=0.0)
+        grad_u = gr * ds_du
+        grad_v = gr * ds_dv
 
-    pR00 = tl.sum(grad_xc * x_w, axis=0)
-    pR01 = tl.sum(grad_xc * y_w, axis=0)
-    pR02 = tl.sum(grad_xc * z_w, axis=0)
-    pR10 = tl.sum(grad_yc * x_w, axis=0)
-    pR11 = tl.sum(grad_yc * y_w, axis=0)
-    pR12 = tl.sum(grad_yc * z_w, axis=0)
-    pR20 = tl.sum(grad_zc * x_w, axis=0)
-    pR21 = tl.sum(grad_zc * y_w, axis=0)
-    pR22 = tl.sum(grad_zc * z_w, axis=0)
+        inv_z = 1.0 / zc
 
-    pT0 = tl.sum(grad_xc, axis=0)
-    pT1 = tl.sum(grad_yc, axis=0)
-    pT2 = tl.sum(grad_zc, axis=0)
+        # ---- grad_xc/yc/zc — used for BOTH per-point AND partial sums --
+        grad_xc = grad_u * fx * inv_z
+        grad_yc = grad_v * fy * inv_z
+        grad_zc = -(grad_u * fx * xc + grad_v * fy * yc) * inv_z * inv_z
 
-    # ---- Store the 21 partials at slot (pid_b, pid_n, k) ---------------
-    pk_base = pid_b * s_pk_b + pid_n * s_pk_t
-    tl.store(PK_ptr + pk_base + 0, pK00)
-    tl.store(PK_ptr + pk_base + 1, pK01)
-    tl.store(PK_ptr + pk_base + 2, pK02)
-    tl.store(PK_ptr + pk_base + 3, pK10)
-    tl.store(PK_ptr + pk_base + 4, pK11)
-    tl.store(PK_ptr + pk_base + 5, pK12)
-    tl.store(PK_ptr + pk_base + 6, pK20)
-    tl.store(PK_ptr + pk_base + 7, pK21)
-    tl.store(PK_ptr + pk_base + 8, pK22)
+        # ---- grad_xyz_world = R^T @ grad_xyz_cam (per-point output) ----
+        g_x = R00 * grad_xc + R10 * grad_yc + R20 * grad_zc
+        g_y = R01 * grad_xc + R11 * grad_yc + R21 * grad_zc
+        g_z = R02 * grad_xc + R12 * grad_yc + R22 * grad_zc
 
-    pr_base = pid_b * s_pr_b + pid_n * s_pr_t
-    tl.store(PR_ptr + pr_base + 0, pR00)
-    tl.store(PR_ptr + pr_base + 1, pR01)
-    tl.store(PR_ptr + pr_base + 2, pR02)
-    tl.store(PR_ptr + pr_base + 3, pR10)
-    tl.store(PR_ptr + pr_base + 4, pR11)
-    tl.store(PR_ptr + pr_base + 5, pR12)
-    tl.store(PR_ptr + pr_base + 6, pR20)
-    tl.store(PR_ptr + pr_base + 7, pR21)
-    tl.store(PR_ptr + pr_base + 8, pR22)
+        # Defensive: mathematically zero for !inside (gr=0), but tl.where
+        # guards against any stray NaN coming through.
+        g_x = tl.where(inside, g_x, 0.0)
+        g_y = tl.where(inside, g_y, 0.0)
+        g_z = tl.where(inside, g_z, 0.0)
 
-    pt_base = pid_b * s_pt_b + pid_n * s_pt_t
-    tl.store(PT_ptr + pt_base + 0, pT0)
-    tl.store(PT_ptr + pt_base + 1, pT1)
-    tl.store(PT_ptr + pt_base + 2, pT2)
+        gxyz_row = pid_b * s_gxyz_b + n_offs * s_gxyz_n
+        tl.store(GXYZ_ptr + gxyz_row + 0, g_x, mask=n_mask)
+        tl.store(GXYZ_ptr + gxyz_row + 1, g_y, mask=n_mask)
+        tl.store(GXYZ_ptr + gxyz_row + 2, g_z, mask=n_mask)
+
+        # ---- Accumulate the 21 reduction operands in registers ---------
+        X0 = xc * inv_z
+        X1 = yc * inv_z
+        X2 = zc * inv_z
+        u = fx * xc * inv_z + cx
+        v = fy * yc * inv_z + cy
+        guv = -(grad_u * u + grad_v * v)
+
+        aK00 += grad_u * X0
+        aK01 += grad_u * X1
+        aK02 += grad_u * X2
+        aK10 += grad_v * X0
+        aK11 += grad_v * X1
+        aK12 += grad_v * X2
+        aK20 += guv * X0
+        aK21 += guv * X1
+        aK22 += guv * X2
+
+        aR00 += grad_xc * x_w
+        aR01 += grad_xc * y_w
+        aR02 += grad_xc * z_w
+        aR10 += grad_yc * x_w
+        aR11 += grad_yc * y_w
+        aR12 += grad_yc * z_w
+        aR20 += grad_zc * x_w
+        aR21 += grad_zc * y_w
+        aR22 += grad_zc * z_w
+
+        aT0 += grad_xc
+        aT1 += grad_yc
+        aT2 += grad_zc
+
+    # ---- Store the 21 partials at slot (pid_b, pid_g, k) ---------------
+    pk_base = pid_b * s_pk_b + pid_g * s_pk_t
+    tl.store(PK_ptr + pk_base + 0, tl.sum(aK00, axis=0))
+    tl.store(PK_ptr + pk_base + 1, tl.sum(aK01, axis=0))
+    tl.store(PK_ptr + pk_base + 2, tl.sum(aK02, axis=0))
+    tl.store(PK_ptr + pk_base + 3, tl.sum(aK10, axis=0))
+    tl.store(PK_ptr + pk_base + 4, tl.sum(aK11, axis=0))
+    tl.store(PK_ptr + pk_base + 5, tl.sum(aK12, axis=0))
+    tl.store(PK_ptr + pk_base + 6, tl.sum(aK20, axis=0))
+    tl.store(PK_ptr + pk_base + 7, tl.sum(aK21, axis=0))
+    tl.store(PK_ptr + pk_base + 8, tl.sum(aK22, axis=0))
+
+    pr_base = pid_b * s_pr_b + pid_g * s_pr_t
+    tl.store(PR_ptr + pr_base + 0, tl.sum(aR00, axis=0))
+    tl.store(PR_ptr + pr_base + 1, tl.sum(aR01, axis=0))
+    tl.store(PR_ptr + pr_base + 2, tl.sum(aR02, axis=0))
+    tl.store(PR_ptr + pr_base + 3, tl.sum(aR10, axis=0))
+    tl.store(PR_ptr + pr_base + 4, tl.sum(aR11, axis=0))
+    tl.store(PR_ptr + pr_base + 5, tl.sum(aR12, axis=0))
+    tl.store(PR_ptr + pr_base + 6, tl.sum(aR20, axis=0))
+    tl.store(PR_ptr + pr_base + 7, tl.sum(aR21, axis=0))
+    tl.store(PR_ptr + pr_base + 8, tl.sum(aR22, axis=0))
+
+    pt_base = pid_b * s_pt_b + pid_g * s_pt_t
+    tl.store(PT_ptr + pt_base + 0, tl.sum(aT0, axis=0))
+    tl.store(PT_ptr + pt_base + 1, tl.sum(aT1, axis=0))
+    tl.store(PT_ptr + pt_base + 2, tl.sum(aT2, axis=0))
 
 
 @triton.jit
@@ -781,17 +822,24 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
 
         BLOCK_N = 256
         n_tiles = triton.cdiv(N, BLOCK_N)
-        # Per-tile K/R/t partial reductions, combined sequentially below.
-        # Total partial buffer: 21 × B × n_tiles ≈ 4 MB at B=1024,
-        # n_tiles=48 — trivial vs the 250 MB of save-intermediates dropped.
-        partials_K = torch.empty((B, n_tiles, 9), device=device, dtype=dtype)
-        partials_R = torch.empty((B, n_tiles, 9), device=device, dtype=dtype)
-        partials_t = torch.empty((B, n_tiles, 3), device=device, dtype=dtype)
+        # Each bwd program covers TILES_PER_PROG tiles so the 21 cross-lane
+        # reductions are paid once per group instead of once per tile. The
+        # kernel-isolated speedup saturates at 2 (measured flat from 2 to
+        # 12), so 2 keeps the most independent programs — the safest choice
+        # on a GPU with more SMs than this one.
+        TILES_PER_PROG = 2
+        n_groups = triton.cdiv(n_tiles, TILES_PER_PROG)
+        # Per-group K/R/t partial reductions, combined sequentially below.
+        # Total partial buffer: 21 × B × n_groups ≈ 2 MB at B=1024,
+        # n_groups=24 — trivial vs the 250 MB of save-intermediates dropped.
+        partials_K = torch.empty((B, n_groups, 9), device=device, dtype=dtype)
+        partials_R = torch.empty((B, n_groups, 9), device=device, dtype=dtype)
+        partials_t = torch.empty((B, n_groups, 3), device=device, dtype=dtype)
 
-        # Match fwd kernel grid order: pid_n (axis 0) varies fastest so
+        # Match fwd kernel grid order: pid_g (axis 0) varies fastest so
         # consecutive blocks share a batch row and reuse per-row data in
         # L1 (cycle 9 locality argument).
-        grid = (n_tiles, B)
+        grid = (n_groups, B)
         with torch.cuda.device(device):
             _project_sample_bwd_kernel[grid](
                 xyz_world,
@@ -811,6 +859,7 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 partials_t,
                 B,
                 N,
+                n_tiles,
                 xyz_world.stride(0),
                 xyz_world.stride(1),
                 ds_du.stride(0),
@@ -827,6 +876,7 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 BLOCK_N=BLOCK_N,
                 FUSE_LOSS=ctx.fuse_loss,
                 FUSE_REDUCE=ctx.fuse_reduce,
+                TILES=TILES_PER_PROG,
                 # Same launch config as cycle 14 bwd — load chain grew by
                 # only xyz_world (3 loads) vs the dropped xc/yc/zc loads
                 # (also 3), so register pressure is similar. num_stages=3
@@ -851,7 +901,7 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 grad_K_flat,
                 grad_R_flat,
                 grad_t,
-                n_tiles,
+                n_groups,
                 partials_K.stride(0),
                 partials_K.stride(1),
                 partials_R.stride(0),

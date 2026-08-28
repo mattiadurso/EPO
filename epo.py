@@ -681,7 +681,22 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             )
 
         # store past poses for convergence evaluation
-        past_poses = self.poses.get_all_matrices().detach().clone()
+        past_poses = self.poses.get_all_matrices().detach()
+
+        # Fixed-lag async per-step stats: each step enqueues its
+        # (loss, err_q, err_t) as a non-blocking D2H copy into a pinned
+        # double buffer and consumes the PREVIOUS step's values. This
+        # replaces the per-step hard sync (.tolist()) with an event wait
+        # that is one step behind — the host runs a full iteration ahead
+        # of the GPU, so the GPU never drains between steps. Convergence
+        # decisions (early stop, the depth-phase switch) therefore fire
+        # one step later than with the synchronous read — an intentional,
+        # bounded semantics change.
+        _stats_pinned = [
+            torch.empty(3, dtype=self.dtype, pin_memory=True) for _ in range(2)
+        ]
+        _stats_events = [torch.cuda.Event(), torch.cuda.Event()]
+        _stats_pending = False  # becomes True after the first enqueue
 
         # Everything before this point is one-shot prologue work (rerun
         # init, GT/BA loading for visualization, the verbose banner). It is
@@ -813,34 +828,50 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             early_stop_start = time.perf_counter()
 
             # collect pose changes for convergence evaluation
-            current_poses = self.poses.get_all_matrices().detach().clone()
+            current_poses = self.poses.get_all_matrices().detach()
             err_qt = evaluate_pose_changes(
                 past_poses,
                 current_poses,
                 quantile=quantile,
             )
-            # Single GPU→CPU transfer for all per-step scalars (loss +
-            # rotation/translation change quantiles) instead of three
-            # separate .item() syncs.
-            loss_val, err_q, err_t = torch.cat([loss_det.reshape(1), err_qt]).tolist()
-            self.loss_list.append(loss_val)
-            max_err = max(err_q, err_t)
-            if self.verbose:
-                self.changes["q"].append(err_q)
-                self.changes["t"].append(err_t)
-                bar.set_postfix(
-                    loss=f"{loss_val:.4f}",
-                    auc5=(
-                        f"{self.auc_list['auc'][5][-1]:.4f}"
-                        if len(self.auc_list["auc"][5]) > 0
-                        else "n/a"
-                    ),
-                )
-            self.changes["max"].append(max_err)
-            self.changes["steps"].append(step)
+            # Enqueue this step's scalars (loss + rotation/translation
+            # change quantiles) as one non-blocking D2H copy into the
+            # pinned double buffer; the previous step's values are
+            # consumed below (fixed-lag — no per-step hard sync).
+            slot = step % 2
+            _stats_pinned[slot].copy_(
+                torch.cat([loss_det.reshape(1), err_qt]), non_blocking=True
+            )
+            _stats_events[slot].record()
             past_poses = current_poses
 
-            if not self.mlp_pose_convergence:
+            # Consume the previous step's scalars. Its event is a full
+            # iteration old, so this wait lets the host stay one step
+            # ahead of the GPU instead of draining it every iteration.
+            appended = False
+            if _stats_pending:
+                prev = 1 - slot
+                _stats_events[prev].synchronize()
+                loss_val, err_q, err_t = _stats_pinned[prev].tolist()
+                self.loss_list.append(loss_val)
+                max_err = max(err_q, err_t)
+                if self.verbose:
+                    self.changes["q"].append(err_q)
+                    self.changes["t"].append(err_t)
+                    bar.set_postfix(
+                        loss=f"{loss_val:.4f}",
+                        auc5=(
+                            f"{self.auc_list['auc'][5][-1]:.4f}"
+                            if len(self.auc_list["auc"][5]) > 0
+                            else "n/a"
+                        ),
+                    )
+                self.changes["max"].append(max_err)
+                self.changes["steps"].append(step - 1)
+                appended = True
+            _stats_pending = True
+
+            if appended and not self.mlp_pose_convergence:
                 mlp_pose_convergence = self.check_convergence(
                     list_of_changes=self.changes["max"],
                     window=window_pose,
@@ -863,7 +894,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                                 time.perf_counter() - optimization_start
                             )
 
-            elif self.mlp_pose_convergence:
+            elif appended and self.mlp_pose_convergence:
                 if early_stop == "pose":
                     if self.check_convergence(
                         list_of_changes=self.changes["max"],
@@ -903,6 +934,19 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 break
 
             self.completed_iterations += 1
+
+        # Drain the last step's stats (the fixed-lag consumer runs one
+        # step behind, so the final entry is still in the pinned buffer).
+        if _stats_pending:
+            slot = step % 2
+            _stats_events[slot].synchronize()
+            loss_val, err_q, err_t = _stats_pinned[slot].tolist()
+            self.loss_list.append(loss_val)
+            if self.verbose:
+                self.changes["q"].append(err_q)
+                self.changes["t"].append(err_t)
+            self.changes["max"].append(max(err_q, err_t))
+            self.changes["steps"].append(step)
 
         self._sync()
         self.timings["total_optimization"] = time.perf_counter() - optimization_start
