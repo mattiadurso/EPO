@@ -544,7 +544,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
     def forward(
         self,
-        batch_size=128,
+        batch_size=1024,
         quantile=0.95,
         window_pose=25,
         window_depth=50,
