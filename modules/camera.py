@@ -92,19 +92,33 @@ class CameraModule(BaseModule):
         return self.keys, self.get_intrinsic_matrix(self.keys)
 
     def get_intrinsic_matrix(self, indices) -> torch.Tensor:
-        """Return ``(B, 3, 3)`` intrinsic matrices for the given cameras."""
-        if isinstance(indices[0], str):
-            indices = self.map_names_to_indices(indices)
+        """Return ``(B, 3, 3)`` intrinsic matrices for the given cameras.
 
-        if self.cameras is not None:
-            return self.cameras[indices]
+        ``indices=None`` means "every camera, in storage order" and skips
+        the identity gathers (and their index_put backwards).
+        """
+        if indices is not None:
+            if isinstance(indices[0], str):
+                indices = self.map_names_to_indices(indices)
+
+            if self.cameras is not None:
+                return self.cameras[indices]
+        elif self.cameras is not None:
+            return self.cameras
 
         return self._build_K(indices)
 
-    def _build_K(self, tensor_indices: torch.Tensor) -> torch.Tensor:
-        """Compose ``(B, 3, 3)`` intrinsic matrices from base params + learned focal."""
-        params = self.k_params[tensor_indices]  # (B, 3): [f, cx, cy]
-        learn = self.params[tensor_indices]  # (B, 1): raw f or alpha
+    def _build_K(self, tensor_indices: torch.Tensor | None) -> torch.Tensor:
+        """Compose ``(B, 3, 3)`` intrinsic matrices from base params + learned focal.
+
+        ``tensor_indices=None`` selects every camera in storage order.
+        """
+        if tensor_indices is None:
+            params = self.k_params  # (B, 3): [f, cx, cy]
+            learn = self.params  # (B, 1): raw f or alpha
+        else:
+            params = self.k_params[tensor_indices]  # (B, 3): [f, cx, cy]
+            learn = self.params[tensor_indices]  # (B, 1): raw f or alpha
 
         if self.direct_backprop:
             f = learn[:, 0]
@@ -113,7 +127,7 @@ class CameraModule(BaseModule):
         cx = params[:, 1]
         cy = params[:, 2]
 
-        B = tensor_indices.shape[0]
+        B = params.shape[0]
         K = torch.zeros((B, 3, 3), dtype=params.dtype, device=self.device)
         K[:, 0, 0] = f
         K[:, 1, 1] = f
@@ -145,7 +159,7 @@ class CameraModule(BaseModule):
     def update_all_matrices(self) -> None:
         """Refresh the cached intrinsic matrices after parameters change."""
         self.cameras = None
-        self.cameras = self.get_intrinsic_matrix(self._all_indices)
+        self.cameras = self.get_intrinsic_matrix(None)
 
     def __repr__(self) -> str:
         """Return a short summary listing the first few cameras and their params."""

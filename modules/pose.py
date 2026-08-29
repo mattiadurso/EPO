@@ -14,6 +14,7 @@ SO(3).
 import torch
 import torch.nn as nn
 
+from helpers.cuda_graph_ops import capture_forward_backward
 from modules.base_module import BaseModule
 from modules.mlp import PoseRefinementMLP, gram_schmidt_rotation
 
@@ -159,6 +160,12 @@ class PoseModule(BaseModule):
         # re-mapping all names (dict lookups + H2D copy) every iteration.
         self._all_indices = torch.arange(num_cams, device=self.device)
 
+        # CUDA-graphed MLP (captured lazily on the first full-batch call).
+        # Disabled when the caller captures a larger block that contains it —
+        # a graph cannot be replayed inside another capture.
+        self._graphed_mlp = None
+        self.use_mlp_graph = True
+
         # Precompute all extrinsic matrices
         self.update_all_matrices()
 
@@ -210,35 +217,49 @@ class PoseModule(BaseModule):
     def get_rotation_matrix(self, indices) -> torch.Tensor:
         """Returns (B, 3, 3) rotation matrices for the requested images,
         re-orthonormalized via Gram-Schmidt so the result is always on SO(3).
+
+        ``indices=None`` means "every image, in storage order" and skips the
+        identity gather (see :meth:`get_projection_matrix`).
         """
         if self._R_orth is not None:  # frozen R: precomputed at init
-            return self._R_orth[indices]
-        return gram_schmidt_rotation(self.R_param[indices])
+            return self._R_orth if indices is None else self._R_orth[indices]
+        param = self.R_param if indices is None else self.R_param[indices]
+        return gram_schmidt_rotation(param)
 
     def get_translation(self, indices) -> torch.Tensor:
         """Returns (B, 3) Translation vectors"""
         # Apply scaling to the learnable parameter
+        if indices is None:
+            return self.t_param
         return self.t_param[indices]
 
     def get_translation_offset(self, indices) -> torch.Tensor:
         """Returns (B, 3) Translation vectors"""
         # Apply scaling to the learnable parameter
+        if indices is None:
+            return self.t_offset
         return self.t_offset[indices]
 
     def get_projection_matrix(self, indices) -> torch.Tensor:
         """Constructs 4x4 SE3 Matrix [R|t].
         Standard convention: World-to-Camera.
         """
-        batch_size = len(indices)
-        if isinstance(indices[0], str):
-            indices = self.map_names_to_indices(indices)
-
-        if self.poses is not None:
-            return self.poses[indices]
+        if indices is None:
+            # "every image, in storage order": every per-image fetch below
+            # is the identity, so skip them (each costs a copy plus a
+            # sort-based index_put in the backward).
+            if self.poses is not None:
+                return self.poses
+        else:
+            if isinstance(indices[0], str):
+                indices = self.map_names_to_indices(indices)
+            if self.poses is not None:
+                return self.poses[indices]
 
         # Retrieve components
         R = self.get_rotation_matrix(indices)  # (B, 3, 3)
         t = self.get_translation(indices)  # (B, 3)
+        batch_size = R.shape[0]
         R, t = self.apply_mlp(R, t, indices)
         t = t * self.t_scale + self.t_mean  # Rescale to physical units
 
@@ -248,6 +269,23 @@ class PoseModule(BaseModule):
         P[:, :3, 3] = t
 
         return P
+
+    def _graphed_mlp_callable(self, sample: torch.Tensor):
+        """Return the CUDA-graphed MLP, capturing it on first use.
+
+        The refinement MLP is tiny — 7 linear layers over (N_img, 12) — so
+        every step pays ~60 kernel launches for a few microseconds of GPU
+        work each, and at bs=1024 the loop is host-bound. See
+        :mod:`helpers.cuda_graph_ops` for what the capture has to work
+        around.
+        """
+        if self._graphed_mlp is None:
+            self._graphed_mlp = capture_forward_backward(
+                self.mlp,
+                (sample,),
+                autocast_dtype=torch.bfloat16 if self.use_amp else None,
+            )
+        return self._graphed_mlp
 
     def apply_mlp(self, R, t, indices) -> torch.Tensor:
         """Apply MLP refinement to given poses."""
@@ -260,12 +298,30 @@ class PoseModule(BaseModule):
         # ``MLP.forward`` opts the Gram-Schmidt orthonormalisation back out to
         # FP32 internally (cross products / normalisations there lose ~2 digits
         # in BF16 and would distort the rotation noticeably).
-        with torch.autocast(
-            device_type="cuda",
-            dtype=torch.bfloat16,
-            enabled=self.use_amp,
+        import os
+
+        if (
+            self.use_mlp_graph
+            and not os.environ.get("AR_NO_GRAPH")
+            and P_3x4.is_cuda
+            and torch.is_grad_enabled()
+            and P_3x4.shape[0] == self._all_indices.shape[0]
         ):
-            P_3x4_refined = self.mlp(P_3x4)
+            # The captured graph carries its own autocast state.
+            P_3x4_refined = self._graphed_mlp_callable(P_3x4)(P_3x4)
+        else:
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=self.use_amp,
+                # The cast cache must stay off: if this runs inside a CUDA
+                # graph capture, cached BF16 weight copies would be baked
+                # into the graph and never see an optimizer update. Casting
+                # the small MLP weights again each step is free and the
+                # values are identical either way.
+                cache_enabled=False,
+            ):
+                P_3x4_refined = self.mlp(P_3x4)
 
         # Autocast only forces matmul/conv inputs into BF16; the output dtype is
         # whatever the last op produced. Cast back explicitly so the Triton kernel
@@ -339,7 +395,7 @@ class PoseModule(BaseModule):
     def update_all_matrices(self):
         """Init/Update all extrinsic matrices for all images and store them internally."""
         self.poses = None  # Invalidate cache before recomputing
-        self.poses = self.get_projection_matrix(self._all_indices)
+        self.poses = self.get_projection_matrix(None)
 
     def get_all_matrices(self):
         """Get all extrinsic matrices for all images."""

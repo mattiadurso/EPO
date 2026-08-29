@@ -97,6 +97,10 @@ class ReconstructAndVizModule:
             )
             # Materialise the per-batch DT view for sample_distance_field.
             dt_fields = dt_fields_src[dt_indices]
+            # Same for the world points, which come back as source + indices.
+            xyz_indices = batch.pop("xyz_indices")
+            if xyz_indices is not None:
+                batch["xyz_world"] = batch["xyz_world"][xyz_indices]
             # Project edges and compute residuals
             edges_reprojected, _ = project_world_to_2D(**batch)
             residuals = sample_distance_field(dt_fields, edges_reprojected).squeeze(1)

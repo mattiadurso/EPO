@@ -30,6 +30,11 @@ from tqdm import tqdm
 
 from epo_modules import MiscModule, ReconstructAndVizModule
 from helpers.benchmark_pose import eval_colmap_model
+from helpers.cuda_graph_ops import (
+    StaticGraph,
+    capture_forward_backward,
+    leaf_parameters,
+)
 from helpers.frustum import build_view_graph_from_frustums
 from helpers.load import (
     find_images,
@@ -68,6 +73,42 @@ warnings.filterwarnings(
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+class _GeometryHead(nn.Module):
+    """The per-step geometry rebuild, as one capturable callable.
+
+    Recomputes the projection matrices, the intrinsic matrices and the
+    unprojected edge points from the current parameter values and returns
+    them. It exists purely so :meth:`EPO._geometry_step` can hand the whole
+    block (forward and backward) to ``capture_forward_backward``:
+    the work is tiny per kernel and dominated by launch dispatch.
+
+    The EPO reference is stored outside the module registry so its
+    submodules are not registered twice; ``parameters()`` is overridden to
+    expose exactly the leaves the captured backward must accumulate into.
+    """
+
+    def __init__(self, epo):
+        """Args: epo: the owning :class:`EPO` instance (not registered)."""
+        super().__init__()
+        object.__setattr__(self, "_epo", epo)
+
+    def parameters(self, recurse=True):
+        """Return the learnable leaves the captured block differentiates."""
+        epo = self._epo
+        return leaf_parameters((epo.poses, epo.intrinsics, epo.sampled_depth))
+
+    def forward(self):
+        """Return ``(P_all, K_all, points_3D)`` for every image."""
+        epo = self._epo
+        epo.poses.poses = None  # invalidate before recomputing
+        poses = epo.poses.get_projection_matrix(None)
+        epo.poses.poses = poses  # the unprojection below fetches it
+        epo.intrinsics.cameras = None
+        cameras = epo.intrinsics.get_intrinsic_matrix(None)
+        epo.intrinsics.cameras = cameras
+        return poses, cameras, epo.compute_edges_3D()
 
 
 class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
@@ -503,6 +544,15 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # (image_id, cam_id)
         self.images_cams_ids = torch.tensor(images_cams_ids).long().to(self.device)
 
+        # The per-step geometry rebuild is captured as a CUDA graph on first
+        # use (see _geometry_step); shapes are fixed for a run.
+        self._geometry_graph = None
+        self.use_geometry_graph = (
+            "cuda" in str(self.device)
+            and self.backend == "triton"
+            and not os.environ.get("AR_NO_GGRAPH")
+        )
+
         # ==========================================================================
         # Create optimizer
         if self.verbose:
@@ -681,7 +731,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             )
 
         # store past poses for convergence evaluation
-        past_poses = self.poses.get_all_matrices().detach()
+        # ``.clone()``: with the captured geometry graph the pose tensor is a
+        # static buffer that the next replay overwrites in place, so holding a
+        # reference would compare a step against itself.
+        past_poses = self.poses.get_all_matrices().detach().clone()
 
         # Fixed-lag async per-step stats: each step enqueues its
         # (loss, err_q, err_t) as a non-blocking D2H copy into a pinned
@@ -697,6 +750,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         ]
         _stats_events = [torch.cuda.Event(), torch.cuda.Event()]
         _stats_pending = False  # becomes True after the first enqueue
+        # Captured on the first step (see PoseChangeGraph): the convergence
+        # metric is all tiny kernels, so it is dispatch-bound, not GPU-bound.
+        _pose_change_graph = None
 
         # Everything before this point is one-shot prologue work (rerun
         # init, GT/BA loading for visualization, the verbose banner). It is
@@ -724,6 +780,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             total=self.max_num_iterations,
             initial=self.completed_iterations,
             desc="Optimizing",
+            # At ~300 it/s the default dynamic miniters makes tqdm consult the
+            # clock on nearly every iteration, which is ~2% of the step. A
+            # fixed stride keeps the bar smooth (~80 refreshes over a run)
+            # and turns the check into an integer compare.
+            miniters=25,
         )
         for step in bar:
             self._sync_for_timing()
@@ -732,12 +793,13 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             # Initialize optimizer gradients for all optimizers
             self.optimizers_zero_grad()
 
-            # Update geometric modules
-            self.poses.update_all_matrices()
-            self.intrinsics.update_all_matrices()
-
-            # Unproject point to world coordinates
-            self.unproject_edges_to_3D()
+            # Update geometric modules + unproject to world coordinates
+            if self.use_geometry_graph:
+                self._geometry_step()
+            else:
+                self.poses.update_all_matrices()
+                self.intrinsics.update_all_matrices()
+                self.unproject_edges_to_3D()
 
             # Sync so the queued GPU work above is actually finished before
             # we read the clock — without this, the kernel-launch overhead
@@ -828,12 +890,20 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             early_stop_start = time.perf_counter()
 
             # collect pose changes for convergence evaluation
-            current_poses = self.poses.get_all_matrices().detach()
-            err_qt = evaluate_pose_changes(
-                past_poses,
-                current_poses,
-                quantile=quantile,
-            )
+            current_poses = self.poses.get_all_matrices().detach().clone()
+            if _pose_change_graph is None:
+                # ~20 elementwise kernels plus a sort over (N_img,) values:
+                # microseconds of GPU work behind a few hundred of dispatch.
+                # The output aliases a static buffer consumed immediately
+                # below (copied into the pinned stats slot each step).
+                _pose_change_graph = StaticGraph(
+                    lambda past, present: evaluate_pose_changes(
+                        past, present, quantile=quantile
+                    ),
+                    current_poses,
+                    current_poses,
+                )
+            err_qt = _pose_change_graph(past_poses, current_poses)
             # Enqueue this step's scalars (loss + rotation/translation
             # change quantiles) as one non-blocking D2H copy into the
             # pinned double buffer; the previous step's values are
@@ -1091,16 +1161,29 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 (step, self.sampled_depth.scheduler.get_last_lr()[0])
             )
 
-    def unproject_edges_to_3D(self, batch_size=None):
-        """Unproject 2D edges to 3D points for all images as a batch."""
+    def compute_edges_3D(self, batch_size=None):
+        """Unproject every image's 2D edges to world points and return them."""
         image_names_id = self.images_cams_ids[:, 0]
         cam_ids = self.images_cams_ids[:, 1]
 
+        # This unprojects *every* image; when the id column is already storage
+        # order (the normal case) the per-image gathers are the identity, so
+        # pass None and skip them — each one costs a copy plus a sort-based
+        # index_put in the backward.
+        if not hasattr(self, "_image_ids_are_identity"):
+            self._image_ids_are_identity = bool(
+                torch.equal(
+                    image_names_id,
+                    torch.arange(len(image_names_id), device=image_names_id.device),
+                )
+            )
+        ids = None if self._image_ids_are_identity else image_names_id
+
         # indexing data
         K_batch = self.intrinsics.get_intrinsic_matrix(cam_ids)  # (B, 3, 3)
-        P_batch = self.poses.get_projection_matrix(image_names_id)  # (B, 4, 4)
-        edges_batch = self.edges_padded.get_parameters(image_names_id)  # (B, N, 2)
-        depth_batch = self.sampled_depth.get_parameters(image_names_id)  # (B, 1, H, W)
+        P_batch = self.poses.get_projection_matrix(ids)  # (B, 4, 4)
+        edges_batch = self.edges_padded.get_parameters(ids)  # (B, N, 2)
+        depth_batch = self.sampled_depth.get_parameters(ids)  # (B, 1, H, W)
 
         # Optionally chunk if batch too large for memory
         B = len(K_batch)
@@ -1123,9 +1206,15 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             )  # (bs, N, 3)
             points_3D_list.append(pts3d)
 
-        points_3D = torch.cat(points_3D_list, dim=0)
+        return torch.cat(points_3D_list, dim=0)
 
-        # Store points_3D in Edges3DModule
+    def unproject_edges_to_3D(self, batch_size=None):
+        """Unproject 2D edges to 3D for every image and store the result."""
+        points_3D = self.compute_edges_3D(batch_size)
+        self.store_edges_3D(points_3D)
+
+    def store_edges_3D(self, points_3D):
+        """Publish the unprojected points on the Edges3DModule."""
         if not hasattr(self, "edges_3D"):
             self.edges_3D = BaseModule(
                 image_id_map=self.image_id_map,
@@ -1136,6 +1225,39 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         else:
             self.edges_3D.params = points_3D
 
+    def _geometry_step(self):
+        """Rebuild poses, intrinsics and unprojected edges for this step.
+
+        The block is ~80 kernel launches of very small work — pure dispatch
+        cost — and its shapes are fixed for a run, so capture it once
+        (forward *and* backward) and replay. A replay runs the identical
+        kernels in the identical order, so values and gradients are
+        bit-identical to the eager path.
+        """
+        if self._geometry_graph is None:
+            head = _GeometryHead(self)
+            # The head subsumes the pose MLP, and a graph cannot be replayed
+            # inside another capture — so the MLP's own graph must go.
+            self.poses.use_mlp_graph = False
+            self.poses._graphed_mlp = None
+            try:
+                self._geometry_graph = capture_forward_backward(head)
+            except Exception as exc:  # noqa: BLE001 — capture is best-effort
+                logger.warning(
+                    "Geometry graph capture failed (%s); running eager.", exc
+                )
+                self.use_geometry_graph = False
+                self.poses.use_mlp_graph = True
+                self.poses.update_all_matrices()
+                self.intrinsics.update_all_matrices()
+                self.unproject_edges_to_3D()
+                return
+
+        poses, cameras, points_3D = self._geometry_graph()
+        self.poses.poses = poses
+        self.intrinsics.cameras = cameras
+        self.store_edges_3D(points_3D)
+
     def create_batched_inputs(self, sampled_viewgraph):
         """Prepare batched inputs for the batched optimization step given a list of pairs from the viewgraph."""
         images_names_ij = sampled_viewgraph[:, :2].reshape(-1)
@@ -1143,9 +1265,17 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         cam_ids = sampled_viewgraph[:, 2:].flip(1).reshape(-1)
 
         batch = {}
-        # 3D points in world coordinates and padd for left images
-        batch["xyz_world"] = self.edges_3D.get_parameters(images_names_ij)
-        pad_masks = self.pad_masks.get_parameters(images_names_ij)
+        # 3D points in world coordinates and padd for left images.
+        # Like the DT fields below, the points are passed as the *source*
+        # (N_img, N, 3) tensor + per-row image indices: the ~300 MB per-batch
+        # gather (and its sort-based index_put backward) never happens, and
+        # both backends read exactly the same values.
+        batch["xyz_world"] = self.edges_3D.params
+        batch["xyz_indices"] = images_names_ij
+        # Padding validity is per source image too, so the fused Triton path
+        # takes the source and reads it by index; the other paths need the
+        # materialised (B, N) view.
+        pad_masks = self.pad_masks.params
 
         # these are the intrinsics and poses for right images. Needed to project
         # 3D world points to the second image of the pair
@@ -1254,8 +1384,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     dt_indices=dt_indices,
                     border=0,
                     backend=self.backend,
+                    xyz_indices=batch["xyz_indices"],
                 )
-                valid_mask = pad_masks & inside_mask
+                valid_mask = pad_masks[batch["xyz_indices"]] & inside_mask
                 total_sum = torch.where(valid_mask, residuals, 0.0).sum(dim=1)
                 total_count = valid_mask.sum(dim=1)
             elif self.backend == "triton":
@@ -1280,6 +1411,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                         pad_masks,
                         clamp_max=clamp_max,
                         huber_delta=huber_delta,
+                        xyz_indices=batch["xyz_indices"],
                     )
                 else:
                     rho, valid_mask = project_sample_huber_triton(
@@ -1292,6 +1424,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                         pad_masks,
                         clamp_max=clamp_max,
                         huber_delta=huber_delta,
+                        xyz_indices=batch["xyz_indices"],
                     )
                     total_sum = rho.sum(dim=1)
                     total_count = valid_mask.sum(dim=1)
@@ -1305,10 +1438,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     dt_indices=dt_indices,
                     border=0,
                     backend=self.backend,
+                    xyz_indices=batch["xyz_indices"],
                 )
 
                 # compute loss over all residuals at once (no chunking)
-                valid_mask = pad_masks & inside_mask
+                valid_mask = pad_masks[batch["xyz_indices"]] & inside_mask
 
                 total_sum, total_count = compute_chunk_loss_logic(
                     residuals,

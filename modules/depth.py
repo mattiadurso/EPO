@@ -107,13 +107,21 @@ class DepthModule(BaseModule):
 
     def get_parameters(self, ids):
         """Return depth parameters - ensures gradient flow"""
-        indices = self.map_names_to_indices(ids) if isinstance(ids[0], str) else ids
+        if ids is None:
+            # "every image, in storage order": use the tensors as-is.
+            indices = None
+        else:
+            indices = self.map_names_to_indices(ids) if isinstance(ids[0], str) else ids
         if self.direct_backprop:
+            params = self.params if indices is None else self.params[indices]
             # z is learnable; (a, b) are frozen at identity, so no-op.
-            return torch.clamp(self.params[indices], min=self.min_depth)
+            return torch.clamp(params, min=self.min_depth)
         # Need to return depth, not inverse depth
-        z = self.depth[indices]
-        ab = self.params[indices]  # single gather instead of one per channel
+        if indices is None:
+            z, ab = self.depth, self.params
+        else:
+            z = self.depth[indices]
+            ab = self.params[indices]  # single gather instead of one per channel
         if self.per_pixel:
             a = ab[:, :, 0]
             b = ab[:, :, 1]

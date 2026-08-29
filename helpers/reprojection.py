@@ -772,6 +772,7 @@ def project_and_sample_logic(  # noqa: D417
     dt_indices: torch.Tensor | None = None,
     border: int = 0,
     backend: str = "torch",
+    xyz_indices: torch.Tensor | None = None,
 ):
     """Fused operation: Projection -> 2D -> Sampling.
     Guarantees no NaNs are produced. Invalid points are zeroed out and tracked via outside_mask.
@@ -785,6 +786,10 @@ def project_and_sample_logic(  # noqa: D417
             index in ``dt_fields``. When provided, the Triton backend reads
             ``dt_fields`` lazily and **never materialises a per-batch copy**;
             the torch backend gathers internally to feed ``F.grid_sample``.
+        xyz_indices: Optional ``(B,)`` int64 — when given, ``xyz_world`` is
+            the *source* ``(N_img, N, 3)`` tensor and row ``b`` reads image
+            ``xyz_indices[b]``. Same lazy-read trick as ``dt_indices``: the
+            Triton backend indexes in-kernel, the torch backend gathers here.
         backend: ``"torch"`` (default) uses the PyTorch chain
             ``project_world_to_2D → sample_distance_field``. ``"triton"``
             calls a fused Triton kernel with an analytical PyTorch backward;
@@ -801,7 +806,7 @@ def project_and_sample_logic(  # noqa: D417
         from helpers.triton_ops import project_and_sample_triton
 
         return project_and_sample_triton(
-            xyz_world, K1, P1, dt_fields, dt_indices, img1_shape
+            xyz_world, K1, P1, dt_fields, dt_indices, img1_shape, xyz_indices
         )
 
     if backend != "torch":
@@ -812,6 +817,8 @@ def project_and_sample_logic(  # noqa: D417
     # backend avoids this copy entirely.)
     if dt_indices is not None:
         dt_fields = dt_fields[dt_indices]
+    if xyz_indices is not None:
+        xyz_world = xyz_world[xyz_indices]
 
     # 1. Project World Points to 2D
     # uv_proj contains safe values (0.0) where points are invalid (outside,

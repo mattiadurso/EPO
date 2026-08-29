@@ -70,8 +70,13 @@ class BaseModule(nn.Module):
         """Returns parameters for the requested IDs.
 
         Args:
-            ids: Single ID (str/int), list, tuple, or tensor of IDs
+            ids: Single ID (str/int), list, tuple, or tensor of IDs, or ``None``
+                for "every image, in storage order" — which returns the
+                parameter tensor itself, skipping the identity gather (and its
+                sort-based index_put backward).
         """
+        if ids is None:
+            return self.params
         indices = self.map_names_to_indices(ids) if isinstance(ids[0], str) else ids
         return self.params[indices]
 
