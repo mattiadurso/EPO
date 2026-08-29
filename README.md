@@ -38,6 +38,13 @@
 
 
 ## Releases
+### v1.2 — EPO is now even faster 🚀
+
+The optimization loop was profiled and rebuilt around two findings: most of the per-step cost was *not* in the Triton kernels but in redundant data movement and in kernel-launch dispatch (~600 tiny launches per step). v1.2 removes both — edge points, DT fields, and pad masks are now read by image index directly inside the fused kernels, the geometry prologue (pose MLP → intrinsics → unprojection, forward *and* backward) is captured once as a CUDA graph and replayed, and the default batch size goes 128 → 1024.
+
+EPO is now **2.4× faster than v1.1** (133 → 318 it/s mean over the 38-scene benchmark set, RTX 4090) and **8.4× faster than the torch backend** wall-clock. On `bicycle` (MipNeRF360), the EPO optimization itself now takes ~5 s.
+
+Accuracy is preserved by construction: every change is bit-exact against the previous loop (same kernels, same FP order), verified by identical AUC@5/@3/@1 on all 38 benchmark scenes. The larger batch size can shift individual scenes slightly (the optimizer sees different mini-batch compositions), but dataset means stay within ±0.5 AUC@5. Kernel-level optimizations that measured faster but perturbed AUC (e.g. reduction-order changes) were deliberately rejected.
 
 ### v1.1 — Dense depth via Any2Full
 
