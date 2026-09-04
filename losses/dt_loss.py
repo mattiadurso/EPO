@@ -8,6 +8,8 @@ reduction used by the EPO forward pass (per-edge clamp → Huber → per-directi
 mean).
 """
 
+import warnings
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -48,8 +50,11 @@ def compute_distance_field(
         try:
             field = _distance_transform_l2_triton(edges_map)
             return field.to(device=device, dtype=dtype)
-        except Exception:
-            pass  # fall through to cv2 path
+        except Exception as exc:  # noqa: BLE001 — fall through to cv2 path
+            warnings.warn(
+                f"Triton distance transform failed ({exc!r}); falling back to "
+                "cv2.distanceTransform (slower, same values)."
+            )
 
     return _compute_distance_field_cv2_fallback(edges_map, device=device, dtype=dtype)
 

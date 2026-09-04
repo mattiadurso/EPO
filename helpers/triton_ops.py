@@ -466,9 +466,16 @@ def _project_sample_bwd_kernel(
         else:
             inside_u8 = tl.load(MASK_ptr + row, mask=n_mask, other=0)
             inside = inside_u8 != 0
-        # xc/yc are inherently finite (linear combo of finite world points);
-        # only zc needs the substitution so 1/zc stays finite.
+        # zc needs the substitution so 1/zc stays finite. The other operands
+        # of the K/R/t partial sums are zeroed too: a non-finite world point
+        # (it is !inside, gr = 0) would otherwise turn 0 * NaN into NaN and
+        # poison the whole row's grad_K / grad_P. Bit-exact for finite inputs.
         zc = tl.where(inside, zc, 1.0)
+        xc = tl.where(inside, xc, 0.0)
+        yc = tl.where(inside, yc, 0.0)
+        x_w = tl.where(inside, x_w, 0.0)
+        y_w = tl.where(inside, y_w, 0.0)
+        z_w = tl.where(inside, z_w, 0.0)
 
         # ---- Load grad_residuals + ds_du/ds_dv → grad_u/grad_v ---------
         if FUSE_REDUCE:

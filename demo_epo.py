@@ -132,6 +132,7 @@ def main():
         single_camera_per_folder=True,  # share one camera across all "<cam_id>/..." images.
         verbose=False,
         log_granular_time=False,
+        device=f"cuda:{args.cuda_id}",
     )
 
     # ── 1. Reconstruction → EPO init ─────────────────────────────────────

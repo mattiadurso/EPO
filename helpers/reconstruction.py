@@ -190,11 +190,13 @@ def build_reconstruction(
         # Get scale for this camera
         scale = camera_scales.get(cam_id, 1.0)
 
-        # Apply inverse scaling to focal lengths (scale back to original)
+        # Apply inverse scaling to focal lengths (scale back to original).
+        # The +0.5 undoes the pixel-centre convention shift of
+        # ``process_camera`` (EPO integer centres -> COLMAP half-integer).
         params = params.copy()
         params[0] /= scale  # f
-        params[1] /= scale  # cx
-        params[2] /= scale  # cy
+        params[1] = (params[1] + 0.5) / scale  # cx
+        params[2] = (params[2] + 0.5) / scale  # cy
         model = pycolmap.CameraModelId.SIMPLE_PINHOLE
 
         # Get image dimensions from first image with this cam_id
@@ -206,11 +208,16 @@ def build_reconstruction(
             warnings.warn(f"No images found for camera {cam_id}, skipping.")
             continue
 
-        height, width = sample_image["hw"]
-
-        # Scale image dimensions back to original
-        width = int(width / scale)
-        height = int(height / scale)
+        # Image dimensions at the original resolution. The disk loader keeps
+        # them in ``coords[4:6]``; ``int(hw / scale)`` truncates (e.g. 3286 ->
+        # 3284) and breaks tools that check camera dims against the files.
+        if "coords" in sample_image:
+            width = int(sample_image["coords"][4])
+            height = int(sample_image["coords"][5])
+        else:
+            height, width = sample_image["hw"]
+            width = int(round(width / scale))
+            height = int(round(height / scale))
 
         # Convert cam_id to int for COLMAP
         if isinstance(cam_id, str):
@@ -258,28 +265,34 @@ def build_reconstruction(
     #
     #    We keep a stable image_id -> name mapping so the points/track
     #    step below references the exact same ids.
+    #    Poses are fetched for all images in one batched call: per-image
+    #    calls each run the pose MLP + a GPU sync (~1 ms/image).
+    #
+    #    Translations (and the 3D points below) are exported as-is: EPO's
+    #    world frame is the input reconstruction's world frame (depth values
+    #    are never rescaled, and the image-resize scale cancels between the
+    #    pixel coordinates and the intrinsics), so only the intrinsics and
+    #    camera dims need to be brought back to the original resolution.
+    #    Dividing ``t`` by the per-image scale, as was done before, was a
+    #    similarity on uniform-resolution scenes but corrupted the relative
+    #    camera placement on mixed-resolution ones.
+    image_names = list(epo.images.keys())
+    R_all, t_all = epo.poses.get_image_Rt(image_names)
+    R_all = R_all.detach().cpu().numpy().astype(np.float64).reshape(-1, 3, 3)
+    t_all = t_all.detach().cpu().numpy().astype(np.float64).reshape(-1, 3)
+
     image_id_to_name = {}
-    for image_id, (image_name, image_data) in enumerate(epo.images.items(), start=1):
+    for image_id, image_name in enumerate(image_names, start=1):
+        image_data = epo.images[image_name]
         cam_id = image_data["cam_id"]
-        scale = image_data.get("scale", 1.0)
 
         # Convert cam_id to int for COLMAP
         cam_id_int = epo.intrinsics.image_to_tensor_idx[cam_id]
         camera = reconstruction.cameras[cam_id_int]
 
-        # Get rotation matrix and translation (R is already orthonormal).
-        # get_image_Rt takes a list and returns a batched result, so
-        # reshape to the strict (3, 3) / (3,) that Rotation3d / Rigid3d
-        # expect.
-        R, t = epo.poses.get_image_Rt([image_name])
-        R = R.detach().cpu().numpy().astype(np.float64).reshape(3, 3)
-        t = t.detach().cpu().numpy().astype(np.float64).reshape(3)
-
-        # Apply inverse scaling to translation (scale back to original)
-        t = t / scale
-
         cam_from_world = pycolmap.Rigid3d(
-            rotation=pycolmap.Rotation3d(R), translation=t
+            rotation=pycolmap.Rotation3d(R_all[image_id - 1]),
+            translation=t_all[image_id - 1],
         )
 
         # Frame holds the pose. set_cam_from_world dereferences the
@@ -319,7 +332,6 @@ def build_reconstruction(
         for _image_id, image_name in image_id_to_name.items():
             image_data = epo.images[image_name]
             cam_id = image_data["cam_id"]
-            scale = image_data.get("scale", 1.0)
 
             # Get unprojected 3D points from edges_3D module
             points_3D = epo.edges_3D.get_parameters([image_name])  # (1, N, 3)
@@ -348,9 +360,6 @@ def build_reconstruction(
                 valid_3D = valid_3D.detach().cpu().numpy()
             if torch.is_tensor(valid_indices):
                 valid_indices = valid_indices.detach().cpu().numpy()
-
-            # Scale points back to original resolution
-            valid_3D = valid_3D / scale
 
             # Sample uniformly up to max_points_per_image
             num_valid = len(valid_3D)

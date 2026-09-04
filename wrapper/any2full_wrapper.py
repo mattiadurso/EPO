@@ -180,10 +180,11 @@ class Any2FullWrapper:
         pattern against image structure.
 
         The depth map lives at the resolution EPO ran at, while the COLMAP
-        camera is at the original image resolution, so both the intrinsics and
-        the depth are converted by the ratio between the two (this mirrors
-        ``helpers.reconstruction.build_reconstruction``, which unprojects at
-        EPO's resolution and then divides the points by that same scale).
+        camera is at the original image resolution, so the intrinsics are
+        scaled into the depth map's pixel space. Depth values themselves are
+        already in the reconstruction's world units (EPO never rescales
+        depth, and ``helpers.reconstruction.build_reconstruction`` exports
+        poses and points in that same frame).
         """
         h, w = depth.shape[-2:]
         scale = 0.5 * (h / camera.height + w / camera.width)
@@ -200,9 +201,7 @@ class Any2FullWrapper:
             torch.arange(w, device=depth.device, dtype=depth.dtype),
             indexing="ij",
         )
-        # Depth is in EPO's scaled space; the reconstruction's translations are
-        # not, so bring z back to the reconstruction's world scale.
-        z = depth / scale
+        z = depth
         points_cam = torch.stack([(us - cx) / fx * z, (vs - cy) / fy * z, z], dim=-1)
 
         valid = torch.isfinite(z) & (z > 0)
@@ -282,7 +281,7 @@ class Any2FullWrapper:
         # one call, so only same-sized images can share a forward pass.
         by_size = defaultdict(list)
         for image in sorted(recon.images.values(), key=lambda im: im.name):
-            entry = depths.get(image.name.split(".")[0])
+            entry = depths.get(Path(image.name).with_suffix("").as_posix())
             if entry is None:
                 continue
             sparse = torch.as_tensor(entry["depth"]).squeeze()
@@ -316,7 +315,9 @@ class Any2FullWrapper:
                     for (image, _), depth, (_, rgb_uint8) in zip(
                         chunk, dense, loaded, strict=True
                     ):
-                        dense_depths[image.name.split(".")[0]] = {"depth": depth.cpu()}
+                        dense_depths[Path(image.name).with_suffix("").as_posix()] = {
+                            "depth": depth.cpu()
+                        }
                         points, colors = self._unproject(
                             depth,
                             rgb_uint8,

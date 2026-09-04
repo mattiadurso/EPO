@@ -31,9 +31,9 @@ from tqdm import tqdm
 from epo_modules import MiscModule, ReconstructAndVizModule
 from helpers.benchmark_pose import eval_colmap_model
 from helpers.cuda_graph_ops import (
+    GeometryHead,
     StaticGraph,
     capture_forward_backward,
-    leaf_parameters,
 )
 from helpers.frustum import build_view_graph_from_frustums
 from helpers.load import (
@@ -75,42 +75,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-class _GeometryHead(nn.Module):
-    """The per-step geometry rebuild, as one capturable callable.
-
-    Recomputes the projection matrices, the intrinsic matrices and the
-    unprojected edge points from the current parameter values and returns
-    them. It exists purely so :meth:`EPO._geometry_step` can hand the whole
-    block (forward and backward) to ``capture_forward_backward``:
-    the work is tiny per kernel and dominated by launch dispatch.
-
-    The EPO reference is stored outside the module registry so its
-    submodules are not registered twice; ``parameters()`` is overridden to
-    expose exactly the leaves the captured backward must accumulate into.
-    """
-
-    def __init__(self, epo):
-        """Args: epo: the owning :class:`EPO` instance (not registered)."""
-        super().__init__()
-        object.__setattr__(self, "_epo", epo)
-
-    def parameters(self, recurse=True):
-        """Return the learnable leaves the captured block differentiates."""
-        epo = self._epo
-        return leaf_parameters((epo.poses, epo.intrinsics, epo.sampled_depth))
-
-    def forward(self):
-        """Return ``(P_all, K_all, points_3D)`` for every image."""
-        epo = self._epo
-        epo.poses.poses = None  # invalidate before recomputing
-        poses = epo.poses.get_projection_matrix(None)
-        epo.poses.poses = poses  # the unprojection below fetches it
-        epo.intrinsics.cameras = None
-        cameras = epo.intrinsics.get_intrinsic_matrix(None)
-        epo.intrinsics.cameras = cameras
-        return poses, cameras, epo.compute_edges_3D()
-
-
 class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
     """Edge-based Pose Optimization (EPO).
 
@@ -143,7 +107,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         detector: Edge detector name (currently ``"canny"``).
         detector_params: Keyword arguments forwarded to the detector.
         device: Torch device to run on. Accepts ``"cuda"`` (current default
-            CUDA device), ``"cuda:N"`` for a specific GPU index, or ``"cpu"``.
+            CUDA device) or ``"cuda:N"`` for a specific GPU index. CPU is not
+            supported (the viewgraph filter and the loop need CUDA).
         max_workers: Max worker threads for parallel I/O. ``-1`` uses
             ``os.cpu_count()``.
         seed: Random seed for reproducibility.
@@ -258,6 +223,13 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         _ff_data=None,  # internal; set by `from_ff` to bypass disk loaders
     ):
         super().__init__()
+        # The viewgraph filter runs its Triton kernel unconditionally and the
+        # loop uses pinned memory / CUDA events / graphs: CPU is not supported.
+        if not torch.cuda.is_available() or torch.device(device).type != "cuda":
+            raise ValueError(
+                f"EPO requires a CUDA device (got device={device!r}, "
+                f"cuda available={torch.cuda.is_available()})."
+            )
         self.device = device
         self.dtype = torch.float32
 
@@ -329,25 +301,27 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.fuse_reduction = fuse_reduction
 
         # Edge extractor
-        # Default detector params used when caller passes ``detector_params=None``.
-        # Kept here (not as a mutable default arg) to avoid the shared-state bug.
-        if detector_params is None:
-            detector_params = {
-                "low_threshold": 0.15,
-                "high_threshold": 0.20,
-                "kernel_size": 9,
-                "sigma": 2,
-            }
+        # Default detector params; a caller's (possibly partial) dict overrides
+        # individual keys, so passing e.g. ``{"sigma": 3}`` keeps the other
+        # defaults instead of silently switching them to a second set.
+        detector_params = {
+            "low_threshold": 0.15,
+            "high_threshold": 0.20,
+            "hysteresis": True,
+            "kernel_size": 9,
+            "sigma": 2,
+            **(detector_params or {}),
+        }
 
         if detector == "canny":
             from extractors.canny import CannyEdgeDetector
 
             self.edge_extractor = CannyEdgeDetector(
-                low_threshold=detector_params.get("low_threshold", 0.20),
-                high_threshold=detector_params.get("high_threshold", 0.25),
-                hysteresis=detector_params.get("hysteresis", True),
-                kernel_size=detector_params.get("kernel_size", 7),
-                sigma=detector_params.get("sigma", 2.0),
+                low_threshold=detector_params["low_threshold"],
+                high_threshold=detector_params["high_threshold"],
+                hysteresis=detector_params["hysteresis"],
+                kernel_size=detector_params["kernel_size"],
+                sigma=detector_params["sigma"],
                 device=device,
                 verbose=verbose,
             )
@@ -411,6 +385,17 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             self.image_path_list = find_images(self.images_path, verbose=self.verbose)
             # loads image, coords, scale, hw into self.images[image_name]
             self._load_and_preprocess_images()
+            # Files on disk that the reconstruction does not register have no
+            # pose: drop them (with a notice) instead of failing later.
+            registered = {img.name for img in self.recon.images.values()}
+            extra = sorted(set(self.images) - registered)
+            if extra:
+                warnings.warn(
+                    f"{len(extra)} images under {self.images_path} are not in the "
+                    f"reconstruction and will be ignored (first: {extra[:5]})."
+                )
+                for name in extra:
+                    del self.images[name]
             self.num_images = len(self.images)
             if self.log_granular_time:
                 self.timings["load_images"] = time.perf_counter() - s_time
@@ -539,8 +524,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             for image_name in sorted(self.images.keys())
         ]
 
-        # (img1_id, img2_id, cam1_id, cam2_id)
-        self.viewgraph_ids = torch.tensor(viewgraph_ids).long().to(self.device)
+        # (img1_id, img2_id, cam1_id, cam2_id). ``.view(-1, 4)`` keeps the
+        # column structure for an empty viewgraph so ``forward`` reaches its
+        # explicit "no residuals" error instead of an IndexError.
+        self.viewgraph_ids = (
+            torch.tensor(viewgraph_ids).long().view(-1, 4).to(self.device)
+        )
         # (image_id, cam_id)
         self.images_cams_ids = torch.tensor(images_cams_ids).long().to(self.device)
 
@@ -603,6 +592,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         convergence_tol_depth=0.1,  # relative change %
         convergence_tol_loss=5e-4,  # relative change %
         early_stop="pose",
+        huber_delta=1.0,
+        clamp_start=10.0,
+        clamp_end=6.0,
         drop_last=False,
         debug=False,
         gt_path=None,
@@ -625,6 +617,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             convergence_tol_depth (float, optional): Tolerance for depth convergence. Default is 0.1. Not used when early_stop is False.
             convergence_tol_loss (float, optional): Relative-loss-change tolerance for early stop when ``early_stop="loss"``. Default is 5e-4.
             early_stop (str, optional): Whether to stop early if depth convergence is reached. Default is 'pose'.
+            huber_delta (float, optional): Huber threshold of the DT loss, in ``images_size`` pixels. Default is 1.0.
+            clamp_start (float, optional): Residual clamp (px) at step 0, annealed linearly to ``clamp_end`` over the first 1000 steps. It sets the capture radius (residuals above it get no gradient), so it stays loose for weak initializations. Default is 10.0.
+            clamp_end (float, optional): Residual clamp (px) after the anneal. Default is 6.0.
             drop_last (bool, optional): Whether to drop the last batch if smaller than batch_size. Default is False.
             debug (bool, optional): Whether to enable debug mode. Default is False.
             gt_path (str, optional): Path to the ground truth data. Default is None.
@@ -766,10 +761,18 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self._sync()
         optimization_start = time.perf_counter()
 
+        # In-loop AUC tracking (COLMAP export + model_aligner + GT parse) is
+        # a diagnostic, not optimization: its wall time is accumulated here
+        # and subtracted from `total_optimization`, otherwise the reported
+        # it/s depends on whether a gt_path was given (~0.1-1 s per export).
+        auc_time = 0.0
+
         # auc before optimization starts
         if gt_path is not None:
+            t_auc = time.perf_counter()
             self.to_colmap(opt, save_points=False, verbose=False)
             self.compute_auc(opt, gt_path, 0)
+            auc_time += time.perf_counter() - t_auc
 
         # Forward and backward loop
         # `step` must exist even if the loop body never runs (e.g. a second
@@ -816,6 +819,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 self.viewgraph_ids,
                 batch_size=batch_size,
                 drop_last=drop_last,
+                huber_delta=huber_delta,
+                clamp_start=clamp_start,
+                clamp_end=clamp_end,
                 step=step,
             )
 
@@ -870,8 +876,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             # before the loop — skip it here to avoid a duplicate export +
             # `colmap model_aligner` run and a doubled step-0 AUC entry)
             if gt_path is not None and step > 0 and step % self.auc_saving_freq == 0:
+                t_auc = time.perf_counter()
                 self.to_colmap(opt, save_points=False, verbose=False)
                 self.compute_auc(opt, gt_path, step)
+                auc_time += time.perf_counter() - t_auc
 
             # rerun tracking
             if use_rerun:
@@ -952,7 +960,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     self.mlp_pose_convergence = True
                     if log_t:
                         self.timings["pose_convergence_time"] = (
-                            time.perf_counter() - optimization_start
+                            time.perf_counter() - optimization_start - auc_time
                         )
                     logger.info(f"Pose convergence reached at step {step}.")
 
@@ -961,7 +969,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                         self.optim_convergence = True
                         if log_t:
                             self.timings["depth_convergence_time"] = (
-                                time.perf_counter() - optimization_start
+                                time.perf_counter() - optimization_start - auc_time
                             )
 
             elif appended and self.mlp_pose_convergence:
@@ -1019,7 +1027,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             self.changes["steps"].append(step)
 
         self._sync()
-        self.timings["total_optimization"] = time.perf_counter() - optimization_start
+        self.timings["total_optimization"] = (
+            time.perf_counter() - optimization_start - auc_time
+        )
 
         if use_rerun:
             rr_folder = os.path.join(rerun_save_path, "rerun")
@@ -1235,7 +1245,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         bit-identical to the eager path.
         """
         if self._geometry_graph is None:
-            head = _GeometryHead(self)
+            head = GeometryHead(self)
             # The head subsumes the pose MLP, and a graph cannot be replayed
             # inside another capture — so the MLP's own graph must go.
             self.poses.use_mlp_graph = False
@@ -1541,6 +1551,22 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         """
         intrinsics = {}
 
+        # Every registered image must have been loaded from `images_path`
+        # (names are relative to it, e.g. "1/IMG_001.jpg"), otherwise the
+        # pose/image join below fails with a bare KeyError.
+        missing = sorted(
+            img.name
+            for img in self.recon.images.values()
+            if img.name not in self.images
+        )
+        if missing:
+            raise ValueError(
+                f"{len(missing)}/{len(self.recon.images)} reconstruction images "
+                f"were not found under {self.images_path} (first: {missing[:5]}). "
+                f"Loaded names look like {next(iter(self.images), None)!r}; check "
+                "that images_path is the folder the reconstruction was built from."
+            )
+
         # Read cameras intrinsics
         if self.single_camera_per_folder:
             # Reading cameras from images (to handle multiple images with same camera)
@@ -1676,25 +1702,44 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             dtype=self.dtype,
             device=self.device,
         )
-        # check all depths have the same size
-        depth_shapes = set()
+        missing = [n for n, d in self.images.items() if "depth" not in d]
+        if missing:
+            raise ValueError(
+                f"{len(missing)}/{len(self.images)} images have no entry in "
+                f"{self.depths_path} (keys are the image names without extension). "
+                f"First missing: {missing[:5]}"
+            )
+        for image_name, data in self.images.items():
+            if tuple(data["depth"].shape[-2:]) != tuple(data["hw"]):
+                raise ValueError(
+                    f"{image_name}: depth {tuple(data['depth'].shape[-2:])} does "
+                    f"not match the resized image {tuple(data['hw'])}"
+                )
+        self._pad_depths_to_common_shape()
+
+    def _pad_depths_to_common_shape(self):
+        """Bottom/right NaN-pad the depth maps so they stack into one tensor.
+
+        Mixed-aspect scenes have per-image ``hw``; the pad is NaN so the
+        padded region is invalid depth (never a real edge, never a valid
+        reprojection target for the viewgraph filter).
+        """
+        depth_shapes = {tuple(d["depth"].shape[-2:]) for d in self.images.values()}
+        if len(depth_shapes) <= 1:
+            return
+        max_h = max(shape[0] for shape in depth_shapes)
+        max_w = max(shape[1] for shape in depth_shapes)
         for image_name in self.images.keys():
-            depth_shapes.add(self.images[image_name]["depth"].shape[-2:])
-        if len(depth_shapes) > 1:
-            # pad bottom right to make them equal
-            max_h = max([shape[0] for shape in depth_shapes])
-            max_w = max([shape[1] for shape in depth_shapes])
-            for image_name in self.images.keys():
-                depth = self.images[image_name]["depth"]
-                h, w = depth.shape[-2:]
-                if h < max_h or w < max_w:
-                    pad_bottom = max_h - h
-                    pad_right = max_w - w
-                    pad = (0, pad_right, 0, pad_bottom)  # left, right, top, bottom
-                    depth = F.pad(depth, pad, mode="constant", value=torch.nan)
-                    self.images[image_name]["depth"] = depth.to(
-                        self.device, dtype=self.dtype
-                    )
+            depth = self.images[image_name]["depth"]
+            h, w = depth.shape[-2:]
+            if h < max_h or w < max_w:
+                pad_bottom = max_h - h
+                pad_right = max_w - w
+                pad = (0, pad_right, 0, pad_bottom)  # left, right, top, bottom
+                depth = F.pad(depth, pad, mode="constant", value=torch.nan)
+                self.images[image_name]["depth"] = depth.to(
+                    self.device, dtype=self.dtype
+                )
 
     def _populate_from_ff(self, ff_data):
         """Populate ``self.images``, ``self.poses``, ``self.intrinsics`` from
@@ -1706,7 +1751,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         - ``"image"``: ``(3, H, W)`` float tensor in [0, 1]
         - ``"depth"``: ``(H, W)`` float tensor
         - ``"pose"``: ``(3, 4)`` or ``(4, 4)`` world-to-camera matrix (T_cw)
-        - ``"intrinsic"``: ``(3, 3)`` pinhole intrinsics matrix
+        - ``"intrinsic"``: ``(3, 3)`` pinhole intrinsics matrix, in COLMAP's
+          pixel convention (centre of pixel ``i`` at ``i + 0.5``)
         - ``"confidence"`` (optional): ``(H, W)`` float tensor
 
         Images and depths must already be at ``self.images_size``. Cameras
@@ -1764,14 +1810,19 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
             R_list.append(pose[:3, :3].contiguous())
             t_list.append(pose[:3, 3].reshape(3, 1).contiguous())
-            # PINHOLE params [fx, fy, cx, cy] taken from K as provided. The
-            # VGGT wrapper supplies the disk path's convention (principal
-            # point at the float image centre, see `process_camera`).
+            # PINHOLE params [fx, fy, cx, cy] taken from K, which the
+            # wrappers supply in COLMAP's pixel convention on the resized
+            # frame (principal point at the float image centre); the -0.5
+            # moves it to EPO's integer-centre grid, as `process_camera`
+            # does for the disk path.
             cam_params.setdefault(cam_id, []).append(
-                torch.stack([K[0, 0], K[1, 1], K[0, 2], K[1, 2]])
+                torch.stack([K[0, 0], K[1, 1], K[0, 2] - 0.5, K[1, 2] - 0.5])
             )
 
         self.num_images = len(self.images)
+        # Mixed-aspect inputs: same bottom/right NaN pad as the disk path so
+        # the depth maps stack for the viewgraph filter.
+        self._pad_depths_to_common_shape()
 
         # Build CameraModule: one entry per unique cam_id, init params averaged
         # over the images that share it (shared cameras are optimized jointly).
@@ -1806,6 +1857,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             grad_t=self.grad_t,
             grad_t_offset=self.grad_t_offset,
             mlp_lr=self.mlp_pose_lr,
+            hidden_dim=self.mlp_hidden_dim,
             use_mlp=self.use_mlp_pose_refinement,
             use_amp=self.use_amp,
             max_num_iterations=self.max_num_iterations,
@@ -1872,9 +1924,13 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             # Build sequential viewgraph based on sorted image names with a window size of 10
             image_names = sorted(list(self.images.keys()))
             viewgraph = []
-            for i in range(len(image_names) - self.sequential_matcher_window):
-                for j in range(1, self.sequential_matcher_window + 1):
-                    viewgraph.append((image_names[i], image_names[i + j]))
+            # Every image pairs with the next `window` images; the range is
+            # clipped at the end so the last `window` images still pair among
+            # themselves (stopping the outer loop early dropped those pairs).
+            for i in range(len(image_names)):
+                stop = min(i + self.sequential_matcher_window + 1, len(image_names))
+                for j in range(i + 1, stop):
+                    viewgraph.append((image_names[i], image_names[j]))
             # Sequential matching uses looser filtering; mirror the values on
             # self so training_logs.json records what was actually used.
             min_points = self.min_points = 200
@@ -2044,14 +2100,17 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             edges_padded = self.images[image_name]["edges_padded"]  # (N, 2)
             depth = self.images[image_name]["depth"]  # (H, W)
             sampled_depth, _ = grid_sample_nan(edges_padded[None], depth[None])
-            # if invalid points set at 0,0 have nan depth, then I'll have sampled depth as nan.
-            # fill with zeros, these points will be masked out during optimization anyway
-            sampled_depth = torch.where(
-                torch.isnan(sampled_depth),
-                torch.zeros_like(sampled_depth) + 1e-6,
-                sampled_depth,
+            sampled_depth = sampled_depth.squeeze()
+            # An edge with a NaN/inf/non-positive depth (NaN-padded or masked
+            # depth maps, models that mark invalid pixels with 0) cannot be
+            # unprojected: fold it into the pad mask so it is skipped by the
+            # loss like a padding entry. The stored value only has to be a
+            # finite positive placeholder for the (masked) unprojection.
+            valid_depth = torch.isfinite(sampled_depth) & (sampled_depth > 0)
+            self.images[image_name]["pad_mask"] *= valid_depth.to(self.dtype)
+            self.images[image_name]["sampled_depth"] = torch.where(
+                valid_depth, sampled_depth, torch.full_like(sampled_depth, 1e-6)
             )
-            self.images[image_name]["sampled_depth"] = sampled_depth.squeeze()
 
     def _pad_edges(self):
         """Pad all edges to have same number (max_edges) of edges per image."""
@@ -2145,9 +2204,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     pad_bottom = max_h - h
                     pad_right = max_w - w
                     pad = (0, pad_right, 0, pad_bottom)  # left, right, top, bottom
-                    dt_field = F.pad(
-                        dt_field, pad, mode="constant", value=dt_field.max()
-                    )
+                    # Replicate (not a constant): the bilinear sampler reads
+                    # one pixel past the real border for points inside the
+                    # last row/column, so a constant pad value would leak
+                    # into their residual and gradient. Replication gives the
+                    # same border-clamp semantics as an unpadded field.
+                    dt_field = F.pad(dt_field[None], pad, mode="replicate")[0]
                     self.images[image_name]["dt_field"] = dt_field
 
         gc.collect()
@@ -2183,7 +2245,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # Single bulk GPU→CPU transfer instead of one .item() per pair.
         self.mre = residuals.view(-1, 2).mean(dim=1).cpu().numpy()
 
-        pairs = sampled_viewgraphs[0][:, :2].tolist()
+        # All batches, not just the first: with more than 10k pairs the
+        # residuals span several batches.
+        pairs = torch.cat(sampled_viewgraphs, dim=0)[:, :2].tolist()
         return [
             (
                 self.poses.tensor_idx_to_image[i],

@@ -12,6 +12,7 @@ import random
 import shutil
 import subprocess
 import warnings
+from pathlib import Path
 
 import matplotlib.cm as cm
 import matplotlib.pyplot as plt
@@ -322,6 +323,19 @@ class ReconstructAndVizModule:
         """
         # Clear any previous export. shutil instead of `rm -rf {path}/*` shell
         # interpolation, which breaks on spaces and is dangerous on odd paths.
+        # Never wipe one of the input folders (e.g. `to_colmap(reconstruction_path)`).
+        out_real = os.path.realpath(output_path)
+        for src in (self.reconstruction_path, self.images_path, self.depths_path):
+            if src is None:
+                continue
+            src_real = os.path.realpath(src)
+            if os.path.isfile(src_real):
+                src_real = os.path.dirname(src_real)
+            if out_real == src_real or src_real.startswith(out_real + os.sep):
+                raise ValueError(
+                    f"to_colmap output_path {output_path!r} would delete the "
+                    f"input folder {src!r}; choose a different output path."
+                )
         if os.path.isdir(output_path):
             shutil.rmtree(output_path)
         os.makedirs(output_path, exist_ok=True)
@@ -389,7 +403,9 @@ class ReconstructAndVizModule:
 
                 # populate hw_array at edges location with depth values
                 hw_array[edges[:, 1], edges[:, 0]] = depth
-                depths_out[image_name.split(".")[0]] = {"depth": hw_array}
+                depths_out[Path(image_name).with_suffix("").as_posix()] = {
+                    "depth": hw_array
+                }
 
             torch.save(depths_out, os.path.join(output_path, "depths.pth"))
 

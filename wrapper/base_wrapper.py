@@ -183,6 +183,8 @@ class BaseWrapper:
             # Decode → CHW uint8 RGB, same decoder + fallback as the disk path.
             try:
                 rgb = read_image(entry["image_path"], mode=ImageReadMode.UNCHANGED)
+                if rgb.dtype == torch.uint16:  # 16-bit PNG: keep the high byte
+                    rgb = (rgb >> 8).to(torch.uint8)
                 if rgb.shape[0] == 1:
                     rgb = rgb.expand(3, -1, -1).contiguous()
                 elif rgb.shape[0] == 4:

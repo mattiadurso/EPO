@@ -84,6 +84,10 @@ def _decode_image_rgb_chw_uint8(image_path: str) -> torch.Tensor:
         img = read_image(image_path, mode=ImageReadMode.UNCHANGED)
     except RuntimeError:
         return _decode_via_pil(image_path)
+    if img.dtype == torch.uint16:
+        # Newer torchvision decodes 16-bit PNGs instead of refusing them; the
+        # /255 below would then leave values in [0, 257]. Keep the high byte.
+        img = (img >> 8).to(torch.uint8)
 
     c = img.shape[0]
     if c == 1:
@@ -239,11 +243,13 @@ def _process_single_depth(
 ):
     """Helper function to process a single depth map.
 
-    Looks the entry up in ``depth_data`` (a dict keyed by image stem), crops to
-    match the original image dimensions (center crop if depth is larger), then
-    resizes it to match the preprocessed image exactly.
+    Looks the entry up in ``depth_data`` (a dict keyed by the image name
+    without its extension), un-letterboxes it if needed, then resizes it to
+    match the preprocessed image exactly.
     """
-    entry = depth_data.get(image_name.split(".")[0])
+    # ``with_suffix`` (not ``split(".")[0]``) so dotted names such as
+    # ``frame.0001.png`` keep their stem; matches the wrappers' writer.
+    entry = depth_data.get(Path(image_name).with_suffix("").as_posix())
     if entry is None:
         return image_name, None, None
 
@@ -264,101 +270,59 @@ def _process_single_depth(
     else:
         confidence_tensor = None
 
-    # Get original image dimensions from image_info
-    # coords stores [x1, y1, x2, y2, orig_width, orig_height]
+    # Size of the resized (unpadded) image, computed exactly as in
+    # _process_single_image. coords stores [x1, y1, x2, y2, orig_w, orig_h].
     orig_w = int(image_info["coords"][4].item())
     orig_h = int(image_info["coords"][5].item())
-    # scale according to target size
     scale = target_size / max(orig_w, orig_h)
-    orig_w, orig_h = int(orig_w * scale), int(orig_h * scale)
+    new_w, new_h = int(orig_w * scale), int(orig_h * scale)
 
-    # Get depth map dimensions
     depth_h, depth_w = depth_tensor.shape[-2:]
 
-    # If depth map is larger than the original image, center crop to original image size
-    if depth_h > orig_h or depth_w > orig_w:
-        crop_top = max((depth_h - orig_h) // 2, 0)
-        crop_left = max((depth_w - orig_w) // 2, 0)
-        crop_h = min(orig_h, depth_h)
-        crop_w = min(orig_w, depth_w)
-
-        depth_tensor = depth_tensor[
-            :,
-            :,
-            crop_top : crop_top + crop_h,
-            crop_left : crop_left + crop_w,
-        ]
+    # A square depth map for a non-square image is a letterbox (VGGT family
+    # pads the input to a square): center-crop it to the image's aspect ratio
+    # in the depth map's own pixels. Any other size difference (full-res
+    # depth, a model that crops to a multiple of 14, ...) is handled by the
+    # resize below, which stretches the map onto the image like the image
+    # itself was.
+    if depth_h == depth_w and new_h != new_w:
+        if new_w > new_h:
+            crop_h = round(depth_h * new_h / new_w)
+            crop_top = (depth_h - crop_h) // 2
+            rows, cols = slice(crop_top, crop_top + crop_h), slice(None)
+        else:
+            crop_w = round(depth_w * new_w / new_h)
+            crop_left = (depth_w - crop_w) // 2
+            rows, cols = slice(None), slice(crop_left, crop_left + crop_w)
+        depth_tensor = depth_tensor[:, :, rows, cols]
         if confidence_tensor is not None:
-            confidence_tensor = confidence_tensor[
-                :,
-                :,
-                crop_top : crop_top + crop_h,
-                crop_left : crop_left + crop_w,
-            ]
-    else:
-        # Depth map is smaller than (or equal to) the original image: leave it
-        # as-is here; the resize step below brings it to the target size.
-        pass
+            confidence_tensor = confidence_tensor[:, :, rows, cols]
 
-    # Now depth_tensor should correspond to the original image content.
-    # Resize it exactly the same way the image was resized.
-    depth_h, depth_w = depth_tensor.shape[-2:]
+    def _resize(t, size):
+        if tuple(t.shape[-2:]) == tuple(size):
+            return t
+        return F.interpolate(t, size=size, mode="bilinear", align_corners=False)
+
+    # Bring the depth onto the resized image grid.
+    depth_tensor = _resize(depth_tensor, (new_h, new_w))
+    if confidence_tensor is not None:
+        confidence_tensor = _resize(confidence_tensor, (new_h, new_w))
 
     if load_with_pad:
-        # Pad to square (same logic as image loading)
-        max_dim = max(depth_h, depth_w)
-
-        pad_h = max_dim - depth_h
-        pad_w = max_dim - depth_w
-
+        # Pad to square around the image content (same placement as the
+        # image loader), NaN = invalid depth, then resize to the square target.
+        max_dim = max(new_h, new_w)
+        pad_h = max_dim - new_h
+        pad_w = max_dim - new_w
         # Symmetric pad: (left, right, top, bottom)
         pad = (pad_w // 2, pad_w - pad_w // 2, pad_h // 2, pad_h - pad_h // 2)
-
-        # Use NaN for invalid depth padding
         depth_tensor = F.pad(depth_tensor, pad, mode="constant", value=float("nan"))
+        depth_tensor = _resize(depth_tensor, (target_size, target_size))
         if confidence_tensor is not None:
             confidence_tensor = F.pad(
                 confidence_tensor, pad, mode="constant", value=0.0
             )
-
-        # Resize to target size (square)
-        depth_tensor = F.interpolate(
-            depth_tensor,
-            size=(target_size, target_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-        if confidence_tensor is not None:
-            confidence_tensor = F.interpolate(
-                confidence_tensor,
-                size=(target_size, target_size),
-                mode="bilinear",
-                align_corners=False,
-            )
-    else:
-        # Resize preserving aspect ratio such that longest edge is target_size
-        # This matches the logic in _process_single_image
-        if depth_w >= depth_h:
-            scale = target_size / depth_w
-        else:
-            scale = target_size / depth_h
-
-        new_h = int(depth_h * scale)
-        new_w = int(depth_w * scale)
-
-        depth_tensor = F.interpolate(
-            depth_tensor,
-            size=(new_h, new_w),
-            mode="bilinear",
-            align_corners=False,
-        )
-        if confidence_tensor is not None:
-            confidence_tensor = F.interpolate(
-                confidence_tensor,
-                size=(new_h, new_w),
-                mode="bilinear",
-                align_corners=False,
-            )
+            confidence_tensor = _resize(confidence_tensor, (target_size, target_size))
 
     # Remove batch and channel dimensions
     depth_tensor = depth_tensor.squeeze()
@@ -499,10 +463,15 @@ def process_camera(camera, load_with_pad: bool = False, images_size: int = 518):
     # Scale factor after resize
     scale = images_size / max_dim
 
-    # Apply padding shift + scale
+    # Apply padding shift + scale, then move from COLMAP's pixel convention
+    # (centre of pixel i at i + 0.5) to EPO's (edge coordinates are integer
+    # pixel indices, i.e. centre of pixel i at i). The resize keeps the
+    # half-integer convention (torchvision/F.interpolate, antialias on), so
+    # the half-pixel shift is applied once, in the working frame.
+    # ``build_reconstruction`` undoes it on export.
     f = f * scale
-    cx = (cx + pad_x) * scale
-    cy = (cy + pad_y) * scale
+    cx = (cx + pad_x) * scale - 0.5
+    cy = (cy + pad_y) * scale - 0.5
 
     params = torch.cat([f.flatten(), torch.tensor([cx, cy])], dim=0)
     return cam_id, model, params

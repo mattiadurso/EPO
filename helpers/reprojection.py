@@ -406,9 +406,13 @@ def filter_viewgraph_by_reprojection_batched(
         [name_to_idx[p[1]] for p in viewgraph], device=device, dtype=torch.long
     )
 
-    first_img_name = image_names[0]
+    # Sample the grid over the stacked (padded) depth canvas rather than the
+    # first image's shape: on mixed-aspect scenes a grid sized on image 0
+    # under-covers larger / rotated images and biases their pair counts low.
+    # Points in another image's NaN pad, or within `border` of its own real
+    # edge, are dropped per row below.
     grid = create_grid(
-        images[first_img_name]["image"], sampling_factor=sampling_factor, border=border
+        all_depths_stacked, sampling_factor=sampling_factor, border=border
     ).to(device)[None]
 
     num_pairs = len(viewgraph)
@@ -469,8 +473,13 @@ def filter_viewgraph_by_reprojection_batched(
         border_mask_x = (kpts1[..., 0] > border) & (kpts1[..., 0] < W_j - border)
         border_mask_y = (kpts1[..., 1] > border) & (kpts1[..., 1] < H_j - border)
         border_mask = border_mask_x & border_mask_y
+        # Source-side border for image i's real extent (the grid spans the
+        # padded canvas; its lower bound already starts at `border`).
+        src_mask = (kpts0[..., 0] < shapes_i[:, 1:2] - border) & (
+            kpts0[..., 1] < shapes_i[:, 0:1] - border
+        )
 
-        valid_mask = (~nan_mask) & reproj_mask & border_mask
+        valid_mask = (~nan_mask) & reproj_mask & border_mask & src_mask
         num_valid_all[batch_start:batch_end] = valid_mask.sum(dim=1)
 
     num_valid_cpu = num_valid_all.cpu().tolist()

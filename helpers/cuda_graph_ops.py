@@ -101,6 +101,42 @@ def capture_forward_backward(module: nn.Module, sample_args=(), autocast_dtype=N
     return graphed
 
 
+class GeometryHead(nn.Module):
+    """The per-step geometry rebuild, as one capturable callable.
+
+    Recomputes the projection matrices, the intrinsic matrices and the
+    unprojected edge points from the current parameter values and returns
+    them. It exists purely so ``EPO._geometry_step`` can hand the whole
+    block (forward and backward) to :func:`capture_forward_backward`:
+    the work is tiny per kernel and dominated by launch dispatch.
+
+    The EPO reference is stored outside the module registry so its
+    submodules are not registered twice; ``parameters()`` is overridden to
+    expose exactly the leaves the captured backward must accumulate into.
+    """
+
+    def __init__(self, epo):
+        """Args: epo: the owning ``EPO`` instance (not registered)."""
+        super().__init__()
+        object.__setattr__(self, "_epo", epo)
+
+    def parameters(self, recurse=True):
+        """Return the learnable leaves the captured block differentiates."""
+        epo = self._epo
+        return leaf_parameters((epo.poses, epo.intrinsics, epo.sampled_depth))
+
+    def forward(self):
+        """Return ``(P_all, K_all, points_3D)`` for every image."""
+        epo = self._epo
+        epo.poses.poses = None  # invalidate before recomputing
+        poses = epo.poses.get_projection_matrix(None)
+        epo.poses.poses = poses  # the unprojection below fetches it
+        epo.intrinsics.cameras = None
+        cameras = epo.intrinsics.get_intrinsic_matrix(None)
+        epo.intrinsics.cameras = cameras
+        return poses, cameras, epo.compute_edges_3D()
+
+
 class StaticGraph:
     """Replay a fixed-shape, gradient-free function from a CUDA graph.
 

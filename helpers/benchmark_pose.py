@@ -23,6 +23,7 @@ import functools
 import logging
 import os
 import time
+import warnings
 from itertools import combinations
 from pathlib import Path
 
@@ -341,6 +342,16 @@ def evaluate_scene(target_rec, input_rec, deg=True, verbose=False):
     input_pd = _extract_pose_dict(input_rec)
     target_images = np.array(sorted(target_pd.keys()))
     input_images_set = set(input_pd.keys())
+    # Names are matched exactly; a naming mismatch (e.g. "IMG.jpg" vs
+    # "1/IMG.jpg") silently makes every pair missing and the AUC 0.
+    n_common = len(input_images_set & set(target_pd.keys()))
+    if n_common == 0 or n_common < 0.5 * len(target_images):
+        warnings.warn(
+            f"AUC eval: only {n_common}/{len(target_images)} GT image names are "
+            f"present in the evaluated model (e.g. GT {target_images[0]!r} vs "
+            f"model {next(iter(input_images_set), None)!r}); unmatched pairs "
+            "count as errors."
+        )
 
     # All unordered pairs (i, j) with i < j.
     idx_i, idx_j = np.triu_indices(len(target_images), k=1)
