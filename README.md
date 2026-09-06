@@ -1,6 +1,6 @@
 <div align="center">
 
-# Boosting 3D Foundation Models with Edge-Based Pose Optimization
+# Boosting 3D Foundation Models with <br> Edge-Based Pose Optimization
 
 <p>
   <a href="https://mattiadurso.com">Mattia D'Urso</a>&ensp;·&ensp;
