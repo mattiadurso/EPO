@@ -92,6 +92,7 @@ class DA3Wrapper(BaseWrapper):
 
     def _load_model(self, model_path: str) -> DepthAnything3:
         """Load DA3 from a Hugging Face repo id or a local weights directory."""
+        self._announce_weights(model_path)
         model = DepthAnything3.from_pretrained(model_path)
         model.eval()
         model = model.to(self.device)

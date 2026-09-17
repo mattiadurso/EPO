@@ -97,6 +97,7 @@ class Pi3XWrapper(BaseWrapper):
 
     def _load_model(self, model_path: str) -> Pi3X:
         """Load Pi3X from a Hugging Face repo id (image-only branch)."""
+        self._announce_weights(model_path)
         model = Pi3X.from_pretrained(model_path).eval()
         # No pose/depth/intrinsic conditions are ever fed, so drop the
         # multimodal branch to save memory (repo demo does the same).

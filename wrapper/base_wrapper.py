@@ -34,6 +34,7 @@ registry for the interface every wrapper must satisfy.
 import glob
 import os
 import random
+from urllib.parse import urlparse
 
 import numpy as np
 import torch
@@ -42,6 +43,38 @@ import torch.nn.functional as F
 
 class BaseWrapper:
     """Helpers shared by every 3DFM wrapper."""
+
+    def _announce_weights(self, model_path: str) -> None:
+        """Print whether ``model_path`` is local, cached, or about to download.
+
+        Every wrapper's ``_load_model`` resolves a local file, a URL
+        (``torch.hub``-cached), or a Hugging Face Hub repo id — this covers
+        all three so the (possibly multi-GB, first-run-only) download isn't
+        silent.
+        """
+        if os.path.isfile(model_path):
+            print(f"✅ Using local weights: {model_path}")
+            return
+
+        if model_path.startswith("http://") or model_path.startswith("https://"):
+            filename = os.path.basename(urlparse(model_path).path)
+            cached_file = os.path.join(torch.hub.get_dir(), "checkpoints", filename)
+            if os.path.exists(cached_file):
+                print(f"✅ Found cached weights: {cached_file}")
+            else:
+                print(f"⏳ Weights not cached, downloading from {model_path} ...")
+            return
+
+        try:
+            from huggingface_hub import scan_cache_dir
+
+            cached_repo_ids = {repo.repo_id for repo in scan_cache_dir().repos}
+        except Exception:
+            cached_repo_ids = set()
+        if model_path in cached_repo_ids:
+            print(f"✅ Found cached weights: {model_path}")
+        else:
+            print(f"⏳ Weights not cached, downloading repo {model_path} ...")
 
     def _set_seed(self, seed: int):
         """Set random seeds for reproducibility."""

@@ -97,6 +97,7 @@ class VGGTOmegaWrapper(BaseWrapper):
 
     def _load_model(self, model_path: str) -> VGGTOmega:
         """Load the VGGT-Omega model from a local checkpoint file or a URL."""
+        self._announce_weights(model_path)
         model = VGGTOmega()
         if os.path.isfile(model_path):
             state_dict = torch.load(model_path, map_location="cpu")

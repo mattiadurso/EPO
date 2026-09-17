@@ -87,6 +87,7 @@ class MapAnythingWrapper(BaseWrapper):
 
     def _load_model(self, model_path: str) -> MapAnything:
         """Load MapAnything from a Hugging Face repo id."""
+        self._announce_weights(model_path)
         model = MapAnything.from_pretrained(model_path)
         model = model.to(self.device)
         model.eval()

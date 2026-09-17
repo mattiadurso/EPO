@@ -106,6 +106,7 @@ class DVLTWrapper(BaseWrapper):
 
     def _load_model(self, model_path: str) -> DVLT:
         """Load the DVLT model from a local path, URL, or HF Hub repo id."""
+        self._announce_weights(model_path)
         # The release checkpoint carries the DINOv2 patch-embed weights
         # (load_pretrained is strict), so skip the separate hub download.
         # decode_chunk_size: frames decoded per chunk in the fp32 ray/depth
