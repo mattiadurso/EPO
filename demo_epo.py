@@ -54,7 +54,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="vggt",
+        default="vggt_omega",
         choices=sorted(WRAPPERS),
         help="Which wrapper/ 3D foundation model to run.",
     )
