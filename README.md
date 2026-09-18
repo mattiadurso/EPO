@@ -48,13 +48,13 @@ Accuracy is preserved by construction: every change is bit-exact against the pre
 
 ### v1.1 — Dense depth via Any2Full
 
-EPO refines depth only at the edge pixels it samples, so the `depths.pth` it exports is sparse (~8% of pixels) and its point cloud is correspondingly thin. v1.1 adds a depth-completion stage built on [Any2Full](https://github.com/zhiyuandaily/Any2Full): it takes EPO's refined (sparse) depths as guidance and completes them into full-resolution dense maps, giving you a dense point cloud on top of the refined poses — poses, intrinsics, and the sparse model are left untouched. 
+EPO refines depth only at the edge pixels it samples, so the `depths.pth` it exports is sparse (~8% of pixels) and its point cloud is correspondingly thin. v1.1 adds a depth-completion stage built on [Any2Full](https://github.com/zhiyuandaily/Any2Full): it takes EPO's refined (sparse) depths as guidance and completes them into full-resolution se maps, giving you a dense point cloud on top of the refined poses — poses, intrinsics, and the sparse model are left untouched. 
 
 ```bash
 python demo_epo.py \
     --images_path bicycle/images \
     --output_path out/bicycle \
-    --densify                         # New added to denisfy EPO output
+    --densify                         # New added to densify EPO output
 ```
 
 This writes a `dense_<model>_epo` COLMAP model next to `sparse_<model>_epo`. See [Densifying EPO's depths](#densifying-epos-depths) for the standalone API, the weights, and the point-count/DBSCAN caveats. Completion is a single feed-forward pass per image, so it adds only ~25 s for a 150-image scene — on `bicycle` (MipNeRF360, RTX 4090) the whole `--densify` run takes ~90 s end-to-end: ~65 s for VGGT + EPO and ~25 s for the densification on top.
