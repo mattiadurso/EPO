@@ -49,6 +49,8 @@ from model.ours.any2full import Any2Full  # noqa: E402
 from PIL import Image  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
+from helpers.reconstruction import clip_points_to_cameras  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_CHECKPOINT = os.path.join(
@@ -339,6 +341,10 @@ class Any2FullWrapper:
             f"Fused {total_points:,} points from {len(dense_depths)} depth maps "
             f"(randomly subsampled to <= {max_points_per_image:,} per image)"
         )
+
+        # Completed depth reaches much further than the edge-only cloud it
+        # came from; clip it back so a viewer frames both models alike.
+        clip_points_to_cameras(recon)
 
         if save:
             os.makedirs(output_path, exist_ok=True)

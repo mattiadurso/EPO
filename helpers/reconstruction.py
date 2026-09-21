@@ -130,6 +130,56 @@ def dbscan_filter(reconstruction, eps=0.5, min_samples=20, verbose: bool = False
     return filtered_reconstruction
 
 
+# A point further than this many camera-rig radii from the camera centroid is
+# dropped on export (see :func:`clip_points_to_cameras`).
+POINT_RADIUS_FACTOR = 3.0
+
+
+def clip_points_to_cameras(reconstruction, factor=POINT_RADIUS_FACTOR):
+    """Drop 3D points far outside the camera rig, in place.
+
+    Every model of one scene lives in the same world frame, but their point
+    clouds reach different distances: depth completion fills in background
+    the edge cloud never had, and low-confidence unprojections trail off
+    behind the scene. A viewer frames on the points, so the same cameras end
+    up drawn at very different sizes in the 3DFM model, in EPO's refinement
+    and in the densified sibling. Removing the trailing tail keeps the three
+    comparable without touching a single pose.
+
+    Args:
+        reconstruction: model to filter in place.
+        factor: bound on the distance from the camera centroid, as a
+            multiple of the camera-rig radius (the largest distance from a
+            camera centre to that centroid). ``None`` disables the filter.
+
+    Returns:
+        Number of points removed.
+    """
+    if factor is None or reconstruction.num_points3D() == 0:
+        return 0
+    centres = np.array(
+        [
+            -im.cam_from_world().rotation.matrix().T @ im.cam_from_world().translation
+            for im in reconstruction.images.values()
+        ]
+    )
+    if len(centres) < 2:
+        return 0
+    origin = centres.mean(0)
+    radius = float(np.linalg.norm(centres - origin, axis=1).max())
+    if radius <= 0:
+        return 0
+    bound = factor * radius
+    doomed = [
+        pid
+        for pid, point in reconstruction.points3D.items()
+        if np.linalg.norm(point.xyz - origin) > bound
+    ]
+    for pid in doomed:
+        reconstruction.delete_point3D(pid)
+    return len(doomed)
+
+
 @torch.no_grad()
 def build_reconstruction(
     epo,
@@ -427,8 +477,12 @@ def build_reconstruction(
             verbose=verbose,
         )
 
-    # 6. Save reconstruction
+    # 6. Keep the framing comparable with the other models of this scene
+    clipped = clip_points_to_cameras(reconstruction)
+
+    # 7. Save reconstruction
     if verbose:
+        logger.info(f"Clipped {clipped:,} points outside the camera rig")
         logger.info(f"Cameras: {len(reconstruction.cameras)}")
         logger.info(f"Images: {len(reconstruction.images)}")
         logger.info(f"Points3D: {len(reconstruction.points3D):,}")

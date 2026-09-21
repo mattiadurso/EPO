@@ -484,8 +484,10 @@ class BaseWrapper:
         """Convert gathered points + cameras to a track-less reconstruction."""
         from np_to_colmap import batch_np_matrix_to_pycolmap_wo_track
 
+        from helpers.reconstruction import clip_points_to_cameras
+
         print("Converting to COLMAP format")
-        return batch_np_matrix_to_pycolmap_wo_track(
+        reconstruction = batch_np_matrix_to_pycolmap_wo_track(
             points_3d,
             points_xyf,
             points_rgb,
@@ -495,6 +497,8 @@ class BaseWrapper:
             shared_camera=False,
             camera_type="PINHOLE",
         )
+        clip_points_to_cameras(reconstruction)
+        return reconstruction
 
     @staticmethod
     def _points_rgb(
