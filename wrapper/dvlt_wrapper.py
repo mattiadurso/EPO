@@ -88,7 +88,10 @@ class DVLTWrapper(BaseWrapper):
         # Configure CUDA
         if torch.cuda.is_available():
             torch.backends.cudnn.enabled = True
-            torch.backends.cudnn.benchmark = True
+            # benchmark stays off: cuDNN re-tunes per distinct batch size S (so
+            # test.py pays it per scene) and measured no steady-state gain —
+            # only cost, ~1.4s on the first forward here (48 imgs: 8.3 -> 6.9s).
+            torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = False
 
         # Fixed resolutions (release checkpoint: img_size=504, patch 14).

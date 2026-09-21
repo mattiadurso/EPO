@@ -22,3 +22,6 @@
 [submodule "third_party/Any2Full"]
 	path = third_party/Any2Full
 	url = https://github.com/zhiyuandaily/Any2Full.git
+[submodule "third_party/vggsfm"]
+	path = third_party/vggsfm
+	url = https://github.com/facebookresearch/vggsfm.git

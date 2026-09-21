@@ -43,6 +43,7 @@ for _p in (
 
 import gc  # noqa: E402
 import time  # noqa: E402
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 from pathlib import Path  # noqa: E402
 
 import numpy as np  # noqa: E402
@@ -83,7 +84,10 @@ class VGGTOmegaWrapper(BaseWrapper):
         # Configure CUDA
         if torch.cuda.is_available():
             torch.backends.cudnn.enabled = True
-            torch.backends.cudnn.benchmark = True
+            # benchmark stays off: cuDNN re-tunes per distinct batch size S (so
+            # test.py pays it per scene) and measured no steady-state gain —
+            # only cost, ~9s on the first forward here (150 imgs: 27.2 -> 17.1s).
+            torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = False
 
         # Load model
@@ -99,8 +103,13 @@ class VGGTOmegaWrapper(BaseWrapper):
         """Load the VGGT-Omega model from a local checkpoint file or a URL."""
         self._announce_weights(model_path)
         model = VGGTOmega()
-        if os.path.isfile(model_path):
-            state_dict = torch.load(model_path, map_location="cpu")
+        # mmap reads the tensors straight from the file instead of copying the
+        # whole checkpoint through host memory (1.40s -> 0.06s here). It needs a
+        # path, so only load_state_dict_from_url's *download* is used, and only
+        # when the weights are not cached yet.
+        local_file = self._resolve_weights_file(model_path)
+        if local_file is not None:
+            state_dict = torch.load(local_file, map_location="cpu", mmap=True)
         else:
             state_dict = torch.hub.load_state_dict_from_url(model_path)
         model.load_state_dict(state_dict)
@@ -248,6 +257,28 @@ class VGGTOmegaWrapper(BaseWrapper):
 
         base_image_paths = [os.path.relpath(path, images_path) for path in image_paths]
 
+        # ff_data needs the *original* sharp pixels resized to the letterbox
+        # geometry, which is fixed by original_coords alone — the model's
+        # outputs never enter it. So start that CPU decode now and let it run
+        # under the GPU forward below instead of after it.
+        orig_coords_np = original_coords.cpu().numpy()
+        ff_geometry = [
+            (
+                self._letterbox_resize_hw(
+                    *orig_coords_np[i, -2:], self.vggt_fixed_resolution
+                ),
+                None,
+            )
+            for i in range(len(base_image_paths))
+        ]
+
+        ff_pool = ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1))
+        ff_prefetch = self._prefetch_ff_images(ff_pool, image_paths, ff_geometry)
+        # Every task is already queued, so a non-waiting shutdown lets the
+        # workers drain it and then retire the pool — no leak if the model
+        # raises, and no join before the futures are consumed below.
+        ff_pool.shutdown(wait=False)
+
         # Run VGGT-Omega.
         print("Running VGGT-Omega model...")
         t_start = time.time()
@@ -291,9 +322,11 @@ class VGGTOmegaWrapper(BaseWrapper):
             "intrinsic": intrinsic,
             "depth_map": depth_map,
             "depth_conf": depth_conf,
-            "original_coords": original_coords.cpu().numpy(),
+            "original_coords": orig_coords_np,
         }
-        ff_data = self._build_ff_data(preds, base_image_paths, image_paths)
+        ff_data = self._build_ff_data(
+            preds, base_image_paths, image_paths, prefetched=ff_prefetch
+        )
         timings["build_ff_data"] = time.time() - t_start
         del images
         gc.collect()

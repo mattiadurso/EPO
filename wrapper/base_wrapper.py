@@ -44,6 +44,29 @@ import torch.nn.functional as F
 class BaseWrapper:
     """Helpers shared by every 3DFM wrapper."""
 
+    @staticmethod
+    def _resolve_weights_file(model_path: str) -> str | None:
+        """Local path of ``model_path``'s weights, if they are already on disk.
+
+        Covers a local file and a URL whose download ``torch.hub`` has already
+        cached (the cache path is derived exactly as ``torch.hub`` derives it).
+        Returns None when the weights still have to be fetched, or when
+        ``model_path`` is a Hugging Face repo id — those load through their own
+        library.
+
+        Having the path lets ``_load_model`` read the checkpoint with
+        ``torch.load(..., mmap=True)`` instead of going through
+        ``load_state_dict_from_url``, which has no mmap option and so copies
+        the whole file through host memory first.
+        """
+        if os.path.isfile(model_path):
+            return model_path
+        if model_path.startswith("http://") or model_path.startswith("https://"):
+            filename = os.path.basename(urlparse(model_path).path)
+            cached = os.path.join(torch.hub.get_dir(), "checkpoints", filename)
+            return cached if os.path.exists(cached) else None
+        return None
+
     def _announce_weights(self, model_path: str) -> None:
         """Print whether ``model_path`` is local, cached, or about to download.
 
@@ -57,9 +80,8 @@ class BaseWrapper:
             return
 
         if model_path.startswith("http://") or model_path.startswith("https://"):
-            filename = os.path.basename(urlparse(model_path).path)
-            cached_file = os.path.join(torch.hub.get_dir(), "checkpoints", filename)
-            if os.path.exists(cached_file):
+            cached_file = self._resolve_weights_file(model_path)
+            if cached_file is not None:
                 print(f"✅ Found cached weights: {cached_file}")
             else:
                 print(f"⏳ Weights not cached, downloading from {model_path} ...")
@@ -183,11 +205,109 @@ class BaseWrapper:
         """
         raise NotImplementedError(f"{type(self).__name__} must implement _ff_entries()")
 
+    @staticmethod
+    def _load_ff_image(
+        image_path: str,
+        resize_hw: tuple[int, int],
+        crop_box: tuple[int, int, int, int] | None,
+    ) -> torch.Tensor:
+        """Decode one original image to EPO's (3, H, W) float tensor in [0, 1].
+
+        The pixel-exact half of the feed-forward path: the same decoder, PIL
+        fallback and antialiased BICUBIC resize as EPO's disk loader
+        (``helpers/load.py``:``_process_single_image`` with
+        ``load_with_pad=False``). Called either inline by
+        :meth:`_build_ff_data` or ahead of time by
+        :meth:`_prefetch_ff_images`; both produce the identical tensor.
+
+        Args:
+            image_path: Absolute path of the original image.
+            resize_hw: ``(h, w)`` the decoded image is resized to.
+            crop_box: ``(top, left, h, w)`` applied after the resize, or None.
+
+        Returns:
+            Float CHW tensor scaled to [0, 1].
+        """
+        from PIL import Image
+        from torchvision.io import ImageReadMode, read_image
+        from torchvision.transforms import InterpolationMode
+        from torchvision.transforms.functional import resize as tv_resize
+
+        new_h, new_w = resize_hw
+
+        # Decode → CHW uint8 RGB, same decoder + fallback as the disk path.
+        try:
+            rgb = read_image(image_path, mode=ImageReadMode.UNCHANGED)
+            if rgb.dtype == torch.uint16:  # 16-bit PNG: keep the high byte
+                rgb = (rgb >> 8).to(torch.uint8)
+            if rgb.shape[0] == 1:
+                rgb = rgb.expand(3, -1, -1).contiguous()
+            elif rgb.shape[0] == 4:
+                # RGBA → blend onto white, drop alpha (same float math +
+                # truncating uint8 cast as the disk decoder).
+                a = rgb[3:4].float() / 255.0
+                rgb = (
+                    (rgb[:3].float() * a + 255.0 * (1.0 - a))
+                    .clamp_(0, 255)
+                    .to(torch.uint8)
+                )
+            elif rgb.shape[0] != 3:
+                raise RuntimeError("defer to PIL")
+        except RuntimeError:
+            img = Image.open(image_path)
+            if img.mode == "RGBA":
+                bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+                img = Image.alpha_composite(bg, img)
+            arr = np.asarray(img.convert("RGB"))
+            rgb = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+
+        img_t = tv_resize(
+            rgb,
+            [new_h, new_w],
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
+        )
+        if crop_box is not None:
+            top, left, crop_h, crop_w = crop_box
+            img_t = img_t[:, top : top + crop_h, left : left + crop_w]
+        return img_t.float().div_(255.0)
+
+    def _prefetch_ff_images(
+        self,
+        executor,
+        image_paths: list[str],
+        geometry: list[tuple[tuple[int, int], tuple[int, int, int, int] | None]],
+    ) -> list[tuple]:
+        """Start the ff_data image decode/resize ahead of the model forward.
+
+        The decode + antialiased downscale is ~2 s of pure CPU work for 150
+        6 MP images, and it depends only on the original pixels and the target
+        geometry — never on the model's outputs. Submitting it before the
+        (GPU-bound, tens of seconds) inference call hides it entirely; the
+        work itself is unchanged, so ff_data stays bit-exact.
+
+        Args:
+            executor: A ``ThreadPoolExecutor`` that must outlive the matching
+                ``_build_ff_data`` call.
+            image_paths: Absolute image paths, in ff_data key order.
+            geometry: Per image, the ``(resize_hw, crop_box)`` that
+                ``_ff_entries`` will report. Re-checked in
+                :meth:`_build_ff_data`.
+
+        Returns:
+            Per-image ``(future, resize_hw, crop_box)`` for ``prefetched=``.
+        """
+        return [
+            (executor.submit(self._load_ff_image, path, hw, crop), hw, crop)
+            for path, (hw, crop) in zip(image_paths, geometry, strict=False)
+        ]
+
     def _build_ff_data(
         self,
         preds: dict,
         base_image_paths: list[str],
         image_paths: list[str],
+        prefetched: list | None = None,
     ) -> dict:
         """Build EPO's feed-forward dict. Shared by every wrapper; never overridden.
 
@@ -203,59 +323,45 @@ class BaseWrapper:
             preds: The model's raw outputs, as assembled by ``forward()``.
             base_image_paths: Relative image paths (the ff_data keys).
             image_paths: Absolute paths of the original images.
+            prefetched: Optional per-image ``(future, resize_hw, crop_box)``
+                from :meth:`_prefetch_ff_images`, in ``base_image_paths``
+                order. The futures carry exactly what :meth:`_load_ff_image`
+                would return here, so passing them only moves *when* the
+                decode runs (during the model forward), never what it
+                produces.
 
         Returns:
             Dict mapping each relative image path to EPO's per-image tensors.
         """
         from concurrent.futures import ThreadPoolExecutor
 
-        from PIL import Image
-        from torchvision.io import ImageReadMode, read_image
-        from torchvision.transforms import InterpolationMode
-        from torchvision.transforms.functional import resize as tv_resize
-
         entries = self._ff_entries(preds, base_image_paths, image_paths)
 
-        def _process_one(entry):
-            """Build one image's ff_data entry (independent per image)."""
-            new_h, new_w = entry["resize_hw"]
-
-            # Decode → CHW uint8 RGB, same decoder + fallback as the disk path.
-            try:
-                rgb = read_image(entry["image_path"], mode=ImageReadMode.UNCHANGED)
-                if rgb.dtype == torch.uint16:  # 16-bit PNG: keep the high byte
-                    rgb = (rgb >> 8).to(torch.uint8)
-                if rgb.shape[0] == 1:
-                    rgb = rgb.expand(3, -1, -1).contiguous()
-                elif rgb.shape[0] == 4:
-                    # RGBA → blend onto white, drop alpha (same float math +
-                    # truncating uint8 cast as the disk decoder).
-                    a = rgb[3:4].float() / 255.0
-                    rgb = (
-                        (rgb[:3].float() * a + 255.0 * (1.0 - a))
-                        .clamp_(0, 255)
-                        .to(torch.uint8)
-                    )
-                elif rgb.shape[0] != 3:
-                    raise RuntimeError("defer to PIL")
-            except RuntimeError:
-                img = Image.open(entry["image_path"])
-                if img.mode == "RGBA":
-                    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
-                    img = Image.alpha_composite(bg, img)
-                arr = np.asarray(img.convert("RGB"))
-                rgb = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-
-            img_t = tv_resize(
-                rgb,
-                [new_h, new_w],
-                interpolation=InterpolationMode.BICUBIC,
-                antialias=True,
+        if prefetched is not None and len(prefetched) != len(entries):
+            raise ValueError(
+                f"prefetched has {len(prefetched)} items, expected {len(entries)}"
             )
-            if entry["crop_box"] is not None:
-                top, left, crop_h, crop_w = entry["crop_box"]
-                img_t = img_t[:, top : top + crop_h, left : left + crop_w]
-            img_t = img_t.float().div_(255.0)
+
+        def _process_one(index_entry):
+            """Build one image's ff_data entry (independent per image)."""
+            i, entry = index_entry
+
+            if prefetched is None:
+                img_t = self._load_ff_image(
+                    entry["image_path"], entry["resize_hw"], entry["crop_box"]
+                )
+            else:
+                # The prefetch ran before the model, off the same geometry;
+                # assert it rather than trusting it (a silent mismatch here
+                # would be a parity break, not a crash).
+                future, hw, crop = prefetched[i]
+                if tuple(hw) != tuple(entry["resize_hw"]) or crop != entry["crop_box"]:
+                    raise RuntimeError(
+                        f"prefetch geometry mismatch for {entry['image_path']}: "
+                        f"prefetched {(hw, crop)}, entry "
+                        f"{(entry['resize_hw'], entry['crop_box'])}"
+                    )
+                img_t = future.result()
 
             ff_entry = {
                 "image": img_t,
@@ -274,7 +380,7 @@ class BaseWrapper:
         # sequential loop (bit-exact ff_data parity is required).
         max_workers = min(8, os.cpu_count() or 1)
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            results = list(ex.map(_process_one, entries))
+            results = list(ex.map(_process_one, enumerate(entries)))
 
         result = {key: entry for key, entry in results}
         # sort the dict by key to make the ff_data deterministic (the thread pool
@@ -384,6 +490,28 @@ class BaseWrapper:
 
         return reconstruction
 
+    @staticmethod
+    def _letterbox_resize_hw(width, height, res: int) -> tuple[int, int]:
+        """``(new_h, new_w)`` the original image occupies inside the square frame.
+
+        The single source of truth for the letterbox family's image geometry:
+        :meth:`_ff_entries_letterbox` places depth with it, and a wrapper's
+        ``forward()`` uses it to prefetch the decode before inference. Keeping
+        one implementation is what makes the prefetch safe — re-deriving
+        ``int(width * scale)`` at the call site risks a different dtype
+        promotion and a silent off-by-one against the depth crop.
+
+        Args:
+            width: Original image width (numpy scalar or int).
+            height: Original image height.
+            res: Side of the square frame the model infers on.
+
+        Returns:
+            ``(new_h, new_w)`` in pixels.
+        """
+        scale = res / max(width, height)
+        return int(height * scale), int(width * scale)
+
     def _ff_entries_letterbox(
         self,
         preds: dict,
@@ -416,7 +544,7 @@ class BaseWrapper:
         for i, key in enumerate(base_image_paths):
             width, height = preds["original_coords"][i, -2:]
             scale = res / max(width, height)
-            new_w, new_h = int(width * scale), int(height * scale)
+            new_h, new_w = self._letterbox_resize_hw(width, height, res)
 
             top = max((res - new_h) // 2, 0)
             left = max((res - new_w) // 2, 0)

@@ -79,7 +79,10 @@ class VGGTWrapper(BaseWrapper):
         # Configure CUDA
         if torch.cuda.is_available():
             torch.backends.cudnn.enabled = True
-            torch.backends.cudnn.benchmark = True
+            # benchmark stays off: cuDNN re-tunes per distinct batch size S (so
+            # test.py pays it per scene) and measured no steady-state gain —
+            # only cost, ~5.7s on the first forward here (48 imgs: 13.8 -> 8.2s).
+            torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = False
 
         # Load model
@@ -95,8 +98,13 @@ class VGGTWrapper(BaseWrapper):
         """Load the VGGT model from a local checkpoint file or a URL."""
         self._announce_weights(model_path)
         model = VGGT()
-        if os.path.isfile(model_path):
-            state_dict = torch.load(model_path, map_location="cpu")
+        # mmap reads the tensors straight from the file instead of copying the
+        # whole checkpoint through host memory (1.40s -> 0.06s here). It needs a
+        # path, so only load_state_dict_from_url's *download* is used, and only
+        # when the weights are not cached yet.
+        local_file = self._resolve_weights_file(model_path)
+        if local_file is not None:
+            state_dict = torch.load(local_file, map_location="cpu", mmap=True)
         else:
             state_dict = torch.hub.load_state_dict_from_url(model_path)
         model.load_state_dict(state_dict)

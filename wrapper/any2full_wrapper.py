@@ -103,6 +103,12 @@ class Any2FullWrapper:
             if torch.cuda.is_available()
             else torch.device("cpu")
         )
+        if torch.cuda.is_available():
+            # Own the cuDNN state instead of inheriting it: densification runs
+            # last, after a 3DFM wrapper and EPO's fix_seed have already set
+            # this process-wide. Autotune costs ~9s of first-forward tuning on
+            # this decoder (29.6s -> 18.6s for 150 imgs) and gains nothing.
+            torch.backends.cudnn.benchmark = False
         self.last_timings = {}
         # Any2Full reads its hyper-parameters off an argparse Namespace.
         # ``stage`` only matters when a DepthAnything checkpoint is loaded on
