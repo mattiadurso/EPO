@@ -1754,6 +1754,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         - ``"intrinsic"``: ``(3, 3)`` pinhole intrinsics matrix, in COLMAP's
           pixel convention (centre of pixel ``i`` at ``i + 0.5``)
         - ``"confidence"`` (optional): ``(H, W)`` float tensor
+        - ``"scale"`` / ``"coords"`` (optional): the resize factor and the
+          disk loader's ``[x1, y1, x2, y2, orig_w, orig_h]``, supplied by the
+          wrapper's ``_ff_entries``. Without them the exported camera keeps
+          the feed-forward resolution instead of the original one.
 
         Images and depths must already be at ``self.images_size``. Cameras
         follow ``single_camera_per_folder``: when True, all images under the
@@ -1800,9 +1804,13 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 "image": img,
                 "depth": dep,
                 "hw": (img.shape[-2], img.shape[-1]),
-                "scale": 1.0,
+                "scale": float(entry.get("scale", 1.0)),
                 "cam_id": cam_id,
             }
+            if "coords" in entry:
+                self.images[name]["coords"] = torch.as_tensor(
+                    entry["coords"], device=self.device
+                )
             if "confidence" in entry and entry["confidence"] is not None:
                 self.images[name]["confidence"] = entry["confidence"].to(
                     self.device, dtype=self.dtype

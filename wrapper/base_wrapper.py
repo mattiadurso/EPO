@@ -169,7 +169,14 @@ class BaseWrapper:
             ``depth`` / ``confidence``: final ``(H, W)`` numpy maps,
                 pixel-aligned with the (cropped) resized image;
             ``pose``: ``(3, 4)`` world-to-camera numpy matrix;
-            ``intrinsic``: ``(3, 3)`` numpy matrix in the same frame.
+            ``intrinsic``: ``(3, 3)`` numpy matrix in the same frame;
+            ``scale`` / ``coords`` (optional): the isotropic resize factor
+                and the disk loader's ``[x1, y1, x2, y2, orig_w, orig_h]``
+                (``helpers/load.py``), which let ``to_colmap`` write the
+                camera at the *original* resolution instead of the model's.
+                Omit them when the model's frame is not a pure isotropic
+                resize of the original image (a crop, or per-axis scales);
+                the exported camera then stays in processed pixels.
 
         Raises:
             NotImplementedError: If the wrapper does not implement it.
@@ -250,13 +257,17 @@ class BaseWrapper:
                 img_t = img_t[:, top : top + crop_h, left : left + crop_w]
             img_t = img_t.float().div_(255.0)
 
-            return entry["key"], {
+            ff_entry = {
                 "image": img_t,
                 "depth": torch.from_numpy(entry["depth"]).float(),
                 "confidence": torch.from_numpy(entry["confidence"]).float(),
                 "pose": torch.from_numpy(entry["pose"]).float(),
                 "intrinsic": torch.from_numpy(entry["intrinsic"]).float(),
             }
+            if "coords" in entry:
+                ff_entry["scale"] = entry["scale"]
+                ff_entry["coords"] = torch.from_numpy(entry["coords"])
+            return entry["key"], ff_entry
 
         # Decode + resize is the bottleneck and releases the GIL, so thread it.
         # `map` preserves input order, so the result is identical to the
@@ -392,7 +403,9 @@ class BaseWrapper:
           same dims (the disk path's follow-up resize is an exact identity at
           these sizes, so it is skipped);
         - intrinsic: square-space focals with the principal point moved to the
-          float image centre ``(w*s/2, h*s/2)``.
+          float image centre ``(w*s/2, h*s/2)``;
+        - scale/coords: ``s`` and the disk loader's ``coords``, so the
+          exported camera lands back at the original resolution.
 
         Expects ``preds`` with ``extrinsic``, ``intrinsic``, ``depth_map``,
         ``depth_conf`` and ``original_coords`` (whose last two columns are the
@@ -424,6 +437,10 @@ class BaseWrapper:
                     "confidence": conf[top : top + new_h, left : left + new_w],
                     "pose": preds["extrinsic"][i][:3, :4],
                     "intrinsic": intr,
+                    "scale": float(scale),
+                    "coords": np.array(
+                        [0, 0, width * scale, height * scale, width, height]
+                    ),
                 }
             )
 
