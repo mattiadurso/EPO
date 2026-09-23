@@ -180,6 +180,57 @@ def clip_points_to_cameras(reconstruction, factor=POINT_RADIUS_FACTOR):
     return len(doomed)
 
 
+def closest_to_identity(R, t):
+    """Index of the world-to-camera pose closest to ``[I|0]``.
+
+    Ranks by rotation angle, then by translation norm, so a camera at exactly
+    ``[I|0]`` (a feed-forward model's reference view) always wins.
+
+    Args:
+        R: ``(N, 3, 3)`` rotations.
+        t: ``(N, 3)`` translations.
+
+    Returns:
+        The index of the closest pose.
+    """
+    R, t = np.asarray(R, dtype=np.float64), np.asarray(t, dtype=np.float64)
+    cos = np.clip((np.trace(R, axis1=1, axis2=2) - 1) / 2, -1.0, 1.0)
+    return int(np.lexsort((np.linalg.norm(t, axis=1), -cos))[0])
+
+
+def center_cameras_to_identity(reconstruction, anchor=None):
+    """Move the world frame onto one camera, whose pose becomes exactly ``[I|0]``.
+
+    A rigid change of frame (rotation and translation, no scale): every pose
+    and 3D point moves with it, so relative poses, depths and reprojections
+    are unchanged. EPO pins no camera, so a refined scene drifts away from the
+    frame of its input; centring on the input's reference view undoes that.
+
+    Args:
+        reconstruction: model to transform in place.
+        anchor: name of the image to put at the origin; ``None`` picks the
+            image whose pose is closest to identity (:func:`closest_to_identity`).
+
+    Returns:
+        The anchor image's name.
+    """
+    images = list(reconstruction.images.values())
+    if anchor is None:
+        poses = [im.cam_from_world() for im in images]
+        R = np.stack([p.rotation.matrix() for p in poses])
+        t = np.stack([p.translation for p in poses])
+        anchor = images[closest_to_identity(R, t)].name
+    image = next(im for im in images if im.name == anchor)
+    new_from_world = image.cam_from_world()
+    reconstruction.transform(
+        pycolmap.Sim3d(1.0, new_from_world.rotation, new_from_world.translation)
+    )
+    # Exactly, not up to round-off: the anchor is the origin by definition.
+    frame = reconstruction.frame(image.frame_id)
+    frame.set_cam_from_world(image.camera_id, pycolmap.Rigid3d())
+    return anchor
+
+
 @torch.no_grad()
 def build_reconstruction(
     epo,
@@ -318,8 +369,9 @@ def build_reconstruction(
     #    Poses are fetched for all images in one batched call: per-image
     #    calls each run the pose MLP + a GPU sync (~1 ms/image).
     #
-    #    Translations (and the 3D points below) are exported as-is: EPO's
-    #    world frame is the input reconstruction's world frame (depth values
+    #    Translations (and the 3D points below) are not rescaled: EPO's
+    #    world frame is the input reconstruction's world frame, re-centred on
+    #    its reference view by step 7 (a rigid move; depth values
     #    are never rescaled, and the image-resize scale cancels between the
     #    pixel coordinates and the intrinsics), so only the intrinsics and
     #    camera dims need to be brought back to the original resolution.
@@ -480,7 +532,10 @@ def build_reconstruction(
     # 6. Keep the framing comparable with the other models of this scene
     clipped = clip_points_to_cameras(reconstruction)
 
-    # 7. Save reconstruction
+    # 7. Put the input's reference view back at [I|0] (EPO pins no camera)
+    center_cameras_to_identity(reconstruction, epo.anchor_image)
+
+    # 8. Save reconstruction
     if verbose:
         logger.info(f"Clipped {clipped:,} points outside the camera rig")
         logger.info(f"Cameras: {len(reconstruction.cameras)}")

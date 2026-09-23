@@ -305,6 +305,10 @@ class ReconstructAndVizModule:
     ):
         """Export the optimized reconstruction (and optionally depth maps) to COLMAP format.
 
+        The model is in the input's world frame, moved rigidly so that the
+        input's reference view (the camera closest to ``[I|0]`` before
+        optimization, ``self.anchor_image``) is at exactly ``[I|0]``.
+
         Args:
             output_path: Destination folder. Existing contents are removed.
             save_points: If True, unproject edge points and write them as
@@ -317,7 +321,8 @@ class ReconstructAndVizModule:
             dbscan_eps: DBSCAN ``eps`` (max neighbour distance).
             dbscan_min_samples: DBSCAN ``min_samples`` (core-point threshold).
             gt_path: If given, align the exported reconstruction to this GT
-                model with ``colmap model_aligner``.
+                model with ``colmap model_aligner`` (the GT frame then
+                replaces the centring on ``self.anchor_image``).
             save_depth: If True, write refined depth maps as a single
                 ``depths.pth`` dict (``{image_stem: {"depth": tensor}}``).
         """

@@ -43,6 +43,7 @@ from helpers.load import (
     process_camera,
     process_pose,
 )
+from helpers.reconstruction import closest_to_identity
 from helpers.reprojection import (
     filter_viewgraph_by_reprojection_batched,
     grid_sample_nan,
@@ -427,6 +428,14 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 self.timings["load_poses_and_intrinsics"] = 0.0
 
         ##==============  Loadings end here ==============
+
+        # The input's reference view, the pose closest to [I|0]: to_colmap puts
+        # it back at exactly [I|0], undoing the drift of the unpinned gauge.
+        names = sorted(self.images)
+        rows = [self.poses.image_to_tensor_idx[n] for n in names]
+        R0 = self.poses.get_rotation_matrix(None).detach().cpu().numpy()[rows]
+        t0 = self.poses.get_translation(None).detach().cpu().numpy()[rows]
+        self.anchor_image = names[closest_to_identity(R0, t0)]
 
         ## Extract edges
         s_time = time.perf_counter()
