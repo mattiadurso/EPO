@@ -967,6 +967,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 )
                 if mlp_pose_convergence:
                     self.mlp_pose_convergence = True
+                    # Phase 2's stop test must only see its own samples: the
+                    # phase-1 history would otherwise fill its window and end
+                    # the depth phase before its learning-rate warmup is over.
+                    self._phase2_start = len(self.changes["max"])
                     if log_t:
                         self.timings["pose_convergence_time"] = (
                             time.perf_counter() - optimization_start - auc_time
@@ -984,7 +988,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             elif appended and self.mlp_pose_convergence:
                 if early_stop == "pose":
                     if self.check_convergence(
-                        list_of_changes=self.changes["max"],
+                        list_of_changes=self.changes["max"][self._phase2_start :],
                         window=window_depth,
                         early_stop=early_stop,  # "pose"
                         tol=convergence_tol_depth,
