@@ -604,6 +604,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         huber_delta=1.0,
         clamp_start=10.0,
         clamp_end=6.0,
+        cooldown_steps=50,
         drop_last=False,
         debug=False,
         gt_path=None,
@@ -629,6 +630,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             huber_delta (float, optional): Huber threshold of the DT loss, in ``images_size`` pixels. Default is 1.0.
             clamp_start (float, optional): Residual clamp (px) at step 0, annealed linearly to ``clamp_end`` over the first 1000 steps. It sets the capture radius (residuals above it get no gradient), so it stays loose for weak initializations. Default is 10.0.
             clamp_end (float, optional): Residual clamp (px) after the anneal. Default is 6.0.
+            cooldown_steps (int, optional): After the early-stop test fires, keep optimizing this many steps with every learning rate decayed linearly to zero, then stop. The cosine schedule spans ``max_num_iterations``, so an early stop otherwise returns the iterate of a still-moving Adam at near-peak learning rate, on a gradient estimated from a random subset of pairs. 0 stops at once. Default is 50.
             drop_last (bool, optional): Whether to drop the last batch if smaller than batch_size. Default is False.
             debug (bool, optional): Whether to enable debug mode. Default is False.
             gt_path (str, optional): Path to the ground truth data. Default is None.
@@ -782,6 +784,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             self.to_colmap(opt, save_points=False, verbose=False)
             self.compute_auc(opt, gt_path, 0)
             auc_time += time.perf_counter() - t_auc
+
+        self._cooldown = None  # set when the stop test fires (see below)
 
         # Forward and backward loop
         # `step` must exist even if the loop body never runs (e.g. a second
@@ -1016,7 +1020,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     time.perf_counter() - early_stop_start
                 )
 
-            if (
+            if self._cooldown is not None:
+                self._cooldown["left"] -= 1
+                if self._cooldown["left"] == 0:
+                    self.completed_iterations += 1
+                    break
+            elif (
                 self.mlp_pose_convergence
                 and self.optim_convergence
                 and early_stop != "none"
@@ -1024,8 +1033,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 logger.info(
                     f"Stopping optimization at step {step}. Convergence reached."
                 )
-                self.completed_iterations += 1
-                break
+                if cooldown_steps > 0:
+                    self._start_cooldown(cooldown_steps)
+                else:
+                    self.completed_iterations += 1
+                    break
 
             self.completed_iterations += 1
 
@@ -1142,6 +1154,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # Ideally each of them should be able to run independently until needed (reaching min lr),
         # but for now we keep them in sync for simplicity.
         s_time = time.perf_counter()
+        if self._cooldown is not None:
+            self._cooldown_step()
+            return
         if (
             self.grad_R is True
             or self.grad_t is True
@@ -1163,6 +1178,29 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self._sync_for_timing()
         if self.log_granular_time:
             self.timings["parameters_update"] += time.perf_counter() - s_time
+
+    def _start_cooldown(self, steps):
+        """Freeze the schedulers and remember each group's current rate."""
+        modules = [self.poses]
+        if self.grad_z and self.mlp_pose_convergence:
+            modules.append(self.sampled_depth)
+        if self.grad_k:
+            modules.append(self.intrinsics)
+        base = [
+            (m.optimizer, [g["lr"] for g in m.optimizer.param_groups])
+            for m in modules
+            if hasattr(m, "optimizer")
+        ]
+        self._cooldown = {"total": steps, "left": steps, "base": base}
+
+    def _cooldown_step(self):
+        """One optimizer step at ``left / (total + 1)`` of the frozen rates."""
+        c = self._cooldown
+        frac = c["left"] / (c["total"] + 1)
+        for opt, lrs in c["base"]:
+            for group, lr in zip(opt.param_groups, lrs, strict=True):
+                group["lr"] = lr * frac
+            opt.step()
 
     def collect_lrs(self, step):
         """Collect learning rates for all optimizers."""
