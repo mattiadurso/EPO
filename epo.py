@@ -1587,13 +1587,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 "that images_path is the folder the reconstruction was built from."
             )
 
-        # Read cameras intrinsics
+        # Read cameras intrinsics, as [f, cx, cy, aspect] in the resized frame
         if self.single_camera_per_folder:
             # Reading cameras from images (to handle multiple images with same camera)
             for image in self.recon.images.values():
-                _, model, new_params = process_camera(
-                    image.camera, self.load_with_pad, images_size=self.images_size
-                )
+                new_params = self._camera_params(image.camera, image.name)
                 # assuming image names are like "cam_id/image_name"
                 cam_id = image.name.split("/")[0]
 
@@ -1601,7 +1599,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 if cam_id not in intrinsics:
                     intrinsics[cam_id] = {
                         "cam_id": cam_id,
-                        "model": model,
                         "parameters": [new_params],
                     }
                 else:
@@ -1620,32 +1617,31 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                         dim=0
                     )
         else:  # one camera per image
-            # Reading cameras from images
-            for cam in self.recon.cameras.values():
-                _, model, new_params = process_camera(
-                    cam, self.load_with_pad, images_size=self.images_size
-                )
-                cam_id = str(cam.camera_id)
-                intrinsics[cam_id] = {
-                    "cam_id": cam_id,
-                    "model": model,
-                    "parameters": new_params.to(self.device),
-                }
+            # Reading cameras from images: the image gives the file and resized
+            # sizes the intrinsics are mapped to.
+            for image in self.recon.images.values():
+                cam_id = str(image.camera_id)
+                if cam_id not in intrinsics:
+                    intrinsics[cam_id] = {
+                        "cam_id": cam_id,
+                        "parameters": self._camera_params(image.camera, image.name),
+                    }
         # Sort dict by keys
         intrinsics = dict(sorted(intrinsics.items()))
 
         # Convert to Camera objects
         cam_id_to_tensor_id = {}
-        k_models, k_params = [], []
+        k_params = []
         for idx, cam_id in enumerate(sorted(intrinsics.keys())):
             cam_id_to_tensor_id[cam_id] = idx
-            k_models.append(intrinsics[cam_id]["model"])
             k_params.append(intrinsics[cam_id]["parameters"])
+        k_params = torch.stack(k_params)
 
         intrinsics = CameraModule(
             image_id_map=cam_id_to_tensor_id,
-            k_models=k_models,
-            k_params=torch.stack(k_params),
+            k_models=["SIMPLE_PINHOLE"] * len(k_params),
+            k_params=k_params[:, :3],
+            aspect=k_params[:, 3],
             lr=self.k_lr,
             device=self.device,
             dtype=self.dtype,
@@ -1698,6 +1694,29 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
         self.poses = poses
         self.intrinsics = intrinsics
+
+    def _camera_params(self, camera, image_name):
+        """``[f, cx, cy, aspect]`` of ``camera`` in ``image_name``'s resized frame.
+
+        Also records the image's per-axis resize scales, which the export
+        inverts (see :func:`helpers.load.process_camera`).
+        """
+        data = self.images[image_name]
+        h, w = data["hw"]
+        if "coords" in data:
+            file_wh = (float(data["coords"][4]), float(data["coords"][5]))
+        else:  # feed-forward entry without original size: its own file
+            file_wh = (float(w), float(h))
+        _, params, aspect = process_camera(
+            camera,
+            self.load_with_pad,
+            images_size=self.images_size,
+            image_wh=file_wh,
+            resized_wh=(w, h),
+        )
+        if not self.load_with_pad:
+            data["axis_scale"] = (w / file_wh[0], h / file_wh[1])
+        return torch.cat([params, torch.tensor([aspect], dtype=params.dtype)])
 
     def _load_and_preprocess_images(self):
         """Load all images into ``self.images`` (resized + optionally padded)."""
@@ -1789,7 +1808,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
         self.images = {}
         R_list, t_list = [], []
-        cam_params = {}  # cam_id -> list of per-image [f, cx, cy] (averaged below)
+        cam_params = {}  # cam_id -> per-image [f, cx, cy, aspect] (averaged below)
 
         for name in sorted(ff_data.keys()):
             entry = ff_data[name]
@@ -1838,13 +1857,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
             R_list.append(pose[:3, :3].contiguous())
             t_list.append(pose[:3, 3].reshape(3, 1).contiguous())
-            # PINHOLE params [fx, fy, cx, cy] taken from K, which the
-            # wrappers supply in COLMAP's pixel convention on the resized
-            # frame (principal point at the float image centre); the -0.5
-            # moves it to EPO's integer-centre grid, as `process_camera`
-            # does for the disk path.
             cam_params.setdefault(cam_id, []).append(
-                torch.stack([K[0, 0], K[1, 1], K[0, 2] - 0.5, K[1, 2] - 0.5])
+                self._ff_camera_params(name, entry["intrinsic"])
             )
 
         self.num_images = len(self.images)
@@ -1861,8 +1875,9 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         )
         self.intrinsics = CameraModule(
             image_id_map=cam_id_to_tensor_id,
-            k_models=["PINHOLE"] * len(cam_ids_sorted),
-            k_params=k_params,
+            k_models=["SIMPLE_PINHOLE"] * len(cam_ids_sorted),
+            k_params=k_params[:, :3],
+            aspect=k_params[:, 3],
             lr=self.k_lr,
             device=self.device,
             dtype=self.dtype,
@@ -1893,6 +1908,32 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             device=self.device,
             dtype=self.dtype,
         )
+
+    def _ff_camera_params(self, name, K):
+        """``[f, cx, cy, aspect]`` of a feed-forward ``K``, as the disk path.
+
+        The wrappers give ``K`` in COLMAP's pixel convention; with ``coords``
+        it lives in the original image scaled by ``scale`` (the letterbox
+        family: principal point at the float centre of the unrounded
+        ``scale``-sized image), otherwise in the processed image itself. It is
+        mapped back to that image's frame and through :meth:`_camera_params`,
+        so the rounded resize is handled per axis exactly like on disk.
+        """
+        data = self.images[name]
+        K = torch.as_tensor(K).detach().to("cpu", torch.float64)
+        params = [K[0, 0], K[1, 1], K[0, 2], K[1, 2]]
+        if "coords" in data:
+            width, height = (int(v) for v in data["coords"][4:6].tolist())
+            params = [p / data["scale"] for p in params]
+        else:
+            height, width = data["hw"]
+        camera = pycolmap.Camera(
+            model="PINHOLE",
+            width=width,
+            height=height,
+            params=[float(p) for p in params],
+        )
+        return self._camera_params(camera, name)
 
     @classmethod
     def from_ff(cls, ff_data, **kwargs):

@@ -270,16 +270,18 @@ def build_reconstruction(
 
     for _image_name, image_data in epo.images.items():
         cam_id = image_data["cam_id"]
+        # Per-axis (x, y) resize scales of the disk loader (see
+        # ``process_camera``); one scale for both axes otherwise.
         scale = image_data.get("scale", 1.0)
         unique_cam_ids.add(cam_id)
 
         if cam_id not in camera_scales:
             camera_scales[cam_id] = []
-        camera_scales[cam_id].append(scale)
+        camera_scales[cam_id].append(image_data.get("axis_scale", (scale, scale)))
 
     # Use median scale for each camera
     for cam_id in camera_scales:
-        camera_scales[cam_id] = np.median(camera_scales[cam_id])
+        camera_scales[cam_id] = np.median(np.asarray(camera_scales[cam_id]), axis=0)
 
     for idx, cam_id in enumerate(
         unique_cam_ids
@@ -289,15 +291,18 @@ def build_reconstruction(
         params = params.detach().cpu().float().numpy()
 
         # Get scale for this camera
-        scale = camera_scales.get(cam_id, 1.0)
+        sx, sy = camera_scales.get(cam_id, (1.0, 1.0))
 
         # Apply inverse scaling to focal lengths (scale back to original).
         # The +0.5 undoes the pixel-centre convention shift of
         # ``process_camera`` (EPO integer centres -> COLMAP half-integer).
+        # ``f`` is the x focal; ``fy = f * aspect`` maps back to the same
+        # value, as ``aspect = sy / sx``, so the export stays SIMPLE_PINHOLE.
         params = params.copy()
-        params[0] /= scale  # f
-        params[1] = (params[1] + 0.5) / scale  # cx
-        params[2] = (params[2] + 0.5) / scale  # cy
+        params[0] /= sx  # f
+        params[1] = (params[1] + 0.5) / sx  # cx
+        params[2] = (params[2] + 0.5) / sy  # cy
+        scale = sx
         model = pycolmap.CameraModelId.SIMPLE_PINHOLE
 
         # Get image dimensions from first image with this cam_id

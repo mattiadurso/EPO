@@ -29,6 +29,7 @@ class CameraModule(BaseModule):
         direct_backprop: bool = False,
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
+        aspect: torch.Tensor | None = None,
     ):
         """Class storing camera intrinsics as simple pinhole (f, cx, cy) for all cameras.
 
@@ -48,6 +49,10 @@ class CameraModule(BaseModule):
                 for ablations.
             device: torch device for parameters and cached matrices.
             dtype: torch dtype for parameters and cached matrices.
+            aspect: optional ``(N,)`` fixed ``fy / fx`` per camera, the
+                anisotropy of the image resize (see
+                :func:`helpers.load.process_camera`); ``K[1, 1] = f * aspect``.
+                Default: square pixels.
         """
         super().__init__(image_id_map, device=device, dtype=dtype)
         self.max_num_iterations = max_num_iterations
@@ -66,6 +71,12 @@ class CameraModule(BaseModule):
             else:  # SIMPLE_PINHOLE
                 normalized.append(p[:3])
         self.k_params = torch.stack(normalized)  # (N, 3): [f, cx, cy]
+        n_cams = self.k_params.shape[0]
+        self.aspect = (
+            torch.ones(n_cams, device=self.device, dtype=self.dtype)
+            if aspect is None
+            else torch.as_tensor(aspect, device=self.device, dtype=self.dtype)
+        )
 
         # Learnable focal per camera. Default: alpha scale (f_eff = f*(1+alpha)).
         # direct_backprop: raw f initialized from k_params.
@@ -116,9 +127,11 @@ class CameraModule(BaseModule):
         if tensor_indices is None:
             params = self.k_params  # (B, 3): [f, cx, cy]
             learn = self.params  # (B, 1): raw f or alpha
+            aspect = self.aspect
         else:
             params = self.k_params[tensor_indices]  # (B, 3): [f, cx, cy]
             learn = self.params[tensor_indices]  # (B, 1): raw f or alpha
+            aspect = self.aspect[tensor_indices]
 
         if self.direct_backprop:
             f = learn[:, 0]
@@ -130,7 +143,7 @@ class CameraModule(BaseModule):
         B = params.shape[0]
         K = torch.zeros((B, 3, 3), dtype=params.dtype, device=self.device)
         K[:, 0, 0] = f
-        K[:, 1, 1] = f
+        K[:, 1, 1] = f * aspect
         K[:, 0, 2] = cx
         K[:, 1, 2] = cy
         K[:, 2, 2] = 1.0

@@ -431,50 +431,64 @@ def load_reconstruction(recon_path):
     return recon, cams, imgs, id_to_name, path
 
 
-def process_camera(camera, load_with_pad: bool = False, images_size: int = 518):
+def process_camera(
+    camera,
+    load_with_pad: bool = False,
+    images_size: int = 518,
+    image_wh=None,
+    resized_wh=None,
+):
     """Convert a ``pycolmap.Camera`` into the layout expected by EPO.
 
-    Returns ``(cam_id, model, params)`` where ``params`` is a 1D tensor with
-    intrinsics rescaled to match the resized (and optionally padded-to-square)
-    image. Supports ``SIMPLE_PINHOLE`` and ``PINHOLE``.
+    Returns ``(cam_id, params, aspect)``: ``params`` is ``[f, cx, cy]`` in the
+    resized (and optionally padded-to-square) image and ``aspect`` the fixed
+    ``fy / fx`` of that frame. Supports ``SIMPLE_PINHOLE`` and ``PINHOLE``.
+
+    The intrinsics are mapped per axis, from the camera's own frame to the
+    image file (``image_wh``, default: the camera's size) and from the file
+    to the resized image (``resized_wh``). Why: a 3DFM may export its
+    network frame, an anisotropic resize of the file (VGGT-Omega: 512 x 336
+    for a 6214 x 4138 image, 1.5 % apart), and the resize rounds the short
+    side down (``int``), which leaves its scale up to 0.3 % below the long
+    side's. Square pixels are imposed in the file frame (``fx`` and ``fy``
+    averaged there), so ``aspect`` is the resize's own anisotropy.
     """
-    cam_id = camera.camera_id
     model = camera.model.name
     params = camera.params
-    width = camera.width
-    height = camera.height
-
-    if model == "SIMPLE_PINHOLE":  # or model == "SIMPLE_RADIAL":
-        f = torch.tensor(params[0])
+    if model == "SIMPLE_PINHOLE":
+        fx = fy = params[0]
         cx, cy = params[1], params[2]
-
-    elif model == "PINHOLE":  # or model == "RADIAL":
-        f = torch.tensor([params[0], params[1]])
-        cx, cy = params[2], params[3]
-
+    elif model == "PINHOLE":
+        fx, fy, cx, cy = params[0], params[1], params[2], params[3]
     else:
         raise NotImplementedError(f"Camera model {model} not supported.")
 
-    # Account for padding when making square
+    # Camera frame -> image-file frame.
+    width, height = image_wh if image_wh is not None else (camera.width, camera.height)
+    ax, ay = width / camera.width, height / camera.height
+    f = 0.5 * (fx * ax + fy * ay)
+    cx, cy = cx * ax, cy * ay
+
+    # Image-file frame -> resized frame (padding shift first when squaring).
     max_dim = max(width, height)
-    pad_x = (max_dim - width) // 2 if load_with_pad else 0
-    pad_y = (max_dim - height) // 2 if load_with_pad else 0
+    if load_with_pad or resized_wh is None:
+        pad_x = (max_dim - width) // 2 if load_with_pad else 0
+        pad_y = (max_dim - height) // 2 if load_with_pad else 0
+        sx = sy = images_size / max_dim
+    else:
+        pad_x = pad_y = 0
+        sx, sy = resized_wh[0] / width, resized_wh[1] / height
 
-    # Scale factor after resize
-    scale = images_size / max_dim
-
-    # Apply padding shift + scale, then move from COLMAP's pixel convention
-    # (centre of pixel i at i + 0.5) to EPO's (edge coordinates are integer
-    # pixel indices, i.e. centre of pixel i at i). The resize keeps the
-    # half-integer convention (torchvision/F.interpolate, antialias on), so
-    # the half-pixel shift is applied once, in the working frame.
-    # ``build_reconstruction`` undoes it on export.
-    f = f * scale
-    cx = (cx + pad_x) * scale - 0.5
-    cy = (cy + pad_y) * scale - 0.5
-
-    params = torch.cat([f.flatten(), torch.tensor([cx, cy])], dim=0)
-    return cam_id, model, params
+    # Then move from COLMAP's pixel convention (centre of pixel i at i + 0.5)
+    # to EPO's (edge coordinates are integer pixel indices, i.e. centre of
+    # pixel i at i). The resize keeps the half-integer convention
+    # (torchvision/F.interpolate, antialias on), so the half-pixel shift is
+    # applied once, in the working frame. ``build_reconstruction`` undoes it.
+    params = torch.tensor(
+        [f * sx, (cx + pad_x) * sx - 0.5, (cy + pad_y) * sy - 0.5],
+        dtype=torch.float64,
+    )
+    return camera.camera_id, params, sy / sx
 
 
 def process_pose(image):
