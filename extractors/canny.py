@@ -90,8 +90,16 @@ class CannyEdgeDetector(nn.Module):
 
         images = images.to(self.device)
         images = images if images.is_floating_point() else images.float()
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            _, edges = self.canny(images)  # 1 strong, 0.5 weak, 0 none
+        # No cuDNN autotuning for these filters: they run once per image
+        # shape, and benchmarking each new shape cost ~0.3 s of a scene's
+        # setup for identical edge maps.
+        cudnn = torch.backends.cudnn
+        benchmark, cudnn.benchmark = cudnn.benchmark, False
+        try:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                _, edges = self.canny(images)  # 1 strong, 0.5 weak, 0 none
+        finally:
+            cudnn.benchmark = benchmark
         if self.hysteresis:
             edges = self._hysteresis(edges)
         return edges
