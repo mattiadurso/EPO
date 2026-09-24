@@ -230,8 +230,11 @@ class BaseWrapper:
         """
         from PIL import Image
         from torchvision.io import ImageReadMode, read_image
-        from torchvision.transforms import InterpolationMode
-        from torchvision.transforms.functional import resize as tv_resize
+
+        # transforms.v2, as helpers/load.py: v1's uint8 bicubic-antialias
+        # resize rounds differently (pixels up to 7/255 apart).
+        from torchvision.transforms.v2 import InterpolationMode
+        from torchvision.transforms.v2.functional import resize as tv_resize
 
         new_h, new_w = resize_hw
 
