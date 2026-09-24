@@ -577,7 +577,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.lr_list = {"R": [], "t": [], "mlp": [], "k": [], "z": []}
         self.auc_list = {"auc": {th: [] for th in self.auc_th}, "steps": []}
         self.convergence = False
-        self.changes = {"q": [], "t": [], "max": [], "steps": [], "z": []}
+        self.changes = {"q": [], "t": [], "max": [], "max_c": [], "steps": [], "z": []}
         self.mlp_pose_convergence = False
         self.optim_convergence = False
         self.convergence_loss = False
@@ -623,7 +623,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             window_depth (int, optional): Window size for depth convergence evaluation. Default is 25.
             window_loss (int, optional): Window size for loss-plateau convergence evaluation. Default is 100.
             convergence_tol_pose (float, optional): Tolerance for pose convergence. Default is 0.5.
-            convergence_tol_depth (float, optional): Tolerance for depth convergence. Default is 0.1. Not used when early_stop is False.
+            convergence_tol_depth (float, optional): Tolerance (degrees) for the phase-2 stop, on the smoothed max of the rotation and camera-centre changes (see ``evaluate_center_err``). Default is 0.1. Not used when early_stop is False.
             convergence_tol_loss (float, optional): Relative-loss-change tolerance for early stop when ``early_stop="loss"``. Default is 5e-4.
             early_stop (str, optional): Whether to stop early if depth convergence is reached. Default is 'pose'.
             huber_delta (float, optional): Huber threshold of the DT loss, in ``images_size`` pixels. Default is 1.0.
@@ -741,7 +741,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         past_poses = self.poses.get_all_matrices().detach().clone()
 
         # Fixed-lag async per-step stats: each step enqueues its
-        # (loss, err_q, err_t) as a non-blocking D2H copy into a pinned
+        # (loss, err_q, err_t, err_c) as a non-blocking D2H copy into a pinned
         # double buffer and consumes the PREVIOUS step's values. This
         # replaces the per-step hard sync (.tolist()) with an event wait
         # that is one step behind — the host runs a full iteration ahead
@@ -750,7 +750,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # one step later than with the synchronous read — an intentional,
         # bounded semantics change.
         _stats_pinned = [
-            torch.empty(3, dtype=self.dtype, pin_memory=True) for _ in range(2)
+            torch.empty(4, dtype=self.dtype, pin_memory=True) for _ in range(2)
         ]
         _stats_events = [torch.cuda.Event(), torch.cuda.Event()]
         _stats_pending = False  # becomes True after the first enqueue
@@ -939,7 +939,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             if _stats_pending:
                 prev = 1 - slot
                 _stats_events[prev].synchronize()
-                loss_val, err_q, err_t = _stats_pinned[prev].tolist()
+                loss_val, err_q, err_t, err_c = _stats_pinned[prev].tolist()
                 self.loss_list.append(loss_val)
                 max_err = max(err_q, err_t)
                 if self.verbose:
@@ -954,6 +954,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                         ),
                     )
                 self.changes["max"].append(max_err)
+                self.changes["max_c"].append(max(err_q, err_c))
                 self.changes["steps"].append(step - 1)
                 appended = True
             _stats_pending = True
@@ -970,7 +971,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     # Phase 2's stop test must only see its own samples: the
                     # phase-1 history would otherwise fill its window and end
                     # the depth phase before its learning-rate warmup is over.
-                    self._phase2_start = len(self.changes["max"])
+                    self._phase2_start = len(self.changes["max_c"])
                     if log_t:
                         self.timings["pose_convergence_time"] = (
                             time.perf_counter() - optimization_start - auc_time
@@ -987,8 +988,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
             elif appended and self.mlp_pose_convergence:
                 if early_stop == "pose":
+                    # Camera-centre motion, not the t_cw direction: the latter
+                    # depends on the world origin (see evaluate_center_err).
                     if self.check_convergence(
-                        list_of_changes=self.changes["max"][self._phase2_start :],
+                        list_of_changes=self.changes["max_c"][self._phase2_start :],
                         window=window_depth,
                         early_stop=early_stop,  # "pose"
                         tol=convergence_tol_depth,
@@ -1031,12 +1034,13 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         if _stats_pending:
             slot = step % 2
             _stats_events[slot].synchronize()
-            loss_val, err_q, err_t = _stats_pinned[slot].tolist()
+            loss_val, err_q, err_t, err_c = _stats_pinned[slot].tolist()
             self.loss_list.append(loss_val)
             if self.verbose:
                 self.changes["q"].append(err_q)
                 self.changes["t"].append(err_t)
             self.changes["max"].append(max(err_q, err_t))
+            self.changes["max_c"].append(max(err_q, err_c))
             self.changes["steps"].append(step)
 
         self._sync()

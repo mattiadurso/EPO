@@ -66,6 +66,34 @@ def evaluate_R_err_fast(R_past, R_present, deg=True):
     return err_rad
 
 
+def evaluate_center_err(R_past, R_present, t_past, t_present, deg=True):
+    """Per-image camera-centre displacement, as an angle at the scene scale.
+
+    ``atan(|c' - c| / s)`` with ``c = -R^T t`` the camera centre and ``s`` the
+    median distance of the present centres from their median. Unlike the
+    direction of ``t_cw`` (:func:`evaluate_t_err`) it does not depend on
+    where the world origin is: a camera next to the origin (the 3DFM's
+    reference view) turns its ``t_cw`` by degrees per step while barely
+    moving, and on a scene of ~20 images the 0.95 quantile is that camera.
+
+    Args:
+        R_past: ``(N, 3, 3)`` previous rotations (world-to-camera).
+        R_present: ``(N, 3, 3)`` current rotations.
+        t_past: ``(N, 3)`` previous translations.
+        t_present: ``(N, 3)`` current translations.
+        deg: If True, return degrees; otherwise radians.
+
+    Returns:
+        ``(N,)`` tensor of per-image angles.
+    """
+    c_past = -(R_past.transpose(-1, -2) @ t_past[..., None])[..., 0]
+    c_present = -(R_present.transpose(-1, -2) @ t_present[..., None])[..., 0]
+    spread = c_present - c_present.median(dim=0).values
+    scale = spread.norm(dim=-1).median()
+    err = torch.atan((c_present - c_past).norm(dim=-1) / scale)
+    return torch.rad2deg(err) if deg else err
+
+
 def evaluate_pose_changes(P_past, P_present, quantile=0.95, deg=True):
     """Evaluate the rotation and translation errors between two poses.
 
@@ -76,7 +104,8 @@ def evaluate_pose_changes(P_past, P_present, quantile=0.95, deg=True):
         deg: If True, report errors in degrees; otherwise in radians.
 
     Returns:
-        ``(2,)`` tensor with the rotation and translation error quantiles in
+        ``(3,)`` tensor with the quantiles of the rotation, translation-
+        direction and camera-centre changes (:func:`evaluate_center_err`), in
         degrees (or radians). Kept on-device — no GPU→CPU sync here; the
         caller batches the transfer of all per-step scalars into one read.
     """
@@ -90,5 +119,6 @@ def evaluate_pose_changes(P_past, P_present, quantile=0.95, deg=True):
 
     err_q = evaluate_R_err_fast(R_past, R_present, deg=deg)  # (N,)
     err_t = evaluate_t_err(t_past, t_present, deg=deg)  # (N,)
+    err_c = evaluate_center_err(R_past, R_present, t_past, t_present, deg=deg)
 
-    return torch.quantile(torch.stack([err_q, err_t]), quantile, dim=1)
+    return torch.quantile(torch.stack([err_q, err_t, err_c]), quantile, dim=1)
