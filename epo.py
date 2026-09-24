@@ -1353,6 +1353,13 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             indices = torch.randperm(len(sampled_viewgraph), generator=self.rng_cpu)[
                 : self.max_viewgraph_pairs
             ]
+            # Indexing a CUDA tensor with a CPU index copies it with a
+            # blocking memcpy, which drained the GPU queue every step. Upload
+            # it asynchronously from pinned memory instead (the caching host
+            # allocator keeps the buffer until the copy has run).
+            indices = indices.pin_memory().to(
+                sampled_viewgraph.device, non_blocking=True
+            )
             sampled_viewgraph = sampled_viewgraph[indices]
 
         # divide self.viewgraph in batches if len(self.viewgraph) > batch size
