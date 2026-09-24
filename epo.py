@@ -1663,11 +1663,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             # sizes the intrinsics are mapped to.
             for image in self.recon.images.values():
                 cam_id = str(image.camera_id)
+                # Called for every image: it also records the image's axis
+                # scales, which the export reads per image.
+                params = self._camera_params(image.camera, image.name)
                 if cam_id not in intrinsics:
-                    intrinsics[cam_id] = {
-                        "cam_id": cam_id,
-                        "parameters": self._camera_params(image.camera, image.name),
-                    }
+                    intrinsics[cam_id] = {"cam_id": cam_id, "parameters": params}
         # Sort dict by keys
         intrinsics = dict(sorted(intrinsics.items()))
 
