@@ -135,7 +135,7 @@ def dbscan_filter(reconstruction, eps=0.5, min_samples=20, verbose: bool = False
 POINT_RADIUS_FACTOR = 3.0
 
 
-def clip_points_to_cameras(reconstruction, factor=POINT_RADIUS_FACTOR):
+def clip_points_to_cameras(reconstruction, factor=POINT_RADIUS_FACTOR, points=None):
     """Drop 3D points far outside the camera rig, in place.
 
     Every model of one scene lives in the same world frame, but their point
@@ -151,6 +151,8 @@ def clip_points_to_cameras(reconstruction, factor=POINT_RADIUS_FACTOR):
         factor: bound on the distance from the camera centroid, as a
             multiple of the camera-rig radius (the largest distance from a
             camera centre to that centroid). ``None`` disables the filter.
+        points: ``(point3D_ids, xyz)`` arrays of every point in the model,
+            when the caller has them; otherwise they are read from it.
 
     Returns:
         Number of points removed.
@@ -170,13 +172,17 @@ def clip_points_to_cameras(reconstruction, factor=POINT_RADIUS_FACTOR):
     if radius <= 0:
         return 0
     bound = factor * radius
-    doomed = [
-        pid
-        for pid, point in reconstruction.points3D.items()
-        if np.linalg.norm(point.xyz - origin) > bound
-    ]
+    if points is None:
+        items = list(reconstruction.points3D.items())
+        points = (
+            np.array([pid for pid, _ in items]),
+            np.array([point.xyz for _, point in items]),
+        )
+    ids, xyz = points
+    # Row-wise norm, bitwise equal to np.linalg.norm on each point.
+    doomed = ids[np.linalg.norm(xyz - origin, axis=1) > bound]
     for pid in doomed:
-        reconstruction.delete_point3D(pid)
+        reconstruction.delete_point3D(int(pid))
     return len(doomed)
 
 
@@ -434,39 +440,29 @@ def build_reconstruction(
         # Compute fresh 3D world coordinates
         epo.unproject_edges_to_3D()
 
+        # One host copy of each per-image tensor (rows follow
+        # ``epo.image_id_map``) instead of three copies per image.
+        points_3D_all = epo.edges_3D.params.detach().cpu().numpy()  # (I, N, 3)
+        pad_mask_all = epo.pad_masks.params.detach().cpu().numpy()  # (I, N)
+        edges_all = epo.edges_padded.params.detach().cpu().numpy()  # (I, N, 2)
+
         total_points = 0
+        track = pycolmap.Track()  # empty; add_point3D copies it
+        point_ids, point_xyz = [], []
 
         for _image_id, image_name in image_id_to_name.items():
             image_data = epo.images[image_name]
-            cam_id = image_data["cam_id"]
-
-            # Get unprojected 3D points from edges_3D module
-            points_3D = epo.edges_3D.get_parameters([image_name])  # (1, N, 3)
-            points_3D = points_3D[0]  # (N, 3)
-
-            # Get pad mask
-            pad_mask = epo.pad_masks.get_parameters([image_name])  # (1, N)
-            pad_mask = pad_mask[0]  # (N,)
-
-            # Convert to numpy if needed
-            if torch.is_tensor(pad_mask):
-                pad_mask = pad_mask.detach().cpu().numpy()
+            row = epo.image_id_map[image_name]
 
             # Filter by pad mask (only valid edges, ignore padded entries)
-            valid_mask = pad_mask > 0
-            valid_3D = points_3D[valid_mask]  # (M, 3)
+            valid_mask = pad_mask_all[row] > 0
+            valid_3D = points_3D_all[row][valid_mask]  # (M, 3)
             valid_indices = np.where(valid_mask)[0]
 
             if len(valid_3D) == 0:
                 if verbose:
                     logger.warning(f"No valid edges for {image_name}")
                 continue
-
-            # Convert to numpy if needed
-            if torch.is_tensor(valid_3D):
-                valid_3D = valid_3D.detach().cpu().numpy()
-            if torch.is_tensor(valid_indices):
-                valid_indices = valid_indices.detach().cpu().numpy()
 
             # Sample uniformly up to max_points_per_image
             num_valid = len(valid_3D)
@@ -480,14 +476,10 @@ def build_reconstruction(
 
             # Get RGB values from original image
             if "image" in image_data:
-                image = image_data["image"].detach().cpu().numpy()  # (3, H, W)
-                edges_padded = epo.edges_padded.get_parameters(
-                    [image_name]
-                )  # (1, N, 2)
-                edges_padded = edges_padded[0].detach().cpu().numpy()  # (N, 2)
+                image = image_data["image"].detach()  # (3, H, W)
 
                 # Get coordinates of valid edges
-                valid_edges = edges_padded[valid_indices]
+                valid_edges = edges_all[row][valid_indices]
                 y_coords_int = valid_edges[:, 1].astype(np.int32)
                 x_coords_int = valid_edges[:, 0].astype(np.int32)
 
@@ -495,7 +487,10 @@ def build_reconstruction(
                 y_coords_int = np.clip(y_coords_int, 0, image.shape[1] - 1)
                 x_coords_int = np.clip(x_coords_int, 0, image.shape[2] - 1)
 
-                rgb = image[:, y_coords_int, x_coords_int]  # (3, M)
+                # Gather on the device: only the sampled pixels reach the host.
+                ys = torch.from_numpy(y_coords_int).to(image.device, torch.long)
+                xs = torch.from_numpy(x_coords_int).to(image.device, torch.long)
+                rgb = image[:, ys, xs].cpu().numpy()  # (3, M)
                 rgb = (rgb * 255).astype(np.uint8).T  # (M, 3)
             else:
                 # Default to black if no image available
@@ -514,7 +509,8 @@ def build_reconstruction(
             # Empty tracks are the correct representation for
             # observation-free points (mean track length 0).
             for pt_world, rgb_val in zip(valid_3D, rgb, strict=False):
-                reconstruction.add_point3D(pt_world, pycolmap.Track(), rgb_val)
+                point_ids.append(reconstruction.add_point3D(pt_world, track, rgb_val))
+            point_xyz.append(valid_3D)
 
             total_points += len(valid_3D)
             if verbose:
@@ -534,8 +530,12 @@ def build_reconstruction(
             verbose=verbose,
         )
 
-    # 6. Keep the framing comparable with the other models of this scene
-    clipped = clip_points_to_cameras(reconstruction)
+    # 6. Keep the framing comparable with the other models of this scene.
+    #    Without DBSCAN the model holds exactly the points added above.
+    known = None
+    if save_points and not final_dbscan_filtering and point_ids:
+        known = (np.asarray(point_ids), np.concatenate(point_xyz).astype(np.float64))
+    clipped = clip_points_to_cameras(reconstruction, points=known)
 
     # 7. Put the input's reference view back at [I|0] (EPO pins no camera)
     center_cameras_to_identity(reconstruction, epo.anchor_image)
