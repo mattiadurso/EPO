@@ -744,6 +744,9 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
         assert xyz_world.is_cuda and K.is_cuda and P.is_cuda
         assert dt_fields_src.is_cuda and dt_indices.is_cuda
         assert img_hw.is_cuda
+        # The second output never gets a gradient; without this autograd
+        # allocates and zero-fills one for it on every backward.
+        ctx.set_materialize_grads(False)
         if dt_fields_src.dim() == 4:
             dt_fields_src = dt_fields_src.squeeze(1)
         assert dt_fields_src.dim() == 3, (

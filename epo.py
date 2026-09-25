@@ -995,8 +995,12 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 if early_stop == "pose":
                     # Camera-centre motion, not the t_cw direction: the latter
                     # depends on the world origin (see evaluate_center_err).
+                    # The test reads only the last 2*window-1 values: slice
+                    # those, not the whole (growing) phase-2 history.
+                    max_c = self.changes["max_c"]
+                    tail = max(self._phase2_start, len(max_c) - (2 * window_depth - 1))
                     if self.check_convergence(
-                        list_of_changes=self.changes["max_c"][self._phase2_start :],
+                        list_of_changes=max_c[tail:],
                         window=window_depth,
                         early_stop=early_stop,  # "pose"
                         tol=convergence_tol_depth,
@@ -1272,6 +1276,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             )  # (bs, N, 3)
             points_3D_list.append(pts3d)
 
+        if len(points_3D_list) == 1:
+            return points_3D_list[0]  # a lone chunk: torch.cat would copy it
         return torch.cat(points_3D_list, dim=0)
 
     def unproject_edges_to_3D(self, batch_size=None):
@@ -1524,11 +1530,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     huber_delta=huber_delta,
                 )
 
-            zero = total_sum.new_zeros(())
             mean_losses = torch.where(
                 total_count > 0,
                 total_sum / total_count.to(self.dtype).clamp(min=1.0),
-                zero,
+                0.0,
             )
 
             # collect this batch's results
@@ -1542,8 +1547,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             if self.log_granular_time:
                 self.timings["forward_pass"] += time.perf_counter() - s_time
 
-        # concatenate all collected batch results
-        residuals = torch.cat(residuals_list, dim=0)  # (num_pairs,)
+        # concatenate all collected batch results (a lone batch needs no copy)
+        if len(residuals_list) == 1:
+            residuals = residuals_list[0]
+        else:
+            residuals = torch.cat(residuals_list, dim=0)  # (num_pairs,)
 
         return residuals, sampled_viewgraphs
 
