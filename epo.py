@@ -1783,6 +1783,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             load_with_pad=self.load_with_pad,
             dtype=self.dtype,
             device=self.device,
+            load_confidence=self.use_depth_confidence,
         )
         missing = [n for n, d in self.images.items() if "depth" not in d]
         if missing:
@@ -1890,10 +1891,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 "cam_id": cam_id,
             }
             if "coords" in entry:
-                self.images[name]["coords"] = torch.as_tensor(
-                    entry["coords"], device=self.device
-                )
-            if "confidence" in entry and entry["confidence"] is not None:
+                self.images[name]["coords"] = torch.as_tensor(entry["coords"])
+            if self.use_depth_confidence and entry.get("confidence") is not None:
                 self.images[name]["confidence"] = entry["confidence"].to(
                     self.device, dtype=self.dtype
                 )
@@ -2207,12 +2206,13 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # pad to have same number of edges per image
         self._pad_edges()
 
-        # add sampled depth at edges_padded locations
-        for image_name in self.images.keys():
-            edges_padded = self.images[image_name]["edges_padded"]  # (N, 2)
-            depth = self.images[image_name]["depth"]  # (H, W)
-            sampled_depth, _ = grid_sample_nan(edges_padded[None], depth[None])
-            sampled_depth = sampled_depth.squeeze()
+        # add sampled depth at edges_padded locations, all images in one call:
+        # edges are padded to one count and depths to one shape, and nearest
+        # sampling is per point, so each row matches a per-image call
+        edges_padded = torch.stack([self.images[n]["edges_padded"] for n in names])
+        depths = torch.stack([self.images[n]["depth"] for n in names])  # (I, H, W)
+        sampled_depths, _ = grid_sample_nan(edges_padded, depths)  # (I, N)
+        for image_name, sampled_depth in zip(names, sampled_depths, strict=True):
             # An edge with a NaN/inf/non-positive depth (NaN-padded or masked
             # depth maps, models that mark invalid pixels with 0) cannot be
             # unprojected: fold it into the pad mask so it is skipped by the

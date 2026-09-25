@@ -224,7 +224,9 @@ def load_and_preprocess_images(
             image_name, img_tensor, coords, scale = future.result()
             images_dict[image_name] = {
                 "image": img_tensor.to(device, dtype=dtype),
-                "coords": torch.from_numpy(coords).to(device),
+                # Host-only: read with .item()/int(); on the device every
+                # read would be a blocking copy.
+                "coords": torch.from_numpy(coords),
                 "scale": scale,
                 "hw": (img_tensor.shape[-2], img_tensor.shape[-1]),
             }
@@ -240,7 +242,7 @@ def load_and_preprocess_images(
 
 
 def _process_single_depth(
-    depth_data, image_name, image_info, target_size, load_with_pad
+    depth_data, image_name, image_info, target_size, load_with_pad, load_confidence
 ):
     """Helper function to process a single depth map.
 
@@ -261,7 +263,7 @@ def _process_single_depth(
     while depth_tensor.ndim < 4:
         depth_tensor = depth_tensor.unsqueeze(0)
 
-    confidence = entry.get("confidence")
+    confidence = entry.get("confidence") if load_confidence else None
     if confidence is not None:
         confidence_tensor = (
             confidence if torch.is_tensor(confidence) else torch.as_tensor(confidence)
@@ -341,6 +343,7 @@ def load_and_preprocess_depths(
     load_with_pad=False,
     dtype=torch.float32,
     device="cuda",
+    load_confidence=True,
 ):
     """Load and preprocess depth maps by center padding to square and resizing to target size.
     Updates images_dict with depth information.
@@ -356,6 +359,8 @@ def load_and_preprocess_depths(
                                         being resized so they align with padded images.
         dtype (torch.dtype, optional): Dtype of the returned depth tensors. Defaults to ``torch.float32``.
         device (str, optional): Device on which the depth tensors are placed. Defaults to ``"cuda"``.
+        load_confidence (bool, optional): If False, confidence maps are skipped
+            (not resized nor uploaded). Defaults to ``True``.
 
     Returns:
         dict: Updated images_dict with depth maps added
@@ -389,6 +394,7 @@ def load_and_preprocess_depths(
                 images_dict[image_name],
                 target_size,
                 load_with_pad,
+                load_confidence,
             ): image_name
             for image_name in images_dict.keys()
         }
