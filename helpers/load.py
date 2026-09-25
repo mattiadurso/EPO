@@ -8,6 +8,7 @@ shapes matching the optional padding + resize convention used by EPO.
 import glob
 import logging
 import os
+import tempfile
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -414,6 +415,28 @@ def load_and_preprocess_depths(
                     {"confidence": confidence_tensor.to(device, dtype=dtype)}
                 )
     return images_dict
+
+
+def read_reconstruction_without_points(recon_path):
+    """Read a COLMAP model's cameras and images, skipping its 3D points.
+
+    EPO only uses the poses and intrinsics, and parsing ``points3D`` is most
+    of the read (0.2 s for vggt's 100k points, 0.6 s for vggt_omega's 460k).
+    The other files are symlinked into a temporary folder next to an empty
+    ``points3D`` of the same format, so pycolmap parses them unchanged.
+    """
+    ext = ".bin" if os.path.isfile(os.path.join(recon_path, "points3D.bin")) else ".txt"
+    if not os.path.isfile(os.path.join(recon_path, "points3D" + ext)):
+        return pycolmap.Reconstruction(recon_path)  # let pycolmap report it
+    src = os.path.abspath(recon_path)
+    with tempfile.TemporaryDirectory() as tmp:
+        for name in os.listdir(src):
+            if not name.startswith("points3D"):
+                os.symlink(os.path.join(src, name), os.path.join(tmp, name))
+        # The binary format starts with the point count (uint64).
+        with open(os.path.join(tmp, "points3D" + ext), "wb") as f:
+            f.write(b"\0" * 8 if ext == ".bin" else b"")
+        return pycolmap.Reconstruction(tmp)
 
 
 def load_reconstruction(recon_path):

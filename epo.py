@@ -42,6 +42,7 @@ from helpers.load import (
     load_and_preprocess_images,
     process_camera,
     process_pose,
+    read_reconstruction_without_points,
 )
 from helpers.reconstruction import closest_to_identity
 from helpers.reprojection import (
@@ -378,7 +379,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # Loading
         if _ff_data is None:
             ## Load Reconstruction
-            self.recon = pycolmap.Reconstruction(self.reconstruction_path)
+            self.recon = read_reconstruction_without_points(self.reconstruction_path)
 
             ## Load Images as dict {image_name: image_tensor}
             s_time = time.perf_counter()
