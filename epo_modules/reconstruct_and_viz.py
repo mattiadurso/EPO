@@ -552,8 +552,8 @@ class ReconstructAndVizModule:
         for _img_id, img in recon.images.items():
             # COLMAP stores world-to-cam (R, t)
             # Rerun needs cam-to-world for the transform
-            R_gt = torch.from_numpy(img.cam_from_world.rotation.matrix())
-            t_gt = torch.from_numpy(img.cam_from_world.translation)
+            R_gt = torch.from_numpy(img.cam_from_world().rotation.matrix())
+            t_gt = torch.from_numpy(img.cam_from_world().translation)
 
             # C = -R^T * t
             cam_center = -R_gt.T @ t_gt

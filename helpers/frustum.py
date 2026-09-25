@@ -90,9 +90,9 @@ def build_view_graph_from_frustums(
         cam = cams[img.camera_id]
         K = torch.tensor(cam.calibration_matrix(), device=device, dtype=dtype)
         R = torch.tensor(
-            img.cam_from_world.rotation.matrix(), device=device, dtype=dtype
+            img.cam_from_world().rotation.matrix(), device=device, dtype=dtype
         )
-        t = torch.tensor(img.cam_from_world.translation, device=device, dtype=dtype)
+        t = torch.tensor(img.cam_from_world().translation, device=device, dtype=dtype)
 
         if images_with_depth is not None and img.name in images_with_depth:
             depth = images_with_depth[img.name]["depth"]
@@ -163,7 +163,7 @@ def build_view_graph_from_frustums(
     out_pairs = []
     for i, j in pairs:
         sorted_ij = sorted([id_to_name[i], id_to_name[j]])
-        out_pairs.append([sorted_ij[0], sorted_ij[1]])
+        out_pairs.append((sorted_ij[0], sorted_ij[1]))
 
     # sort pairs by first image name and then second image name (colmap convention)
     out_pairs = sorted(out_pairs, key=lambda x: (x[0], x[1]))
