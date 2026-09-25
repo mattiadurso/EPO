@@ -121,6 +121,22 @@ def test_full_edges():
     assert out_triton.max() == 0.0
 
 
+def test_batch_matches_per_image():
+    """A (B, H, W) stack gives each image's field bit for bit."""
+    rng = np.random.default_rng(7)
+    edges = (rng.random((5, 200, 350)) < 0.02).astype(np.float32)
+    edges[3] = 0.0
+    edges[3, 17, 42] = 1.0  # a single-edge image in the batch
+    edges_t = torch.from_numpy(edges).cuda()
+
+    batched = distance_transform_l2_triton(edges_t)
+    for b in range(len(edges)):
+        assert torch.equal(batched[b], distance_transform_l2_triton(edges_t[b]))
+        np.testing.assert_allclose(
+            batched[b].cpu().numpy(), _cv2_reference(edges[b]), atol=1e-5, rtol=1e-6
+        )
+
+
 # ---------------------------------------------------------------------------
 # Speed parity
 # ---------------------------------------------------------------------------

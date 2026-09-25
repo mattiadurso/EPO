@@ -39,12 +39,13 @@ def compute_distance_field(
     (cv2 is imported lazily so it's only required on the fallback path).
 
     Args:
-        edges_map: Tensor of shape (H, W). Values > 0 are treated as edges.
+        edges_map: Tensor of shape (H, W), or (B, H, W) for a batch of images
+            of one size. Values > 0 are treated as edges.
         device: Device to place the result on.
         dtype: Data type for the result (e.g., torch.float16).
 
     Returns:
-        field: Distance field of shape (H, W).
+        field: Distance field of the same shape as ``edges_map``.
     """
     if _distance_transform_l2_triton is not None and edges_map.is_cuda:
         try:
@@ -56,6 +57,13 @@ def compute_distance_field(
                 "cv2.distanceTransform (slower, same values)."
             )
 
+    if edges_map.dim() == 3:
+        return torch.stack(
+            [
+                _compute_distance_field_cv2_fallback(m, device=device, dtype=dtype)
+                for m in edges_map
+            ]
+        )
     return _compute_distance_field_cv2_fallback(edges_map, device=device, dtype=dtype)
 
 

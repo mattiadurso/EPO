@@ -1849,11 +1849,14 @@ def distance_transform_l2_triton(edges_map: torch.Tensor) -> torch.Tensor:
     is measured to the *edge* pixels of ``edges_map``).
 
     Args:
-        edges_map: (H, W) tensor. Values > 0 are treated as edges (distance 0).
+        edges_map: (..., H, W) tensor. Values > 0 are treated as edges
+            (distance 0). Leading dims are a batch of images of one size:
+            their rows join a single launch per pass, each computed exactly
+            as for one image.
 
     Returns:
-        (H, W) float32 tensor of Euclidean distances to the nearest edge, on the
-        same device as ``edges_map``.
+        (..., H, W) float32 tensor of Euclidean distances to the nearest edge,
+        on the same device as ``edges_map``.
     """
     assert edges_map.is_cuda, "Triton EDT requires a CUDA tensor"
     H, W = edges_map.shape[-2:]
@@ -1869,14 +1872,17 @@ def distance_transform_l2_triton(edges_map: torch.Tensor) -> torch.Tensor:
         torch.tensor(LARGE, dtype=torch.float32, device=device),
     ).contiguous()
 
+    lead = f.shape[:-2]
+
     # Pass 1: 1D EDT along rows → squared horizontal distances
-    f = _edt_1d_sq_triton(f)
+    f = _edt_1d_sq_triton(f.view(-1, W)).view(-1, H, W)
 
     # Pass 2: 1D EDT along columns. Transpose so columns become the last dim,
     # run the same kernel, transpose back.
-    f = _edt_1d_sq_triton(f.t().contiguous()).t().contiguous()
+    f = _edt_1d_sq_triton(f.transpose(1, 2).contiguous().view(-1, H))
+    f = f.view(-1, W, H).transpose(1, 2).contiguous()
 
-    return torch.sqrt(f)
+    return torch.sqrt(f).view(*lead, H, W)
 
 
 # ===========================================================================

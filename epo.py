@@ -2293,17 +2293,21 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         Stores ``dt_field`` in ``self.images[name]`` and the stacked
         ``self.dt_fields`` tensor used by the batched forward pass.
         """
+        # One EDT call per image size: the kernel runs one program per row,
+        # so a stack only adds rows (each image's values are unchanged) and
+        # replaces two tiny launches per image.
+        groups = {}
+        for image_name, data in self.images.items():
+            groups.setdefault(tuple(data["edges_map"].shape), []).append(image_name)
         dt_fields_shapes = []
-        for image_name in self.images.keys():
-            edges_map = self.images[image_name]["edges_map"]
-            dt_field = compute_distance_field(
-                edges_map,
-                device=self.device,
-            )
-            self.images[image_name].update(
-                {"dt_field": dt_field.to(self.device, dtype=self.dtype)}
-            )
-            dt_fields_shapes.append(dt_field.shape)
+        for names in groups.values():
+            edges_maps = torch.stack([self.images[n]["edges_map"] for n in names])
+            dt_fields = compute_distance_field(edges_maps, device=self.device)
+            for image_name, dt_field in zip(names, dt_fields, strict=True):
+                self.images[image_name].update(
+                    {"dt_field": dt_field.to(self.device, dtype=self.dtype)}
+                )
+                dt_fields_shapes.append(dt_field.shape)
 
         # if dt_fields_shapes is not equal, need to pad right bottom to make them equal
         if len(set(dt_fields_shapes)) > 1:
@@ -2323,9 +2327,6 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     # same border-clamp semantics as an unpadded field.
                     dt_field = F.pad(dt_field[None], pad, mode="replicate")[0]
                     self.images[image_name]["dt_field"] = dt_field
-
-        gc.collect()
-        torch.cuda.empty_cache()
 
     @torch.no_grad()
     def compute_mre(self):
