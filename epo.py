@@ -22,7 +22,6 @@ from itertools import combinations
 
 import numpy as np
 import pycolmap
-import rerun as rr
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -683,6 +682,8 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         forward_start = time.perf_counter()
 
         if use_rerun:
+            import rerun as rr  # lazy: ~0.14 s per process to import
+
             rr.init("Feature-Less Optimization", spawn=spawn_rerun)
             rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
 

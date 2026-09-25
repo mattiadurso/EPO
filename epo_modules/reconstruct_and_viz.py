@@ -14,13 +14,9 @@ import subprocess
 import warnings
 from pathlib import Path
 
-import matplotlib.cm as cm
-import matplotlib.pyplot as plt
 import numpy as np
 import pycolmap
-import rerun as rr
 import torch
-from matplotlib.colors import Normalize
 from tqdm import tqdm
 
 from helpers.reconstruction import build_reconstruction
@@ -178,6 +174,11 @@ class ReconstructAndVizModule:
         residual, and the underlying edge maps. Used by
         :meth:`visualize_residuals` to dump per-pair diagnostics.
         """
+        # Lazy: plotting libraries cost ~0.13 s per process to import.
+        import matplotlib.cm as cm
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import Normalize
+
         # Prepare filenames
         safe_img_i = img_i.replace("/", "_").replace("\\", "_")
         safe_img_j = img_j.replace("/", "_").replace("\\", "_")
@@ -546,6 +547,8 @@ class ReconstructAndVizModule:
             camera_color: RGB color used for the frustum line strips. Defaults
                 to green ``[0, 255, 0]`` when ``None``.
         """
+        import rerun as rr  # lazy: ~0.14 s per process, only needed here
+
         if camera_color is None:
             camera_color = [0, 255, 0]
         recon = pycolmap.Reconstruction(path)
