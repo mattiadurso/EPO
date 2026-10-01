@@ -25,3 +25,6 @@
 [submodule "third_party/vggsfm"]
 	path = third_party/vggsfm
 	url = https://github.com/facebookresearch/vggsfm.git
+[submodule "third_party/resplat"]
+	path = third_party/resplat
+	url = https://github.com/cvg/resplat.git

@@ -38,6 +38,33 @@
 
 
 ## Releases
+### v1.3 — Feed-forward 3D Gaussians via ReSplat
+
+`--3dgsfy` turns EPO's refined cameras into a 3D Gaussian Splatting scene in one forward pass of [ReSplat](https://github.com/cvg/resplat) (no per-scene training), as an alternative or addition to `--densify`:
+
+```bash
+bash scripts/install_resplat.sh       # once, inside the epo env
+python demo_epo.py \
+    --model vggt_omega \
+    --images_path bicycle/images \
+    --output_path out/bicycle \
+    --3dgsfy
+```
+
+This writes `splat_<model>_epo/gaussians.ply` next to `sparse_<model>_epo`: a standard 3DGS PLY (opens in any 3DGS viewer) in the same world frame as the COLMAP model. All registered images are context views at 256×384 (~21.5 GiB peak for 150 views, fits a 24 GB GPU). On `counter` (150 images, RTX 4090) the whole run takes ~47 s: 29 s for VGGT-Omega (model load + forward), 2.4 s for EPO and 15 s for ReSplat (3.4 s model load, 9.3 s forward, 1.9 s export).
+
+Better poses give better splats. Novel views on Mip-NeRF 360 (all 9 scenes, every 8th image held out, 256×384), the same feed-forward ReSplat fed with different cameras:
+
+| | VGGT-Omega + ReSplat | VGGT-Omega + EPO + ReSplat | COLMAP poses + ReSplat |
+|---|---|---|---|
+| PSNR ↑ | 22.42 | **24.22** | 25.02 |
+| SSIM ↑ | 0.599 | **0.718** | 0.761 |
+| LPIPS ↓ | 0.278 | **0.225** | 0.196 |
+
+EPO closes 70 % of the PSNR gap between VGGT-Omega's and COLMAP's poses.
+
+The installer sets everything up inside the existing `epo` env: it fetches the `third_party/resplat` submodule, applies [third_party/patches/resplat_many_views.patch](third_party/patches/resplat_many_views.patch) (chunks ReSplat's cost volume, point transformer and renderer over views so ~150 views fit in memory; same maths), installs NVIDIA's pip `nvcc` matching torch's CUDA (no system CUDA toolkit needed), builds `gsplat` 1.5.3 and `pointops`, and adds a few pure-Python deps without upgrading any existing package. The weights download from the Hugging Face Hub on first use. If `pip` hangs on an unreachable extra index from your pip config, run it as `PIP_CONFIG_FILE=/dev/null bash scripts/install_resplat.sh`.
+
 ### v1.2 — EPO is now even faster 🚀
 
 The optimization loop was profiled and rebuilt around two findings: most of the per-step cost was *not* in the Triton kernels but in redundant data movement and in kernel-launch dispatch (~600 tiny launches per step). v1.2 removes both — edge points, DT fields, and pad masks are now read by image index directly inside the fused kernels, the geometry prologue (pose MLP → intrinsics → unprojection, forward *and* backward) is captured once as a CUDA graph and replayed, and the default batch size goes 128 → 1024.
@@ -125,6 +152,8 @@ python wrapper/vggt_wrapper.py --images_path scene/images/1 --output_path out/sp
 Only `vggt`'s submodule is needed to run EPO's own demo/reconstructions; EPO refines any reconstruction in the expected layout without any of them. [third_party/lightglue](third_party/lightglue) is a further submodule needed **only** for VGGT's optional Bundle-Adjustment path (`use_ba=True`); the default feed-forward path — including [demo_epo.py](demo_epo.py) — never imports it. If you cloned without `--recursive`:
 
 [wrapper/any2full_wrapper.py](wrapper/any2full_wrapper.py) (over [third_party/Any2Full](third_party/Any2Full)) is a different kind of driver and is therefore **not** in the `WRAPPERS` registry: it takes an existing COLMAP reconstruction whose depths are sparse — EPO's own export, whose `depths.pth` only carries depth at the sampled edge pixels — and completes them into dense maps, passing the poses through untouched. See [Densifying EPO's depths](#densifying-epos-depths).
+
+[wrapper/resplat_wrapper.py](wrapper/resplat_wrapper.py) (over [third_party/resplat](third_party/resplat)) is likewise outside the registry: it reads a posed COLMAP reconstruction plus its images and predicts 3D Gaussians, written as a world-frame `gaussians.ply` (see [v1.3](#v13--feed-forward-3d-gaussians-via-resplat); setup: `bash scripts/install_resplat.sh`).
 
 ```bash
 git submodule update --init --recursive

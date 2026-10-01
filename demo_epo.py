@@ -16,6 +16,10 @@ python demo_epo.py \
     --gt_path demo_scenes/mipnerf360/bicycle/sparse_150 \
     --densify
 
+Add ``--densify`` (Any2Full depth completion) and/or ``--3dgsfy`` (ReSplat
+feed-forward 3D Gaussians, setup: ``bash scripts/install_resplat.sh``) to run
+them on EPO's refined cameras.
+
 Pass ``--model`` to pick a different wrapper/ 3D foundation model (see
 ``wrapper/__init__.py``'s ``WRAPPERS`` registry for the full list).
 Pass ``--model_output <dir>`` to skip the model and reuse a previous run's
@@ -105,6 +109,13 @@ def main():
         type=int,
         default=4,
         help="Images per Any2Full forward pass when --densify is set.",
+    )
+    parser.add_argument(
+        "--3dgsfy",
+        dest="splat",
+        action="store_true",
+        help="After EPO, predict 3D Gaussians from its cameras + the images with "
+        "ReSplat and write <output_path>/splat_<model>_epo/gaussians.ply.",
     )
     parser.add_argument("--cuda_id", type=int, default=0)
     parser.add_argument(
@@ -240,14 +251,15 @@ def main():
         )
 
     # ── 4. Optional: densify EPO's edge-only depth maps ───────────────────
+    if args.densify or args.splat:
+        del epo  # free GPU memory before loading Any2Full / ReSplat
+        gc.collect()
+        torch.cuda.empty_cache()
+
     if args.densify:
         # Imported here so the Any2Full repo's generic top-level `model` /
         # `utils` packages only land on sys.path when densification is used.
         from wrapper.any2full_wrapper import Any2FullWrapper, dense_output_path
-
-        del epo  # free GPU memory before loading Any2Full
-        gc.collect()
-        torch.cuda.empty_cache()
 
         print("\nDensifying depths with Any2Full...")
         densifier = Any2FullWrapper(cuda_id=args.cuda_id)
@@ -260,6 +272,20 @@ def main():
             f"Densification time: {densifier.last_timings['run_any2full']:.2f} s "
             f"-> {dense_output_path(epo_out)}"
         )
+        del densifier
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # ── 5. Optional: feed-forward 3D Gaussians on EPO's cameras ───────────
+    if args.splat:
+        # Imported here so ReSplat's top-level `src` package only lands on
+        # sys.path when it is used.
+        from wrapper.resplat_wrapper import ReSplatWrapper
+
+        print("\nPredicting 3D Gaussians with ReSplat...")
+        splatter = ReSplatWrapper(cuda_id=args.cuda_id)
+        ply_path = splatter.forward(epo_out, args.images_path)
+        print(f"3DGS time: {splatter.last_timings['run_resplat']:.2f} s -> {ply_path}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,205 @@
+diff --git a/src/model/decoder/gsplat_decoder_splatting_cuda.py b/src/model/decoder/gsplat_decoder_splatting_cuda.py
+index a792eab..aba1b92 100644
+--- a/src/model/decoder/gsplat_decoder_splatting_cuda.py
++++ b/src/model/decoder/gsplat_decoder_splatting_cuda.py
+@@ -13,6 +13,8 @@ from .decoder import DepthRenderingMode
+ from gsplat.rendering import rasterization
+ from .decoder import Decoder, DecoderOutput
+ 
++VIEW_CHUNK = 16  # views per rasterization call (many-view inference)
++
+ 
+ @dataclass
+ class GSplatDecoderSplattingCUDACfg:
+@@ -65,27 +67,33 @@ class GSplatDecoderSplattingCUDA(Decoder[GSplatDecoderSplattingCUDACfg]):
+         intrinsics[:, :, 0] *= width
+         intrinsics[:, :, 1] *= height
+ 
+-        render_colors, render_alphas, meta = rasterization(
+-            means=means,
+-            quats=quats,
+-            scales=scales,
+-            opacities=opacities,
+-            colors=colors,
+-            sh_degree=sh_degree,
+-            viewmats=viewmats,
+-            Ks=intrinsics,
+-            width=width,
+-            height=height,
+-            near_plane=near[0, 0].item(),  # expect float
+-            far_plane=far[0, 0].item(),
+-            eps2d=0.1,
+-            rasterize_mode="antialiased",
+-            packed=True,
+-            absgrad=False,
+-            sparse_grad=False,
+-            render_mode="RGB+ED",
+-            covars=covars,
+-        )
++        # Chunked over views (local patch for many-view inference): packed
++        # rasterization of ~130 views at once needs > 10 GB of intersections.
++        chunks = []
++        for s in range(0, viewmats.shape[1], VIEW_CHUNK):
++            chunks.append(rasterization(
++                means=means,
++                quats=quats,
++                scales=scales,
++                opacities=opacities,
++                colors=colors,
++                sh_degree=sh_degree,
++                viewmats=viewmats[:, s : s + VIEW_CHUNK],
++                Ks=intrinsics[:, s : s + VIEW_CHUNK],
++                width=width,
++                height=height,
++                near_plane=near[0, 0].item(),  # expect float
++                far_plane=far[0, 0].item(),
++                eps2d=0.1,
++                rasterize_mode="antialiased",
++                packed=True,
++                absgrad=False,
++                sparse_grad=False,
++                render_mode="RGB+ED",
++                covars=covars,
++            )[:2])
++        render_colors = torch.cat([c[0] for c in chunks], dim=1)
++        render_alphas = torch.cat([c[1] for c in chunks], dim=1)
+ 
+         color = render_colors[..., :3].permute(0, 1, 4, 2, 3)  # [B, V, 3, H, W]
+         depth = render_colors[..., -1]  # [B, V, H, W]
+diff --git a/src/model/encoder/point_transformer/layer.py b/src/model/encoder/point_transformer/layer.py
+index 999819b..d4177c3 100644
+--- a/src/model/encoder/point_transformer/layer.py
++++ b/src/model/encoder/point_transformer/layer.py
+@@ -10,6 +10,8 @@ from einops import rearrange
+ from ..unimatch.dinov2.layers.block import Block as MultiViewBlock
+ from .local_knn import local_knn_query
+ 
++POINT_CHUNK = 131072  # points per chunk in KNNAttention / MLP (many-view inference)
++
+ 
+ class KNNAttention(nn.Module):
+     def __init__(self, channels, knn_samples=16,
+@@ -46,33 +48,25 @@ class KNNAttention(nn.Module):
+         # [N, C]
+         x_q, x_k, x_v = torch.chunk(qkv, chunks=3, dim=-1)
+ 
+-        # [N, K, C+3], [N, K]
+-        x_k, idx = pointops.knn_query_and_group(
+-            x_k.contiguous(), p, o, new_xyz=p, new_offset=o,
+-            idx=knn_idx,
+-            nsample=self.knn_samples, with_xyz=False
+-        )
+-
+-        # [N, K, C]
+-        x_v, _ = pointops.knn_query_and_group(
+-            x_v.contiguous(),
+-            p,
+-            o,
+-            new_xyz=p,
+-            new_offset=o,
+-            idx=idx,
+-            nsample=self.knn_samples,
+-            with_xyz=False,
+-        )
+-
+-        n, k, c = x_k.shape
+-
+-        # [N, 1, K]
+-        scores = torch.matmul(x_q.unsqueeze(1), x_k.permute(0, 2, 1)) * scale_factor
+-        # [N, C]
+-        out = torch.matmul(torch.softmax(scores, dim=2), x_v).squeeze(1)
++        if knn_idx is None:
++            knn_idx, _ = pointops.knn_query(self.knn_samples, p, o, p, o)
+ 
+-        out = self.proj(out)
++        # Chunked over query points (local patch for many-view inference): the
++        # grouped [N, K, C] keys/values of ~1M Gaussians do not fit at once.
++        # Same gather as pointops.grouping (index -1 -> zero row).
++        pad = x_k.new_zeros(1, x_k.size(1))
++        x_k, x_v = torch.cat([x_k, pad]), torch.cat([x_v, pad])
++        out = []
++        for s in range(0, x_q.size(0), POINT_CHUNK):
++            idx = knn_idx[s : s + POINT_CHUNK].long()
++            # [n, 1, K]
++            scores = torch.matmul(
++                x_q[s : s + POINT_CHUNK].unsqueeze(1), x_k[idx].permute(0, 2, 1)
++            ) * scale_factor
++            # [n, C]
++            out.append(torch.matmul(torch.softmax(scores, dim=2), x_v[idx]).squeeze(1))
++
++        out = self.proj(torch.cat(out))
+ 
+         return out
+ 
+@@ -116,7 +110,8 @@ class TransformerBlock(nn.Module):
+         p, x, o = pxo
+ 
+         x = x + self.attn((p, self.norm1(x), o), knn_idx=knn_idx)
+-        x = x + self.mlp(self.norm2(x))
++        # chunked over points, like the attention (4x hidden width)
++        x = torch.cat([xc + self.mlp(self.norm2(xc)) for xc in x.split(POINT_CHUNK)])
+ 
+         return x
+ 
+diff --git a/src/model/encoder/unimatch/mv_unimatch.py b/src/model/encoder/unimatch/mv_unimatch.py
+index 172dbc9..9c5efb0 100755
+--- a/src/model/encoder/unimatch/mv_unimatch.py
++++ b/src/model/encoder/unimatch/mv_unimatch.py
+@@ -545,28 +545,35 @@ class MultiViewUniMatch(nn.Module):
+             tgt_features = tgt_features.float()
+             depth_candidates_curr = depth_candidates_curr.float()
+ 
+-            warped_tgt_features = warp_with_pose_depth_candidates(
+-                rearrange(tgt_features, "b v ... -> (b v) ..."),
+-                rearrange(intrinsics_input, "b v ... -> (b v) ..."),
+-                rearrange(pose_curr, "b v ... -> (b v) ..."),
+-                torch.exp(depth_candidates_curr) if self.sample_log_depth else 1.0 / depth_candidates_curr,  # convert inverse/log depth to depth
+-                grid_sample_disable_cudnn=self.grid_sample_disable_cudnn,
+-            )  # [BV*(V-1), C, D, H, W]
+-
+-            # ref: [BV, C, H, W]
+-            # warped: [BV*(V-1), C, D, H, W] -> [BV, V-1, C, D, H, W]
+-            warped_tgt_features = rearrange(
+-                warped_tgt_features,
+-                "(b v) ... -> b v ...",
+-                b=b_new,
+-                v=tgt_features.size(1),
+-            )
+-            # [BV, V-1, D, H, W] -> [BV, D, H, W]
+-            # average cross other views
+-            cost_volume = (
+-                (ref_features.unsqueeze(-3).unsqueeze(1) * warped_tgt_features).sum(2)
+-                / (c**0.5)
+-            ).mean(1)
++            # Chunked over reference views (local patch for many-view inference):
++            # the warp buffer is [BV*(V-1), C, D, H, W], ~190 MB per view at
++            # 512x768, so 130 views at once need ~25 GB. Same maths per chunk.
++            n_tgt = tgt_features.size(1)
++            depth_curr = depth_candidates_curr.view(b_new, n_tgt, *depth_candidates_curr.shape[1:])
++            cost_chunks = []
++            for s in range(0, b_new, 8):
++                e = min(s + 8, b_new)
++                d_chunk = depth_curr[s:e].flatten(0, 1)
++                warped_tgt_features = warp_with_pose_depth_candidates(
++                    rearrange(tgt_features[s:e], "b v ... -> (b v) ..."),
++                    rearrange(intrinsics_input[s:e], "b v ... -> (b v) ..."),
++                    rearrange(pose_curr[s:e], "b v ... -> (b v) ..."),
++                    torch.exp(d_chunk) if self.sample_log_depth else 1.0 / d_chunk,  # convert inverse/log depth to depth
++                    grid_sample_disable_cudnn=self.grid_sample_disable_cudnn,
++                )  # [b*(V-1), C, D, H, W]
++                # [b, V-1, C, D, H, W]
++                warped_tgt_features = rearrange(
++                    warped_tgt_features, "(b v) ... -> b v ...", b=e - s, v=n_tgt
++                )
++                # [b, V-1, D, H, W] -> [b, D, H, W], average cross other views
++                cost_chunks.append(
++                    (
++                        (ref_features[s:e].unsqueeze(-3).unsqueeze(1) * warped_tgt_features).sum(2)
++                        / (c**0.5)
++                    ).mean(1)
++                )
++                del warped_tgt_features
++            cost_volume = torch.cat(cost_chunks)
+ 
+             # regressor
+             features_cnn = features_list_cnn[scale_idx]  # [BV, C, H, W]
