@@ -16,7 +16,8 @@ The PLY uses the standard 3DGS layout (positions, SH degree 3, logit
 opacity, log scale, wxyz quaternion), so any 3DGS viewer opens it, and it is
 in the reconstruction's world frame, so it overlays the COLMAP model.
 
-All registered images are context views at 256x384 (portrait: 384x256):
+All registered images are context views at 256x384 (portrait views are
+turned 90 deg to landscape: ReSplat's encoder needs W >= H):
 peak ~19 GiB at 131 views, ~21.5 GiB at 150, on a 24 GB GPU. Setup (CUDA
 extensions, patch for many views): ``bash scripts/install_resplat.sh``. Weights
 (``resplat-base-dl3dv-256x448-view32``) download from the Hugging Face Hub on
@@ -108,9 +109,8 @@ class ReSplatWrapper:
                 ``third_party/resplat/pretrained/<CHECKPOINT>`` if present,
                 else the Hugging Face Hub copy.
             cuda_id: CUDA device index.
-            image_shape: (H, W) of the context views for landscape scenes,
-                multiples of 64; swapped for portrait scenes. 256x384 is the
-                largest that fits ~150 views in 24 GB.
+            image_shape: Landscape (H, W) of the context views, multiples
+                of 64. 256x384 is the largest that fits ~150 views in 24 GB.
         """
         self.device = torch.device(f"cuda:{cuda_id}")
         # Own the cuDNN state (see Any2FullWrapper): EPO's fix_seed leaves
@@ -203,6 +203,19 @@ class ReSplatWrapper:
         c2w = torch.from_numpy(np.stack(c2w).astype(np.float32))
         intrinsics = torch.from_numpy(np.stack(intrinsics).astype(np.float32))
         return images, c2w, intrinsics
+
+    @staticmethod
+    def _to_landscape(rgb, c2w, intrinsics):
+        """Views turned 90 deg clockwise, as ReSplat's encoder needs W >= H.
+
+        Normalised pixels map (u, v) -> (1 - v, u) and camera axes to
+        x' = -y, y' = x, so the world-frame Gaussians are unchanged.
+        """
+        rot = torch.eye(4)
+        rot[:2, :2] = torch.tensor([[0.0, -1.0], [1.0, 0.0]])
+        pix = torch.tensor([[0.0, -1.0, 1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+        rgb = torch.rot90(rgb, k=-1, dims=(-2, -1))
+        return rgb, c2w @ rot.T, pix @ intrinsics @ rot[:3, :3].T
 
     @torch.no_grad()
     def _predict(
@@ -305,11 +318,14 @@ class ReSplatWrapper:
         recon = pycolmap.Reconstruction(reconstruction_path)
         images, c2w, intrinsics = self._cameras(recon)
         cam = recon.cameras[images[0].camera_id]
-        h, w = self.image_shape if cam.width >= cam.height else self.image_shape[::-1]
+        portrait = cam.height > cam.width
+        h, w = self.image_shape[::-1] if portrait else self.image_shape
         start = time.time()
         rgb = self._load_images(
             [os.path.join(images_path, im.name) for im in images], h, w
         )
+        if portrait:
+            rgb, c2w, intrinsics = self._to_landscape(rgb, c2w, intrinsics)
         gaussians, pivot = self._predict(rgb, c2w, intrinsics)
         fields = self._to_world(gaussians, pivot)
         self.last_timings = {"run_resplat": time.time() - start}
