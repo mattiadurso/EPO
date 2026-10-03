@@ -50,6 +50,7 @@ from PIL import Image  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
 from helpers.reconstruction import clip_points_to_cameras  # noqa: E402
+from helpers.reprojection import undistort_pixels  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,11 @@ class Any2FullWrapper:
             torch.arange(w, device=depth.device, dtype=depth.dtype),
             indexing="ij",
         )
+        if camera.model.name == "SIMPLE_RADIAL":  # EPO's self-calibrated k1
+            K = depth.new_tensor([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]])
+            k1 = depth.new_tensor([camera.params[3]])
+            uv = torch.stack([us, vs], dim=-1).reshape(1, -1, 2)
+            us, vs = undistort_pixels(uv, K[None], k1).reshape(h, w, 2).unbind(-1)
         z = depth
         points_cam = torch.stack([(us - cx) / fx * z, (vs - cy) / fy * z, z], dim=-1)
 

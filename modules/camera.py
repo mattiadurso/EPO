@@ -6,6 +6,10 @@ optimizes a single scalar focal-length scale per camera (``f_eff = f *
 directly as a raw parameter instead of via ``alpha``. Principal points are
 kept fixed; ``PINHOLE`` cameras are collapsed to ``SIMPLE_PINHOLE`` by
 averaging ``fx`` and ``fy``. Skew (``gamma``) stays at 0 and non-learnable.
+
+With ``radial=True`` each camera also learns one radial distortion term,
+COLMAP's ``SIMPLE_RADIAL``: ``x_d = x_u (1 + k1 r_u^2)`` on normalised
+coordinates, ``k1`` starting at 0.
 """
 
 import torch
@@ -30,6 +34,7 @@ class CameraModule(BaseModule):
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
         aspect: torch.Tensor | None = None,
+        radial: bool = False,
     ):
         """Class storing camera intrinsics as simple pinhole (f, cx, cy) for all cameras.
 
@@ -53,6 +58,10 @@ class CameraModule(BaseModule):
                 anisotropy of the image resize (see
                 :func:`helpers.load.process_camera`); ``K[1, 1] = f * aspect``.
                 Default: square pixels.
+            radial: if True, also learn one radial distortion ``k1`` per
+                camera (``SIMPLE_RADIAL``). It is stored as a second column
+                of ``params`` so it shares the focal's optimizer and
+                schedule.
         """
         super().__init__(image_id_map, device=device, dtype=dtype)
         self.max_num_iterations = max_num_iterations
@@ -79,13 +88,17 @@ class CameraModule(BaseModule):
         )
 
         # Learnable focal per camera. Default: alpha scale (f_eff = f*(1+alpha)).
-        # direct_backprop: raw f initialized from k_params.
+        # direct_backprop: raw f initialized from k_params. With radial, a
+        # second column holds k1 (0 = pinhole).
+        self.radial = radial
         if direct_backprop:
             init = self.k_params[:, 0:1].clone()
         else:
             init = torch.zeros(
                 (self.k_params.shape[0], 1), device=self.device, dtype=self.dtype
             )
+        if radial:
+            init = torch.cat([init, torch.zeros_like(init)], dim=1)
         self.params = nn.Parameter(init, requires_grad=grad)
 
         if grad:
@@ -149,11 +162,25 @@ class CameraModule(BaseModule):
         K[:, 2, 2] = 1.0
         return K
 
-    def get_camera_parameters(self, indices) -> tuple[str, torch.Tensor]:
-        """Return ``("SIMPLE_PINHOLE", params)`` for the requested cameras.
+    def get_k1(self, indices) -> torch.Tensor | None:
+        """``(B,)`` radial distortion of the given cameras (``None``: all).
 
-        ``params`` is a ``(B, 3)`` tensor of effective ``[f, cx, cy]`` values
-        (i.e. with the learnable focal-length scale already applied).
+        ``None`` without ``radial``: callers then take the pinhole path.
+        """
+        if not self.radial:
+            return None
+        if indices is None:
+            return self.params[:, 1]
+        if isinstance(indices[0], str):
+            indices = self.map_names_to_indices(indices)
+        return self.params[indices, 1]
+
+    def get_camera_parameters(self, indices) -> tuple[str, torch.Tensor]:
+        """Return ``(model, params)`` for the requested cameras.
+
+        ``params`` holds the effective ``[f, cx, cy]`` (the learnable focal
+        scale applied), plus ``k1`` with ``radial``; ``model`` is
+        ``"SIMPLE_RADIAL"`` then, ``"SIMPLE_PINHOLE"`` otherwise.
         """
         if isinstance(indices, str):
             indices = [indices]
@@ -161,12 +188,14 @@ class CameraModule(BaseModule):
             indices = self.map_names_to_indices(indices)
 
         params = self.k_params[indices].clone()  # (B, 3): [f, cx, cy]
-        learn = self.params[indices]  # (B, 1): raw f or alpha
+        learn = self.params[indices]  # (B, 1|2): raw f or alpha [, k1]
         if self.direct_backprop:
             params[:, 0] = learn[:, 0]
         else:
             params[:, 0] = params[:, 0] * (1 + learn[:, 0])
-
+        if self.radial:
+            params = torch.cat([params, learn[:, 1:2]], dim=1)
+            return "SIMPLE_RADIAL", params.squeeze()
         return "SIMPLE_PINHOLE", params.squeeze()
 
     def update_all_matrices(self) -> None:

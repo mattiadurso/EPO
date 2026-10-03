@@ -42,6 +42,7 @@ from pathlib import Path  # noqa: E402
 import numpy as np  # noqa: E402
 import pycolmap  # noqa: E402
 import torch  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
 from gsplat import spherical_harmonics  # noqa: E402
 from PIL import Image  # noqa: E402
 from plyfile import PlyData, PlyElement  # noqa: E402
@@ -194,8 +195,8 @@ class ReSplatWrapper:
         c2w, intrinsics = [], []
         for image in images:
             camera = recon.cameras[image.camera_id]
-            if camera.model.name not in ("SIMPLE_PINHOLE", "PINHOLE"):
-                raise ValueError(f"ReSplat needs pinhole cameras, got {camera.model}")
+            if camera.model.name not in ("SIMPLE_PINHOLE", "PINHOLE", "SIMPLE_RADIAL"):
+                raise ValueError(f"Unsupported camera model {camera.model}")
             norm = np.diag([1 / camera.width, 1 / camera.height, 1.0])
             intrinsics.append(norm @ camera.calibration_matrix())
             w2c = np.vstack([image.cam_from_world().matrix(), [0, 0, 0, 1]])
@@ -216,6 +217,27 @@ class ReSplatWrapper:
         pix = torch.tensor([[0.0, -1.0, 1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
         rgb = torch.rot90(rgb, k=-1, dims=(-2, -1))
         return rgb, c2w @ rot.T, pix @ intrinsics @ rot[:3, :3].T
+
+    @staticmethod
+    def _undistort(
+        rgb: torch.Tensor, intrinsics: torch.Tensor, k1: torch.Tensor
+    ) -> torch.Tensor:
+        """Resample SIMPLE_RADIAL views onto the pinhole camera with the same K.
+
+        ReSplat is pinhole-only, so each output pixel reads the image where
+        the distortion ``x_d = x_u (1 + k1 r_u^2)`` sends it (``intrinsics``
+        are image-normalised, pixel centres at ``(i + 0.5) / size``).
+        """
+        h, w = rgb.shape[-2:]
+        ys, xs = torch.meshgrid(
+            (torch.arange(h) + 0.5) / h, (torch.arange(w) + 0.5) / w, indexing="ij"
+        )
+        f = intrinsics[:, [0, 1], [0, 1]][:, None, None]  # (V, 1, 1, 2)
+        c = intrinsics[:, [0, 1], [2, 2]][:, None, None]
+        xn = (torch.stack([xs, ys], dim=-1) - c) / f  # (V, h, w, 2)
+        s = 1 + k1[:, None, None, None] * (xn * xn).sum(-1, keepdim=True)
+        grid = 2 * (c + f * xn * s) - 1  # [0, 1] -> grid_sample's [-1, 1]
+        return F.grid_sample(rgb, grid, align_corners=False, padding_mode="border")
 
     @torch.no_grad()
     def _predict(
@@ -306,7 +328,8 @@ class ReSplatWrapper:
 
         Args:
             reconstruction_path: Posed COLMAP model (e.g. EPO's
-                ``sparse_<model>_epo``); pinhole cameras only.
+                ``sparse_<model>_epo``); pinhole or SIMPLE_RADIAL cameras
+                (those views are undistorted first, see :meth:`_undistort`).
             images_path: Root folder of the RGB images; the reconstruction's
                 image names are resolved relative to it.
             output_path: Output folder. Defaults to
@@ -324,6 +347,18 @@ class ReSplatWrapper:
         rgb = self._load_images(
             [os.path.join(images_path, im.name) for im in images], h, w
         )
+        k1 = torch.tensor(
+            [
+                (
+                    float(recon.cameras[im.camera_id].params[3])
+                    if recon.cameras[im.camera_id].model.name == "SIMPLE_RADIAL"
+                    else 0.0
+                )
+                for im in images
+            ]
+        )
+        if k1.any():
+            rgb = self._undistort(rgb, intrinsics, k1)
         if portrait:
             rgb, c2w, intrinsics = self._to_landscape(rgb, c2w, intrinsics)
         gaussians, pivot = self._predict(rgb, c2w, intrinsics)

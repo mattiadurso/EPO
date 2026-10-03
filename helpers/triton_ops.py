@@ -36,6 +36,7 @@ def _project_sample_fwd_kernel(
     XYZ_IDX_ptr,  # (B,) int64 — batch row → image index (XYZ_GATHER only)
     K_ptr,  # (B, 3, 3) float
     P_ptr,  # (B, 4, 4) float
+    K1D_ptr,  # (B,) float — target radial k1 (HAS_DIST only; dummy otherwise)
     DT_ptr,  # (N_img, H, W) float — *source* DT tensor (not gathered)
     DT_IDX_ptr,  # (B,) int64 — maps batch row → image index in DT_ptr
     IMG_HW_ptr,  # (B, 2) int32 — per-row real (H, W) of the target image
@@ -76,8 +77,13 @@ def _project_sample_fwd_kernel(
     FUSE_LOSS: tl.constexpr,
     FUSE_REDUCE: tl.constexpr,
     XYZ_GATHER: tl.constexpr,
+    HAS_DIST: tl.constexpr,
 ):
     """Forward: project xyz_world → pixel → bilinear-sample dt_field.
+
+    ``HAS_DIST``: the target camera is SIMPLE_RADIAL, ``(u, v) = c + f s
+    (x, y)`` with ``s = 1 + k1 r^2`` on the normalised point ``(x, y)``.
+    Without it the pinhole path compiles exactly as before.
 
     Grid layout: ``(ceil(N / BLOCK_N), B)``. ``pid_n`` is the fast-varying
     axis (axis 0 = CUDA ``blockIdx.x``), so the hardware dispatches
@@ -172,8 +178,21 @@ def _project_sample_fwd_kernel(
     # ---- Perspective divide ----------------------------------------------
     # Guard against divide-by-zero: if zc is ~0 we mark as outside below.
     inv_z = 1.0 / zc
-    u = fx * xc * inv_z + cx
-    v = fy * yc * inv_z + cy
+    if HAS_DIST:
+        # Radial distortion of the normalised point. Beyond the branch where
+        # the distortion is monotonic (1 + 3 k1 r^2 <= 0) two rays share a
+        # pixel; such points are treated as outside.
+        k1 = tl.load(K1D_ptr + pid_b)
+        xn = xc * inv_z
+        yn = yc * inv_z
+        r2 = xn * xn + yn * yn
+        sd = 1.0 + k1 * r2
+        u = fx * (sd * xn) + cx
+        v = fy * (sd * yn) + cy
+        mono = (1.0 + 3.0 * k1 * r2) > 0.0
+    else:
+        u = fx * xc * inv_z + cx
+        v = fy * yc * inv_z + cy
 
     # ---- Bounds + numerical-validity check ---------------------------
     # Inside iff u, v are inside the *real* (unpadded) target image *and*
@@ -192,6 +211,8 @@ def _project_sample_fwd_kernel(
     Hf = tl.cast(H_real, tl.float32)
     finite_uv = (u == u) & (v == v) & (u * 0.0 == 0.0) & (v * 0.0 == 0.0)
     inside = (u >= 0.0) & (u < Wf) & (v >= 0.0) & (v < Hf) & (zc > 0.0) & finite_uv
+    if HAS_DIST:
+        inside = inside & mono
 
     # ---- Bilinear sample (with border-padding semantics) -----------------
     # Clamp corner indices to [0, W-1] / [0, H-1] to mimic padding_mode='border'.
@@ -331,6 +352,7 @@ def _project_sample_bwd_kernel(
     GR_ptr,  # (B, N) grad_residuals / grad_rho; FUSE_REDUCE: (B, n_tiles)
     K_ptr,  # (B, 3, 3)
     P_ptr,  # (B, 4, 4)
+    K1D_ptr,  # (B,) target radial k1 (HAS_DIST only; dummy otherwise)
     # Loss-epilogue fusion — only read when FUSE_LOSS (dummy ptr otherwise)
     RES_ptr,  # (B, N) float — fwd-saved raw residuals
     clamp_max,
@@ -341,6 +363,7 @@ def _project_sample_bwd_kernel(
     PK_ptr,  # (B, n_groups, 9) per-group K-grad partials
     PR_ptr,  # (B, n_groups, 9) per-group R-grad partials
     PT_ptr,  # (B, n_groups, 3) per-group t-grad partials
+    PK1_ptr,  # (B, n_groups) per-group k1-grad partials (HAS_DIST only)
     # Sizes
     B,
     N,
@@ -359,13 +382,21 @@ def _project_sample_bwd_kernel(
     s_pr_t,
     s_pt_b,
     s_pt_t,
+    s_pk1_b,
     BLOCK_N: tl.constexpr,
     FUSE_LOSS: tl.constexpr,
     FUSE_REDUCE: tl.constexpr,
     TILES: tl.constexpr,
     XYZ_GATHER: tl.constexpr,
+    HAS_DIST: tl.constexpr,
 ):
     """Fused per-point bwd + per-group K/R/t partial reductions.
+
+    ``HAS_DIST`` (SIMPLE_RADIAL target): the chain through the distortion
+    ``s = 1 + k1 r^2`` replaces the pinhole one, the focal partials use the
+    distorted point, and a 22nd partial collects ``d loss / d k1``. Only
+    ``grad_K``'s (0,0), (1,1), (0,2), (1,2) entries are meaningful then (the
+    others have no SIMPLE_RADIAL counterpart and no consumer).
 
     Grid layout: ``(ceil(N_TILES / TILES), B)``. ``pid_g`` is fast-varying
     (axis 0 = CUDA ``blockIdx.x``) so consecutive blocks share ``pid_b``
@@ -429,6 +460,9 @@ def _project_sample_bwd_kernel(
     aT0 = tl.zeros([BLOCK_N], tl.float32)
     aT1 = tl.zeros([BLOCK_N], tl.float32)
     aT2 = tl.zeros([BLOCK_N], tl.float32)
+    if HAS_DIST:
+        k1 = tl.load(K1D_ptr + pid_b)
+        aK1 = tl.zeros([BLOCK_N], tl.float32)
 
     # Source row for the world points (see XYZ_GATHER in the fwd kernel).
     if XYZ_GATHER:
@@ -501,9 +535,26 @@ def _project_sample_bwd_kernel(
         inv_z = 1.0 / zc
 
         # ---- grad_xc/yc/zc — used for BOTH per-point AND partial sums --
-        grad_xc = grad_u * fx * inv_z
-        grad_yc = grad_v * fy * inv_z
-        grad_zc = -(grad_u * fx * xc + grad_v * fy * yc) * inv_z * inv_z
+        if HAS_DIST:
+            # (u, v) = c + f s (xn, yn), s = 1 + k1 r^2, (xn, yn) = (xc, yc)/zc:
+            # d(u, v)/d(xn, yn) = f (s I + 2 k1 [xn, yn]^T [xn, yn]).
+            xn = xc * inv_z
+            yn = yc * inv_z
+            r2 = xn * xn + yn * yn
+            sd = 1.0 + k1 * r2
+            ga = grad_u * fx
+            gb = grad_v * fy
+            gp = ga * xn + gb * yn
+            g_xn = sd * ga + 2.0 * k1 * xn * gp
+            g_yn = sd * gb + 2.0 * k1 * yn * gp
+            grad_xc = g_xn * inv_z
+            grad_yc = g_yn * inv_z
+            grad_zc = -(g_xn * xn + g_yn * yn) * inv_z
+            aK1 += r2 * gp  # d(u, v)/d k1 = f r^2 (xn, yn)
+        else:
+            grad_xc = grad_u * fx * inv_z
+            grad_yc = grad_v * fy * inv_z
+            grad_zc = -(grad_u * fx * xc + grad_v * fy * yc) * inv_z * inv_z
 
         # ---- grad_xyz_world = R^T @ grad_xyz_cam (per-point output) ----
         g_x = R00 * grad_xc + R10 * grad_yc + R20 * grad_zc
@@ -522,11 +573,19 @@ def _project_sample_bwd_kernel(
         tl.store(GXYZ_ptr + gxyz_row + 2, g_z, mask=n_mask)
 
         # ---- Accumulate the 21 reduction operands in registers ---------
-        X0 = xc * inv_z
-        X1 = yc * inv_z
-        X2 = zc * inv_z
-        u = fx * xc * inv_z + cx
-        v = fy * yc * inv_z + cy
+        if HAS_DIST:
+            # Focal partials: d u / d fx = s xn, d v / d fy = s yn.
+            X0 = sd * xn
+            X1 = sd * yn
+            X2 = zc * inv_z
+            u = fx * X0 + cx
+            v = fy * X1 + cy
+        else:
+            X0 = xc * inv_z
+            X1 = yc * inv_z
+            X2 = zc * inv_z
+            u = fx * xc * inv_z + cx
+            v = fy * yc * inv_z + cy
         guv = -(grad_u * u + grad_v * v)
 
         aK00 += grad_u * X0
@@ -580,6 +639,8 @@ def _project_sample_bwd_kernel(
     tl.store(PT_ptr + pt_base + 0, tl.sum(aT0, axis=0))
     tl.store(PT_ptr + pt_base + 1, tl.sum(aT1, axis=0))
     tl.store(PT_ptr + pt_base + 2, tl.sum(aT2, axis=0))
+    if HAS_DIST:
+        tl.store(PK1_ptr + pid_b * s_pk1_b + pid_g, tl.sum(aK1, axis=0))
 
 
 @triton.jit
@@ -711,6 +772,7 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
         huber_delta=None,
         fuse_reduce=False,
         xyz_indices=None,
+        k1=None,
     ):
         """Args
         xyz_world: (B, N, 3)
@@ -740,6 +802,8 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
             cnt_partials)`` of shape ``(B, n_tiles)`` to be row-summed by
             the caller. NOT bit-equal to ``rho.sum(dim=1)`` (different
             fp accumulation order), but deterministic run-to-run.
+        k1: optional ``(B,)`` radial distortion of each row's target camera
+            (SIMPLE_RADIAL). ``None`` runs the pinhole kernels unchanged.
         """
         assert xyz_world.is_cuda and K.is_cuda and P.is_cuda
         assert dt_fields_src.is_cuda and dt_indices.is_cuda
@@ -776,6 +840,12 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
         hw_c = img_hw.contiguous().to(torch.int32)
         device = xyz_c.device
         dtype = xyz_c.dtype
+        has_dist = k1 is not None
+        if has_dist:
+            k1_c = k1.contiguous().to(dtype)
+            assert k1_c.shape == (B,), f"k1 must be ({B},), got {tuple(k1_c.shape)}"
+        else:
+            k1_c = K_c  # dummy pointer — never read (HAS_DIST=False)
 
         residuals = torch.empty((B, N), device=device, dtype=dtype)
         mask = torch.empty((B, N), device=device, dtype=torch.uint8)
@@ -833,6 +903,7 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 xyz_idx_c,
                 K_c,
                 P_c,
+                k1_c,
                 dt_c,
                 idx_c,
                 hw_c,
@@ -863,6 +934,7 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 FUSE_LOSS=fuse_loss,
                 FUSE_REDUCE=fuse_reduce,
                 XYZ_GATHER=xyz_gather,
+                HAS_DIST=has_dist,
                 # Single fixed launch config (no autotune dispatch overhead).
                 # ``num_warps=8`` matches BLOCK_N=256 → 1 element/thread (vs
                 # default 4 warps × 32 threads = 128 threads, 2 elements each).
@@ -883,15 +955,16 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
         ctx.fuse_loss = fuse_loss
         ctx.fuse_reduce = fuse_reduce
         ctx.xyz_gather = xyz_gather
+        ctx.has_dist = has_dist
         ctx.batch = B
         if fuse_loss:
             ctx.clamp_max = float(clamp_max)
             ctx.huber_delta = float(huber_delta)
             ctx.save_for_backward(
-                xyz_c, K_c, P_c, ds_du, ds_dv, mask, residuals, xyz_idx_c
+                xyz_c, K_c, P_c, ds_du, ds_dv, mask, residuals, xyz_idx_c, k1_c
             )
         else:
-            ctx.save_for_backward(xyz_c, K_c, P_c, ds_du, ds_dv, mask, xyz_idx_c)
+            ctx.save_for_backward(xyz_c, K_c, P_c, ds_du, ds_dv, mask, xyz_idx_c, k1_c)
         if fuse_reduce:
             ctx.mark_non_differentiable(cnt_partials)
             return rho_partials, cnt_partials
@@ -911,9 +984,11 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
         yield ``None``.
         """
         if ctx.fuse_loss:
-            xyz_world, K, P, ds_du, ds_dv, mask, residuals, xyz_idx = ctx.saved_tensors
+            xyz_world, K, P, ds_du, ds_dv, mask, residuals, xyz_idx, k1 = (
+                ctx.saved_tensors
+            )
         else:
-            xyz_world, K, P, ds_du, ds_dv, mask, xyz_idx = ctx.saved_tensors
+            xyz_world, K, P, ds_du, ds_dv, mask, xyz_idx, k1 = ctx.saved_tensors
             residuals = ds_du  # dummy pointer — never read (FUSE_LOSS=False)
         B, N = ctx.batch, xyz_world.shape[1]
         device, dtype = xyz_world.device, xyz_world.dtype
@@ -939,6 +1014,11 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
         partials_K = torch.empty((B, n_groups, 9), device=device, dtype=dtype)
         partials_R = torch.empty((B, n_groups, 9), device=device, dtype=dtype)
         partials_t = torch.empty((B, n_groups, 3), device=device, dtype=dtype)
+        partials_k1 = (
+            torch.empty((B, n_groups), device=device, dtype=dtype)
+            if ctx.has_dist
+            else partials_t  # dummy pointer — never written (HAS_DIST=False)
+        )
 
         # Match fwd kernel grid order: pid_g (axis 0) varies fastest so
         # consecutive blocks share a batch row and reuse per-row data in
@@ -954,6 +1034,7 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 gr,
                 K,
                 P,
+                k1,
                 residuals,
                 ctx.clamp_max if ctx.fuse_loss else 0.0,
                 ctx.huber_delta if ctx.fuse_loss else 1.0,
@@ -962,6 +1043,7 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 partials_K,
                 partials_R,
                 partials_t,
+                partials_k1,
                 B,
                 N,
                 n_tiles,
@@ -978,11 +1060,13 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
                 partials_R.stride(1),
                 partials_t.stride(0),
                 partials_t.stride(1),
+                partials_k1.stride(0),
                 BLOCK_N=BLOCK_N,
                 FUSE_LOSS=ctx.fuse_loss,
                 FUSE_REDUCE=ctx.fuse_reduce,
                 TILES=TILES_PER_PROG,
                 XYZ_GATHER=ctx.xyz_gather,
+                HAS_DIST=ctx.has_dist,
                 # Same launch config as cycle 14 bwd — load chain grew by
                 # only xyz_world (3 loads) vs the dropped xc/yc/zc loads
                 # (also 3), so register pressure is similar. num_stages=3
@@ -1034,6 +1118,8 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
             grad_src.index_put_((xyz_idx,), grad_xyz_world, accumulate=True)
             grad_xyz_world = grad_src
 
+        grad_k1 = partials_k1.sum(dim=1) if ctx.has_dist else None
+
         # dt_fields_src, dt_indices, img_hw, pad_mask, clamp_max, huber_delta,
         # fuse_reduce, xyz_indices do not require gradients.
         return (
@@ -1048,6 +1134,7 @@ class _ProjectAndSampleTriton(torch.autograd.Function):
             None,
             None,
             None,
+            grad_k1,
         )
 
 
@@ -1059,6 +1146,7 @@ def project_and_sample_triton(
     dt_indices: torch.Tensor,
     img_hw: torch.Tensor,
     xyz_indices: torch.Tensor | None = None,
+    k1: torch.Tensor | None = None,
 ):
     """Fused project + bilinear DT sample (no per-batch DT gather).
 
@@ -1079,6 +1167,8 @@ def project_and_sample_triton(
         xyz_indices: optional ``(B,)`` int64 — when given, ``xyz_world`` is
             the *source* ``(N_img, N, 3)`` tensor and row ``b`` reads image
             ``xyz_indices[b]``, so the per-pair gather is never materialised.
+        k1: optional ``(B,)`` radial distortion of each row's target camera
+            (SIMPLE_RADIAL); ``None`` is the pinhole camera.
 
     Returns:
         ``(residuals, inside_mask)`` of shapes ``(B, N)`` and ``(B, N)`` bool.
@@ -1096,6 +1186,7 @@ def project_and_sample_triton(
         None,
         False,
         xyz_indices,
+        k1,
     )
 
 
@@ -1110,6 +1201,7 @@ def project_sample_huber_triton(
     clamp_max: float,
     huber_delta: float = 1.0,
     xyz_indices: torch.Tensor | None = None,
+    k1: torch.Tensor | None = None,
 ):
     """Project + DT sample with the loss epilogue fused into the kernel.
 
@@ -1135,6 +1227,8 @@ def project_sample_huber_triton(
         xyz_indices: optional ``(B,)`` int64 — when given, ``xyz_world`` is
             the *source* ``(N_img, N, 3)`` tensor and row ``b`` reads image
             ``xyz_indices[b]``, so the per-pair gather is never materialised.
+        k1: optional ``(B,)`` radial distortion of each row's target camera
+            (SIMPLE_RADIAL); ``None`` is the pinhole camera.
 
     Returns:
         ``(rho, valid_mask)``: ``(B, N)`` robustified residuals (zero at
@@ -1154,6 +1248,7 @@ def project_sample_huber_triton(
         huber_delta,
         False,
         xyz_indices,
+        k1,
     )
 
 
@@ -1168,6 +1263,7 @@ def project_sample_huber_sum_triton(
     clamp_max: float,
     huber_delta: float = 1.0,
     xyz_indices: torch.Tensor | None = None,
+    k1: torch.Tensor | None = None,
 ):
     """Like :func:`project_sample_huber_triton` but with the row reduction
     fused too: the per-point rho never leaves registers; the kernel emits
@@ -1195,6 +1291,7 @@ def project_sample_huber_sum_triton(
         huber_delta,
         True,
         xyz_indices,
+        k1,
     )
     return rho_partials.sum(dim=1), cnt_partials.sum(dim=1)
 
@@ -1228,11 +1325,27 @@ def project_sample_huber_sum_triton(
 
 
 @triton.jit
+def _undistort_scale(c_raw):
+    """Scale ``s`` with ``x_u = x_d / s`` for ``c = k1 r_d^2`` (SIMPLE_RADIAL).
+
+    ``s = 1 + k1 r_u^2`` solves ``s^3 - s^2 - c = 0``; four Newton steps from
+    ``1 + c``, with ``c`` floored at -0.14 — the same solver as
+    :func:`helpers.reprojection.undistort_pixels`.
+    """
+    c = tl.maximum(c_raw, -0.14)
+    s = 1.0 + c
+    for _ in tl.static_range(4):
+        s = s - (s * s * s - s * s - c) / (3.0 * s * s - 2.0 * s)
+    return s
+
+
+@triton.jit
 def _unproject_fwd_kernel(
     XY_ptr,  # (B, N, 2) — pixel coords
     DEPTH_ptr,  # (B, N)    — corrected depth (already a·z+b·)
     K_ptr,  # (B, 3, 3) — intrinsics (only fx, fy, cx, cy read)
     P_ptr,  # (B, 4, 4) — extrinsics
+    K1D_ptr,  # (B,) — radial k1 (HAS_DIST only; dummy otherwise)
     XYZW_ptr,  # (B, N, 3) — output xyz_world
     # xyz_cam NOT saved (cycle 27 fusion): the new bwd kernel recomputes
     # xc/yc/zc from (xy, K, depth) and absorbs all post-bwd PyTorch
@@ -1248,8 +1361,12 @@ def _unproject_fwd_kernel(
     s_xyzw_b,
     s_xyzw_n,
     BLOCK_N: tl.constexpr,
+    HAS_DIST: tl.constexpr,
 ):
     """Pixel → world: collapses the four-op chain into one kernel.
+
+    ``HAS_DIST``: the camera is SIMPLE_RADIAL; the normalised pixel ``x_d``
+    is undistorted to ``x_u = x_d / s`` first (:func:`_undistort_scale`).
 
     Grid layout ``(ceil(N / BLOCK_N), B)`` — axis 0 (CUDA blockIdx.x) varies
     fastest, so consecutive blocks share ``pid_b`` and reuse per-batch K/P
@@ -1297,8 +1414,16 @@ def _unproject_fwd_kernel(
     #          [0,    0,    1   ]]
     inv_fx = 1.0 / fx
     inv_fy = 1.0 / fy
-    xc = z * (u - cx) * inv_fx
-    yc = z * (v - cy) * inv_fy
+    if HAS_DIST:
+        k1 = tl.load(K1D_ptr + pid_b)
+        xd = (u - cx) * inv_fx
+        yd = (v - cy) * inv_fy
+        sc = _undistort_scale(k1 * (xd * xd + yd * yd))
+        xc = z * (xd / sc)
+        yc = z * (yd / sc)
+    else:
+        xc = z * (u - cx) * inv_fx
+        yc = z * (v - cy) * inv_fy
     zc = z
 
     # ---- xyz_world = R^T · (xyz_cam - t) -------------------------------
@@ -1327,6 +1452,9 @@ def _unproject_bwd_kernel(
     GXYZW_ptr,  # (B, N, 3) — upstream gradient
     GDEPTH_ptr,  # (B, N)    — output: grad_depth (per-point)
     PART_ptr,  # (B, n_tiles, 16) — per-tile partials for grad_R, total_gxyzw, grad_K
+    K1D_ptr,  # (B,) radial k1 (HAS_DIST only; dummy otherwise)
+    PK1_ptr,  # (B, n_tiles) per-tile k1-grad partials (HAS_DIST only)
+    s_pk1_b,
     B,
     N,
     s_xy_b,
@@ -1339,8 +1467,14 @@ def _unproject_bwd_kernel(
     s_part_b,
     s_part_t,
     BLOCK_N: tl.constexpr,
+    HAS_DIST: tl.constexpr,
 ):
     """Fused per-point bwd + per-tile reductions (cycle 27).
+
+    ``HAS_DIST`` (SIMPLE_RADIAL): the chain also runs through the
+    undistortion ``x_u = x_d / s(k1 r_d^2)``; the focal / principal-point
+    partials are taken w.r.t. the distorted normalised pixel ``x_d`` (so the
+    combine step is unchanged) and a 17th partial collects ``d / d k1``.
 
     Per point: emits grad_depth (the only true per-point output now —
     grad_xyz_cam is purely intermediate and stays in registers).
@@ -1396,8 +1530,18 @@ def _unproject_bwd_kernel(
     t2 = tl.load(Pb + 11)
 
     # ---- Recompute xyz_cam (matches fwd exactly) ------------------------
-    xc = z * (u - cx) * inv_fx
-    yc = z * (v - cy) * inv_fy
+    if HAS_DIST:
+        k1 = tl.load(K1D_ptr + pid_b)
+        xd = (u - cx) * inv_fx
+        yd = (v - cy) * inv_fy
+        rd2 = xd * xd + yd * yd
+        c_raw = k1 * rd2
+        sc = _undistort_scale(c_raw)
+        xc = z * (xd / sc)
+        yc = z * (yd / sc)
+    else:
+        xc = z * (u - cx) * inv_fx
+        yc = z * (v - cy) * inv_fy
     zc = z
 
     # ---- Upstream gradient ---------------------------------------------
@@ -1416,7 +1560,16 @@ def _unproject_bwd_kernel(
     grad_zc = gYz
 
     # ---- grad_depth per-point output ------------------------------------
-    grad_z = grad_xc * (u - cx) * inv_fx + grad_yc * (v - cy) * inv_fy + grad_zc
+    if HAS_DIST:
+        grad_z = grad_xc * (xd / sc) + grad_yc * (yd / sc) + grad_zc
+        # Through the undistortion: xc = z x_d / s, s(c), c = k1 r_d^2
+        # (floored at -0.14, where its gradient is 0), ds/dc = 1/(3s^2 - 2s).
+        g_c = -(grad_xc * xc + grad_yc * yc) / (sc * (3.0 * sc * sc - 2.0 * sc))
+        g_c = tl.where(c_raw > -0.14, g_c, 0.0)
+        g_xd = grad_xc * z / sc + 2.0 * k1 * xd * g_c
+        g_yd = grad_yc * z / sc + 2.0 * k1 * yd * g_c
+    else:
+        grad_z = grad_xc * (u - cx) * inv_fx + grad_yc * (v - cy) * inv_fy + grad_zc
     tl.store(GDEPTH_ptr + pid_b * s_d_b + n_offs, grad_z, mask=n_mask)
 
     # ---- Y = xyz_cam - t (per-point, kept in registers) -----------------
@@ -1442,10 +1595,18 @@ def _unproject_bwd_kernel(
     pT2 = tl.sum(gzw, axis=0)
 
     # grad_K raw sums — 4 outputs (post-combine: multiplied by -inv_fx/fy)
-    pKfx = tl.sum(grad_xc * xc, axis=0)
-    pKfy = tl.sum(grad_yc * yc, axis=0)
-    pKcx = tl.sum(grad_xc * z, axis=0)
-    pKcy = tl.sum(grad_yc * z, axis=0)
+    if HAS_DIST:
+        # x_d = (u - cx) / fx: d/dfx = -x_d / fx, d/dcx = -1 / fx.
+        pKfx = tl.sum(g_xd * xd, axis=0)
+        pKfy = tl.sum(g_yd * yd, axis=0)
+        pKcx = tl.sum(g_xd, axis=0)
+        pKcy = tl.sum(g_yd, axis=0)
+        tl.store(PK1_ptr + pid_b * s_pk1_b + pid_n, tl.sum(g_c * rd2, axis=0))
+    else:
+        pKfx = tl.sum(grad_xc * xc, axis=0)
+        pKfy = tl.sum(grad_yc * yc, axis=0)
+        pKcx = tl.sum(grad_xc * z, axis=0)
+        pKcy = tl.sum(grad_yc * z, axis=0)
 
     part_base = pid_b * s_part_b + pid_n * s_part_t
     tl.store(PART_ptr + part_base + 0, pR00)
@@ -1548,7 +1709,7 @@ class _UnprojectTriton(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, xy0, depth, K, P):
+    def forward(ctx, xy0, depth, K, P, k1=None):
         """Forward: lift pixel coords + depth to world via ``K`` and ``P``.
 
         Args:
@@ -1557,6 +1718,8 @@ class _UnprojectTriton(torch.autograd.Function):
             depth: ``(B, N)`` per-pixel depth.
             K: ``(B, 3, 3)`` intrinsics.
             P: ``(B, 4, 4)`` world-to-cam extrinsics.
+            k1: optional ``(B,)`` radial distortion (SIMPLE_RADIAL); the
+                pixels are undistorted in-kernel.
 
         Returns:
             ``(B, N, 3)`` world-space points.
@@ -1576,6 +1739,8 @@ class _UnprojectTriton(torch.autograd.Function):
         xyz_world = torch.empty((B, N, 3), device=device, dtype=dtype)
         # xyz_cam allocation dropped (cycle 27): bwd recomputes it from
         # (xy, K, depth) inside the kernel.
+        has_dist = k1 is not None
+        k1_c = k1.contiguous().to(dtype) if has_dist else K_c  # dummy if pinhole
 
         BLOCK_N = 256
         # Axis 0 = fast-varying ⇒ ``pid_n`` first so consecutive blocks share
@@ -1587,6 +1752,7 @@ class _UnprojectTriton(torch.autograd.Function):
                 d_c,
                 K_c,
                 P_c,
+                k1_c,
                 xyz_world,
                 B,
                 N,
@@ -1598,6 +1764,7 @@ class _UnprojectTriton(torch.autograd.Function):
                 xyz_world.stride(0),
                 xyz_world.stride(1),
                 BLOCK_N=BLOCK_N,
+                HAS_DIST=has_dist,
                 # Unproject is a simpler kernel than project+sample (no DT
                 # gather), so 4 warps is enough and 8 over-provisions
                 # (cycle 12 confirmed). One extra pipeline stage on top of
@@ -1607,7 +1774,8 @@ class _UnprojectTriton(torch.autograd.Function):
                 num_stages=4,
             )
 
-        ctx.save_for_backward(xy_c, d_c, K_c, P_c)
+        ctx.has_dist = has_dist
+        ctx.save_for_backward(xy_c, d_c, K_c, P_c, k1_c)
         return xyz_world
 
     @staticmethod
@@ -1619,7 +1787,7 @@ class _UnprojectTriton(torch.autograd.Function):
         grad_K) are done inside the fused bwd kernel + combine kernel
         (cycle 27 — mirrors the project_sample cycle-19 fusion).
         """
-        xy0, depth, K, P = ctx.saved_tensors
+        xy0, depth, K, P, k1 = ctx.saved_tensors
         B, N, _ = xy0.shape
         device, dtype = xy0.device, xy0.dtype
 
@@ -1630,6 +1798,11 @@ class _UnprojectTriton(torch.autograd.Function):
         n_tiles = triton.cdiv(N, BLOCK_N)
         # 16 partials per tile: 9 grad_R + 3 total_gxyzw + 4 grad_K-raw.
         partials = torch.empty((B, n_tiles, 16), device=device, dtype=dtype)
+        partials_k1 = (
+            torch.empty((B, n_tiles), device=device, dtype=dtype)
+            if ctx.has_dist
+            else grad_depth  # dummy pointer — never written (HAS_DIST=False)
+        )
 
         # Axis 0 = fast-varying ⇒ ``pid_n`` first so consecutive blocks share
         # ``pid_b`` and keep K/P/(B,N) row data hot in L1.
@@ -1643,6 +1816,9 @@ class _UnprojectTriton(torch.autograd.Function):
                 gr,
                 grad_depth,
                 partials,
+                k1,
+                partials_k1,
+                partials_k1.stride(0),
                 B,
                 N,
                 xy0.stride(0),
@@ -1655,6 +1831,7 @@ class _UnprojectTriton(torch.autograd.Function):
                 partials.stride(0),
                 partials.stride(1),
                 BLOCK_N=BLOCK_N,
+                HAS_DIST=ctx.has_dist,
                 # Cycle 28: 16 new reduction accumulators (cycle 27 fusion)
                 # add register pressure on top of the existing per-point chain.
                 # Mirrors cycle 20-21: post-fusion cliff drops; test num_stages=3.
@@ -1696,7 +1873,8 @@ class _UnprojectTriton(torch.autograd.Function):
         grad_K[:, 0, 2] = -grad_K_raw[:, 2] * inv_fx_b
         grad_K[:, 1, 2] = -grad_K_raw[:, 3] * inv_fy_b
 
-        return None, grad_depth, grad_K, grad_P
+        grad_k1 = partials_k1.sum(dim=1) if ctx.has_dist else None
+        return None, grad_depth, grad_K, grad_P, grad_k1
 
 
 def unproject_2D_to_world_triton(
@@ -1704,6 +1882,7 @@ def unproject_2D_to_world_triton(
     K0: torch.Tensor,
     depth0: torch.Tensor,
     P0: torch.Tensor,
+    k1: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused pixel → world projection (Triton).
 
@@ -1714,11 +1893,12 @@ def unproject_2D_to_world_triton(
         K0: ``(B, 3, 3)`` intrinsics (only the pinhole entries are read).
         depth0: ``(B, N)`` per-pixel depth.
         P0: ``(B, 4, 4)`` world-to-camera extrinsics.
+        k1: optional ``(B,)`` radial distortion (SIMPLE_RADIAL).
 
     Returns:
         ``(B, N, 3)`` 3D points in world coordinates.
     """
-    return _UnprojectTriton.apply(xy0, depth0, K0, P0)
+    return _UnprojectTriton.apply(xy0, depth0, K0, P0, k1)
 
 
 # ---------------------------------------------------------------------------

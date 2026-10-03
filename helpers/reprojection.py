@@ -606,12 +606,44 @@ def invert_P(P: Tensor, return_Rt=False) -> Tensor:
     return P_inv
 
 
+def undistort_pixels(xy: Tensor, K: Tensor, k1: Tensor, iters: int = 4) -> Tensor:
+    """Pixels of a SIMPLE_RADIAL camera -> pinhole pixels of the same rays.
+
+    The camera maps a normalised ray ``x_u`` to ``x_d = x_u (1 + k1 r_u^2)``.
+    Its scale ``s = 1 + k1 r_u^2`` solves ``s^3 - s^2 - k1 r_d^2 = 0`` (``r_u
+    = r_d / s``); Newton from ``1 + k1 r_d^2`` converges quadratically.
+    ``k1 r_d^2`` is floored at -0.14, just
+    above the -4/27 where the root on the branch through ``s = 1`` vanishes,
+    so the step stays finite for any ``k1``. Differentiable w.r.t. ``K`` and
+    ``k1`` (autograd through the fixed Newton iterations).
+
+    Args:
+        xy: ``(B, N, 2)`` pixel coordinates.
+        K: ``(B, 3, 3)`` pinhole part of the camera.
+        k1: ``(B,)`` radial distortion.
+        iters: Newton steps.
+
+    Returns:
+        ``(B, N, 2)`` pixels the same rays hit in the pinhole camera ``K``.
+    """
+    fx, fy = K[:, 0, 0, None], K[:, 1, 1, None]
+    cx, cy = K[:, 0, 2, None], K[:, 1, 2, None]
+    xd = (xy[..., 0] - cx) / fx
+    yd = (xy[..., 1] - cy) / fy
+    c = (k1[:, None] * (xd * xd + yd * yd)).clamp(min=-0.14)
+    s = 1 + c
+    for _ in range(iters):
+        s = s - (s * s * s - s * s - c) / (3 * s * s - 2 * s)
+    return torch.stack([cx + fx * (xd / s), cy + fy * (yd / s)], dim=-1)
+
+
 def unproject_2D_to_world(
     xy0: Tensor,
     K0: Tensor,
     depth0: Tensor,
     P0: Tensor,
     backend: str = "torch",
+    k1: Tensor | None = None,
 ) -> Tensor:
     """Unproject points to world coordinates
     Args:
@@ -628,6 +660,9 @@ def unproject_2D_to_world(
             ``"triton"`` swaps in a fused CUDA kernel with an analytical
             backward (numerically equivalent up to fp32 noise; requires
             CUDA tensors).
+        k1: optional ``(B,)`` radial distortion (SIMPLE_RADIAL): the pixels
+            are first undistorted (:func:`undistort_pixels`; the Triton
+            kernel runs the same solver in-kernel).
 
     Returns:
         xyz_world: unprojected 3D points in the world reference system
@@ -637,10 +672,12 @@ def unproject_2D_to_world(
         # Local import so CPU-only setups don't need triton installed.
         from helpers.triton_ops import unproject_2D_to_world_triton
 
-        return unproject_2D_to_world_triton(xy0, K0, depth0, P0)
+        return unproject_2D_to_world_triton(xy0, K0, depth0, P0, k1=k1)
 
     if backend != "torch":
         raise ValueError(f"Unknown backend {backend!r}; expected 'torch' or 'triton'")
+    if k1 is not None:
+        xy0 = undistort_pixels(xy0, K0, k1)
 
     # invert K and P
     K0_inv = invert_K(K0)
@@ -731,6 +768,7 @@ def project_world_to_2D(
     K1: Tensor,
     img1_shape: Tensor,
     border: int = 0,
+    k1: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Project world-frame 3D points into pixel coordinates of the target view.
 
@@ -740,6 +778,10 @@ def project_world_to_2D(
         K1: ``(B, 3, 3)`` intrinsics of the target view.
         img1_shape: ``(2,)`` ``(H, W)`` of the target image.
         border: Pixels excluded around the image boundary.
+        k1: optional ``(B,)`` radial distortion of the target camera
+            (SIMPLE_RADIAL): ``uv = c + f (x, y) (1 + k1 r^2)`` on the
+            normalised point; points off the distortion's monotonic branch
+            (``1 + 3 k1 r^2 <= 0``) are invalid, as in the Triton kernel.
 
     Returns:
         ``(uv, invalid_mask)`` where ``uv`` is ``(B, N, 2)`` (with values
@@ -756,13 +798,31 @@ def project_world_to_2D(
     # Shape optimized: (World @ R^T) + t
     xyz_camera1 = xyz_world @ R1.transpose(-2, -1) + t1
 
-    xy_proj, outside_mask = project_to_2D(xyz_camera1, K1, img1_shape, border)
+    if k1 is None:
+        xy_proj, outside_mask = project_to_2D(xyz_camera1, K1, img1_shape, border)
+        off_branch = torch.zeros_like(outside_mask)
+    else:
+        # A zero depth would give 0 / 0 = NaN gradients through the masked
+        # branch; such points are invalid anyway (zc <= 0 below).
+        zc = xyz_camera1[..., 2:3]
+        zc = torch.where(zc.abs() > 1e-10, zc, 1.0)
+        xn = xyz_camera1[..., :2] / zc
+        r2 = (xn * xn).sum(dim=-1)
+        s = 1 + k1[:, None] * r2
+        f = torch.stack([K1[:, 0, 0], K1[:, 1, 1]], dim=-1)[:, None]
+        c = torch.stack([K1[:, 0, 2], K1[:, 1, 2]], dim=-1)[:, None]
+        xy_proj = c + f * (xn * s[..., None])
+        xy_proj, outside_mask = filter_outside_safe(xy_proj, img1_shape, border)
+        off_branch = (1 + 3 * k1[:, None] * r2) <= 0
 
     # Match the Triton inside test (_project_sample_fwd_kernel): points behind
     # the camera (zc <= 0) or with non-finite projections are invalid even if
     # the perspective divide mirrors them into the image bounds.
     invalid_mask = (
-        outside_mask | (xyz_camera1[..., 2] <= 0) | ~torch.isfinite(xy_proj).all(dim=-1)
+        outside_mask
+        | off_branch
+        | (xyz_camera1[..., 2] <= 0)
+        | ~torch.isfinite(xy_proj).all(dim=-1)
     )
     xy_proj = torch.where(invalid_mask[..., None], 0.0, xy_proj)
 
@@ -782,6 +842,7 @@ def project_and_sample_logic(  # noqa: D417
     border: int = 0,
     backend: str = "torch",
     xyz_indices: torch.Tensor | None = None,
+    k1: torch.Tensor | None = None,
 ):
     """Fused operation: Projection -> 2D -> Sampling.
     Guarantees no NaNs are produced. Invalid points are zeroed out and tracked via outside_mask.
@@ -804,6 +865,8 @@ def project_and_sample_logic(  # noqa: D417
             calls a fused Triton kernel with an analytical PyTorch backward;
             it requires ``border == 0``, CUDA tensors, and assumes
             ``dt_fields`` does not require gradients (true for EPO).
+        k1: optional ``(B,)`` radial distortion of each row's target camera
+            (SIMPLE_RADIAL); ``None`` is the pinhole camera.
     """
     if backend == "triton":
         assert border == 0, "Triton backend currently supports border=0 only"
@@ -815,7 +878,7 @@ def project_and_sample_logic(  # noqa: D417
         from helpers.triton_ops import project_and_sample_triton
 
         return project_and_sample_triton(
-            xyz_world, K1, P1, dt_fields, dt_indices, img1_shape, xyz_indices
+            xyz_world, K1, P1, dt_fields, dt_indices, img1_shape, xyz_indices, k1
         )
 
     if backend != "torch":
@@ -832,7 +895,9 @@ def project_and_sample_logic(  # noqa: D417
     # 1. Project World Points to 2D
     # uv_proj contains safe values (0.0) where points are invalid (outside,
     # behind the camera, or non-finite — same test as the Triton kernel)
-    uv_proj, invalid_mask = project_world_to_2D(xyz_world, P1, K1, img1_shape, border)
+    uv_proj, invalid_mask = project_world_to_2D(
+        xyz_world, P1, K1, img1_shape, border, k1=k1
+    )
 
     # 2. Prepare Distance Fields
     # Ensure 4D shape (B, C, H, W) for grid_sample

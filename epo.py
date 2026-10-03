@@ -134,6 +134,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             ``use_mlp_pose_refinement`` is True.
         grad_t_offset: Whether to optimize the per-image translation offset.
         grad_k: Whether to optimize camera intrinsics.
+        radial_distortion: If True (default), each camera also
+            self-calibrates one radial distortion term ``k1`` (COLMAP
+            ``SIMPLE_RADIAL``, ``x_d = x_u (1 + k1 r_u^2)``), starting at 0
+            and trained with the focal (needs ``grad_k``). The export then
+            writes SIMPLE_RADIAL cameras. False gives the pinhole model.
         grad_z: Whether to optimize per-pixel depth.
         use_mlp_pose_refinement: If True, refine poses via an MLP residual
             instead of the raw q/t parameters.
@@ -205,6 +210,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         grad_t=False,
         grad_t_offset=True,
         grad_k=True,
+        radial_distortion=True,
         grad_z=True,
         use_mlp_pose_refinement=True,
         backend="torch",
@@ -367,6 +373,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.grad_t = grad_t
         self.grad_t_offset = grad_t_offset
         self.grad_k = grad_k
+        self.radial_distortion = radial_distortion
         self.grad_z = grad_z
         self.use_mlp_pose_refinement = use_mlp_pose_refinement
         # BF16 autocast for the pose-refinement MLP's linear stack.
@@ -1252,6 +1259,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
 
         # indexing data
         K_batch = self.intrinsics.get_intrinsic_matrix(cam_ids)  # (B, 3, 3)
+        k1_batch = self.intrinsics.get_k1(cam_ids)  # (B,), None for pinhole
         P_batch = self.poses.get_projection_matrix(ids)  # (B, 4, 4)
         edges_batch = self.edges_padded.get_parameters(ids)  # (B, N, 2)
         depth_batch = self.sampled_depth.get_parameters(ids)  # (B, 1, H, W)
@@ -1274,6 +1282,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                 depth0=depth0,
                 P0=P0,
                 backend=self.backend,
+                k1=None if k1_batch is None else k1_batch[i : i + batch_size],
             )  # (bs, N, 3)
             points_3D_list.append(pts3d)
 
@@ -1353,6 +1362,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         # these are the intrinsics and poses for right images. Needed to project
         # 3D world points to the second image of the pair
         batch["K1"] = self.intrinsics.get_intrinsic_matrix(cam_ids)
+        batch["k1"] = self.intrinsics.get_k1(cam_ids)  # None for pinhole
         batch["P1"] = self.poses.get_projection_matrix(images_names_ji)
         # Per-row target H/W (not just the first row): on mixed-aspect datasets
         # like mipnerf360 every target image has its own real shape, and reusing
@@ -1465,6 +1475,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     border=0,
                     backend=self.backend,
                     xyz_indices=batch["xyz_indices"],
+                    k1=batch["k1"],
                 )
                 valid_mask = pad_masks[batch["xyz_indices"]] & inside_mask
                 total_sum = torch.where(valid_mask, residuals, 0.0).sum(dim=1)
@@ -1492,6 +1503,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                         clamp_max=clamp_max,
                         huber_delta=huber_delta,
                         xyz_indices=batch["xyz_indices"],
+                        k1=batch["k1"],
                     )
                 else:
                     rho, valid_mask = project_sample_huber_triton(
@@ -1505,6 +1517,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                         clamp_max=clamp_max,
                         huber_delta=huber_delta,
                         xyz_indices=batch["xyz_indices"],
+                        k1=batch["k1"],
                     )
                     total_sum = rho.sum(dim=1)
                     total_count = valid_mask.sum(dim=1)
@@ -1519,6 +1532,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
                     border=0,
                     backend=self.backend,
                     xyz_indices=batch["xyz_indices"],
+                    k1=batch["k1"],
                 )
 
                 # compute loss over all residuals at once (no chunking)
@@ -1700,6 +1714,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             grad=self.grad_k,
             max_num_iterations=self.max_num_iterations,
             warmup_steps=self.warmup_steps,
+            radial=self.radial_distortion,
         )
 
         # Read poses from images
@@ -1935,6 +1950,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             grad=self.grad_k,
             max_num_iterations=self.max_num_iterations,
             warmup_steps=self.warmup_steps,
+            radial=self.radial_distortion,
         )
 
         # Build PoseModule (world-to-camera convention, same as COLMAP).

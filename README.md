@@ -38,6 +38,20 @@
 
 
 ## Releases
+### v1.4 — Radial distortion (SIMPLE_RADIAL) support
+
+EPO now self-calibrates one radial distortion term per camera, COLMAP's `SIMPLE_RADIAL` model (`x_d = x_u (1 + k1 r²)` on normalised coordinates), on by default; pass `radial_distortion=False` to `EPO(...)` for the previous pinhole model. `k1` starts at 0 and is trained together with the focal length. The distortion (projection) and undistortion (unprojection) run inside the fused Triton kernels, so the kernels cost the same as before. Exports write `SIMPLE_RADIAL` cameras; `--densify` unprojects through `k1` and `--3dgsfy` undistorts the views before ReSplat.
+
+VGGT-Omega, AUC@5 averaged per dataset (ETH3D 25 scenes, Mip-NeRF 360 7 scenes, TerraSky3D 9, ScanNet++ 20 at max 150 images; RTX 4090):
+
+| | ETH3D | Mip-NeRF 360 | TerraSky3D | ScanNet++ | Mean |
+|---|---|---|---|---|---|
+| VGGT-Omega | 63.7 | 76.9 | 63.1 | 68.4 | 68.0 |
+| + EPO v1.3 | **78.4** | **94.3** | 81.2 | 79.4 | 83.3 |
+| + EPO v1.4 | 78.1 | 94.2 | **83.6** | **86.8** | **85.7** |
+
+The gain is on ScanNet++ (+7.4) and TerraSky3D (+2.4); ETH3D (−0.3) and Mip-NeRF 360 (−0.1) are essentially unchanged. EPO takes 2.84 s per scene on average (v1.3: 2.68 s).
+
 ### v1.3 — Feed-forward 3D Gaussians via ReSplat
 
 `--3dgsfy` turns EPO's refined cameras into a 3D Gaussian Splatting scene in one forward pass of [ReSplat](https://github.com/cvg/resplat) (no per-scene training), as an alternative or addition to `--densify`:

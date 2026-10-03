@@ -295,6 +295,10 @@ def build_reconstruction(
         # Get camera parameters as numpy array
         model, params = epo.intrinsics.get_camera_parameters(cam_id)
         params = params.detach().cpu().float().numpy()
+        # A radial camera module appends its k1 (SIMPLE_RADIAL); the
+        # rescaling below only touches (f, cx, cy).
+        k1 = float(params[3]) if params.shape[0] > 3 else 0.0
+        params = params[:3]
 
         # Get scale for this camera
         sx, sy = camera_scales.get(cam_id, (1.0, 1.0))
@@ -310,6 +314,11 @@ def build_reconstruction(
         params[2] = (params[2] + 0.5) / sy  # cy
         scale = sx
         model = pycolmap.CameraModelId.SIMPLE_PINHOLE
+        # The self-calibrated radial term is defined on normalised
+        # coordinates, so it carries over unchanged (COLMAP SIMPLE_RADIAL).
+        if k1 != 0.0:
+            model = pycolmap.CameraModelId.SIMPLE_RADIAL
+            params = np.append(params, k1)
 
         # Get image dimensions from first image with this cam_id
         sample_image = next(
