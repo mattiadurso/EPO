@@ -67,6 +67,46 @@ class BaseWrapper:
             return cached if os.path.exists(cached) else None
         return None
 
+    @staticmethod
+    def _download_weights(url: str) -> str:
+        """Download ``url`` to where ``_resolve_weights_file`` looks; return the path.
+
+        Hugging Face URLs go through ``hf_hub_download``, which sends the
+        user's HF token (``hf auth login`` or ``HF_TOKEN``): gated checkpoints
+        such as VGGT-Omega's only get a 401 from ``torch.hub``.
+        """
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise FileNotFoundError(f"Weights not found: {url}")
+        cache_dir = os.path.join(torch.hub.get_dir(), "checkpoints")
+        os.makedirs(cache_dir, exist_ok=True)
+        parts = parsed.path.strip("/").split("/")
+        if parsed.netloc != "huggingface.co" or "resolve" not in parts:
+            cached = os.path.join(cache_dir, os.path.basename(parsed.path))
+            torch.hub.download_url_to_file(url, cached)
+            return cached
+
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.errors import GatedRepoError
+
+        i = parts.index("resolve")  # <repo_id>/resolve/<revision>/<filename>
+        repo_id = "/".join(parts[:i])
+        try:
+            return hf_hub_download(
+                repo_id,
+                "/".join(parts[i + 2 :]),
+                revision=parts[i + 1],
+                local_dir=cache_dir,
+            )
+        except GatedRepoError as err:
+            raise RuntimeError(
+                f"{repo_id} is gated: request access at "
+                f"https://huggingface.co/{repo_id}, log in with `hf auth login` "
+                "(or set HF_TOKEN) and rerun. Alternatives: pass a local "
+                "checkpoint as --model_path, or use a model with public weights "
+                "(e.g. --model vggt)."
+            ) from err
+
     def _announce_weights(self, model_path: str) -> None:
         """Print whether ``model_path`` is local, cached, or about to download.
 

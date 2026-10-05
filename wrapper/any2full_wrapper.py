@@ -19,8 +19,9 @@ point cloud unprojected from it) changes::
 The output folder defaults to a sibling of the input with ``sparse`` swapped
 for ``dense`` (``sparse_vggt_epo`` → ``dense_vggt_epo``).
 
-Weights: ``third_party/Any2Full/checkpoints/Any2Full_vitl.pth.tar``
-(https://huggingface.co/zhiyuandaily/Any2Full/tree/main/checkpoints).
+Weights: ``third_party/Any2Full/checkpoints/Any2Full_vitl.pth.tar`` if present,
+else the copy downloaded from https://huggingface.co/zhiyuandaily/Any2Full into
+the Hugging Face cache on first use.
 """
 
 import os
@@ -54,6 +55,7 @@ from helpers.reprojection import undistort_pixels  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+HF_REPO = "zhiyuandaily/Any2Full"
 DEFAULT_CHECKPOINT = os.path.join(
     _ANY2FULL_ROOT, "checkpoints", "Any2Full_vitl.pth.tar"
 )
@@ -125,10 +127,16 @@ class Any2FullWrapper:
 
     def _load_model(self, model_path: str, encoder: str) -> Any2Full:
         """Build Any2Full and load ``model_path`` into it."""
+        if model_path == DEFAULT_CHECKPOINT and not os.path.exists(model_path):
+            from huggingface_hub import hf_hub_download
+
+            # Not in the submodule: fetch (first run) or reuse the HF-cache copy.
+            filename = os.path.relpath(model_path, _ANY2FULL_ROOT)
+            model_path = hf_hub_download(HF_REPO, filename)
         if not os.path.exists(model_path):
             raise FileNotFoundError(
                 f"Any2Full checkpoint not found at {model_path}. Download it from "
-                "https://huggingface.co/zhiyuandaily/Any2Full/tree/main/checkpoints"
+                f"https://huggingface.co/{HF_REPO}/tree/main/checkpoints"
             )
         model = Any2Full(encoder=encoder, da_ckpt_path=None, args=self.args)
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)

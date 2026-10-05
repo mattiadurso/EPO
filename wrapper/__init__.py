@@ -1,15 +1,18 @@
 """Shared registry for the wrapper/ 3D foundation model wrappers.
 
 Selecting a model (``vggt``, ``vggt_omega``, ...) resolves to a (module,
-class, default weights path or URL — downloaded/cached via torch.hub when a
-URL) triple; the module is imported lazily via ``load_wrapper_class`` so
-only the selected backend's dependencies are needed. Every wrapper must
-expose the ``VGGTWrapper`` interface: ``ctor(model_path, cuda_id=...,
-oom_safe=...)`` and ``forward(images_path, output_path, ...)``.
+class, default weights path or URL — downloaded/cached on first load) triple;
+the module is imported lazily via ``load_wrapper_class`` so only the selected
+backend's dependencies are needed, and those are fetched on first use (its
+third_party/ submodules + pyproject's ``[<model>]`` extra, see ``deps.py``).
+Every wrapper must expose the ``VGGTWrapper`` interface: ``ctor(model_path,
+cuda_id=..., oom_safe=...)`` and ``forward(images_path, output_path, ...)``.
 """
 
 import importlib
 import logging
+
+from .deps import ensure_deps
 
 # Third-party libraries the wrappers pull in log a lot at INFO (model loading,
 # DINO internals, HF Hub HTTP requests, …). They show up because EPO calls
@@ -86,7 +89,8 @@ WRAPPERS = {
 
 
 def load_wrapper_class(name: str):
-    """Import and return the wrapper class registered under ``name``."""
+    """Fetch ``name``'s dependencies, then import and return its wrapper class."""
     module_name, class_name, _ = WRAPPERS[name]
+    ensure_deps(name)
     module = importlib.import_module(f".{module_name}", __name__)
     return getattr(module, class_name)

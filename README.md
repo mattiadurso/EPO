@@ -57,7 +57,6 @@ The gain is on ScanNet++ (+7.4) and TerraSky3D (+2.4); ETH3D (−0.3) and Mip-Ne
 `--3dgsfy` turns EPO's refined cameras into a 3D Gaussian Splatting scene in one forward pass of [ReSplat](https://github.com/cvg/resplat) (no per-scene training), as an alternative or addition to `--densify`:
 
 ```bash
-bash scripts/install_resplat.sh       # once, inside the epo env
 python demo_epo.py \
     --model vggt_omega \
     --images_path bicycle/images \
@@ -77,7 +76,7 @@ Better poses give better splats. Novel views on Mip-NeRF 360 (all 9 scenes, ever
 
 EPO closes 70 % of the PSNR gap between VGGT-Omega's and COLMAP's poses.
 
-The installer sets everything up inside the existing `epo` env: it fetches the `third_party/resplat` submodule, applies [third_party/patches/resplat_many_views.patch](third_party/patches/resplat_many_views.patch) (chunks ReSplat's cost volume, point transformer and renderer over views so ~150 views fit in memory; same maths), installs NVIDIA's pip `nvcc` matching torch's CUDA (no system CUDA toolkit needed), builds `gsplat` 1.5.3 and `pointops`, and adds a few pure-Python deps without upgrading any existing package. The weights download from the Hugging Face Hub on first use. If `pip` hangs on an unreachable extra index from your pip config, run it as `PIP_CONFIG_FILE=/dev/null bash scripts/install_resplat.sh`.
+The first `--3dgsfy` run sets everything up inside the current env with [scripts/install_resplat.sh](scripts/install_resplat.sh) (a few minutes, once; you can also run it yourself): it fetches the `third_party/resplat` submodule, applies [third_party/patches/resplat_many_views.patch](third_party/patches/resplat_many_views.patch) (chunks ReSplat's cost volume, point transformer and renderer over views so ~150 views fit in memory; same maths), installs NVIDIA's pip `nvcc` matching torch's CUDA (no system CUDA toolkit needed), builds `gsplat` 1.5.3 and `pointops`, and adds a few pure-Python deps without upgrading any existing package. The weights download from the Hugging Face Hub on first use. If `pip` hangs on an unreachable extra index from your pip config, prefix the command with `PIP_CONFIG_FILE=/dev/null`.
 
 ### v1.2 — EPO is now even faster 🚀
 
@@ -109,44 +108,36 @@ This writes a `dense_<model>_epo` COLMAP model next to `sparse_<model>_epo`. See
 - CUDA-compatible GPU
 - One of: [Conda](https://docs.conda.io/en/latest/) **or** `python3-venv` (any pip-only flow)
 
-### Option A — Conda Environment File
+### Quick start (recommended)
 
 ```bash
-git clone --recursive https://github.com/mattiadurso/epo.git
+git clone https://github.com/mattiadurso/epo.git
 cd epo
+conda create -n epo python=3.10 -y && conda activate epo   # or any Python >= 3.10 venv
+pip install -e .
 
+python demo_epo.py --images_path path/to/images --output_path out/my_scene
+```
+
+That is all the setup: the first run of a model (or of `--densify` / `--3dgsfy`) fetches what it needs and caches it (see [Submodules](#submodules)). The default model, VGGT-Omega, has gated weights: request access at [facebook/VGGT-Omega](https://huggingface.co/facebook/VGGT-Omega) and run `hf auth login` once, or add `--model vggt` to start with public weights. Only `mylib`, used by the demo notebooks (`demo.ipynb`), is a separate install: `pip install git+https://github.com/mattiadurso/mylib.git`.
+
+### Alternative — the exact conda environment
+
+[environment.yml](environment.yml) pins every package to the versions behind the reported numbers (torch 2.11, CUDA 13 wheels):
+
+```bash
+git clone https://github.com/mattiadurso/epo.git
+cd epo
 conda env create -f environment.yml
 conda activate epo
+pip install -e .
 ```
 
-### Option B — Conda + Manual Pip Install
-
-```bash
-conda create -n epo python=3.10 -y
-conda activate epo
-
-pip install joblib \
-            kornia \
-            matplotlib \
-            numpy \
-            opencv-python \
-            pandas \
-            pycolmap \
-            rerun-sdk \
-            torch \
-            torchvision \
-            triton \
-            tqdm
-
-# Only needed to run the demo notebooks (demo.ipynb); not required for the library or demo_epo.py
-pip install git+https://github.com/mattiadurso/mylib.git
-```
-
-> ℹ️ `triton` is Linux-only and requires a CUDA build of `torch`. On systems without CUDA, install `torch` from the [official selector](https://pytorch.org/get-started/locally/) first, then run the rest of the `pip install` line without `triton` — EPO will fall back to the PyTorch reference path (`backend="torch"`).
+> ℹ️ `triton` is Linux-only (pyproject only installs it there) and requires a CUDA build of `torch`. On systems without CUDA, install `torch` from the [official selector](https://pytorch.org/get-started/locally/) first, then run `pip install -e .`; EPO will fall back to the PyTorch reference path (`backend="torch"`).
 
 ### Submodules
 
-[wrapper/](wrapper) provides swappable drivers for several 3D foundation models, each a thin driver over a pristine git submodule under [third_party/](third_party) plus the shared pycolmap-4 conversion helper [wrapper/np_to_colmap.py](wrapper/np_to_colmap.py) and the common base class [wrapper/base_wrapper.py](wrapper/base_wrapper.py). Select one via `--model` on [demo_epo.py](demo_epo.py) (default `vggt`); the full list lives in the `WRAPPERS` registry in [wrapper/\_\_init\_\_.py](wrapper/__init__.py):
+[wrapper/](wrapper) provides swappable drivers for several 3D foundation models, each a thin driver over a pristine git submodule under [third_party/](third_party) plus the shared pycolmap-4 conversion helper [wrapper/np_to_colmap.py](wrapper/np_to_colmap.py) and the common base class [wrapper/base_wrapper.py](wrapper/base_wrapper.py). Select one via `--model` on [demo_epo.py](demo_epo.py) (default `vggt_omega`); the full list lives in the `WRAPPERS` registry in [wrapper/\_\_init\_\_.py](wrapper/__init__.py):
 
 | `--model`     | Submodule                                                     | Wrapper                                                           |
 |---------------|----------------------------------------------------------------|--------------------------------------------------------------------|
@@ -163,21 +154,28 @@ Each wrapper is also runnable on its own for a quick smoke test — handy to che
 python wrapper/vggt_wrapper.py --images_path scene/images/1 --output_path out/sparse
 ```
 
-Only `vggt`'s submodule is needed to run EPO's own demo/reconstructions; EPO refines any reconstruction in the expected layout without any of them. [third_party/lightglue](third_party/lightglue) is a further submodule needed **only** for VGGT's optional Bundle-Adjustment path (`use_ba=True`); the default feed-forward path — including [demo_epo.py](demo_epo.py) — never imports it. If you cloned without `--recursive`:
+A standalone run downloads its weights but does not fetch the submodule or packages (see below), so use a model once through [demo_epo.py](demo_epo.py) first, or install its extra, e.g. `pip install -e ".[vggt]"`.
+
+Only `vggt`'s submodule is needed to run EPO's own demo/reconstructions; EPO refines any reconstruction in the expected layout without any of them. [third_party/lightglue](third_party/lightglue) is a further submodule needed **only** for VGGT's optional Bundle-Adjustment path (`use_ba=True`); the default feed-forward path — including [demo_epo.py](demo_epo.py) — never imports it.
 
 [wrapper/any2full_wrapper.py](wrapper/any2full_wrapper.py) (over [third_party/Any2Full](third_party/Any2Full)) is a different kind of driver and is therefore **not** in the `WRAPPERS` registry: it takes an existing COLMAP reconstruction whose depths are sparse — EPO's own export, whose `depths.pth` only carries depth at the sampled edge pixels — and completes them into dense maps, passing the poses through untouched. See [Densifying EPO's depths](#densifying-epos-depths).
 
 [wrapper/resplat_wrapper.py](wrapper/resplat_wrapper.py) (over [third_party/resplat](third_party/resplat)) is likewise outside the registry: it reads a posed COLMAP reconstruction plus its images and predicts 3D Gaussians, written as a world-frame `gaussians.ply` (see [v1.3](#v13--feed-forward-3d-gaussians-via-resplat); setup: `bash scripts/install_resplat.sh`).
 
+**Everything a model needs is fetched on first use.** The first time [demo_epo.py](demo_epo.py) loads a `--model` (or runs `--densify` / `--3dgsfy`), [wrapper/deps.py](wrapper/deps.py):
+
+- checks out its submodule(s) if you cloned without `--recursive`;
+- pip-installs the missing packages of its extra in [pyproject.toml](pyproject.toml) (e.g. `einops` for `vggt`, `uniception` for `mapanything`). Nothing already installed is upgraded, and the upstream `requirements.txt` files are never used, as their pinned `torch`/`numpy` versions would downgrade and break the EPO environment;
+- downloads the weights on load (Hugging Face / torch.hub caches; Any2Full's go to the Hugging Face cache unless `third_party/Any2Full/checkpoints/Any2Full_vitl.pth.tar` exists).
+
+To fetch everything up front instead:
+
 ```bash
 git submodule update --init --recursive
+pip install -e ".[all]"       # or a single model, e.g. pip install -e ".[dvlt]"
 ```
 
-To actually **run** a model (e.g. via [demo_epo.py](demo_epo.py)), also install its dependencies — see the top of each wrapper module for the exact extras and any model-specific gotchas (e.g. `vggt_omega`'s checkpoint is gated on Hugging Face: request access, then pass a local path via `--model_path`). For VGGT itself, install only these extras — do **not** run `pip install -r third_party/vggt/requirements.txt`, as its pinned `torch`/`numpy` versions would downgrade and break the EPO environment:
-
-```bash
-pip install huggingface_hub einops safetensors
-```
+`--3dgsfy` additionally builds ReSplat's CUDA extensions on first use (a few minutes, once; this is [scripts/install_resplat.sh](scripts/install_resplat.sh), which you can also run yourself). The only manual step is `vggt_omega`'s gated checkpoint: request access at [facebook/VGGT-Omega](https://huggingface.co/facebook/VGGT-Omega) and log in with `hf auth login` (the download then uses your token), or pass a local file via `--model_path`.
 ### 3DFM Results
 
 We report models results averaged by dataset at [mattiadurso.com/epo](https://mattiadurso.com/epo).

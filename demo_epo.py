@@ -36,7 +36,7 @@ import time
 import torch
 
 from epo import EPO
-from wrapper import WRAPPERS, load_wrapper_class
+from wrapper import WRAPPERS, ensure_deps, load_wrapper_class
 
 
 def main():
@@ -127,6 +127,12 @@ def main():
         "WRAPPERS registry entry for --model.",
     )
     args = parser.parse_args()
+
+    # First use of --densify / --3dgsfy: fetch their submodules + packages now,
+    # not after the model and EPO have run (--model's are fetched on load).
+    for stage, requested in (("any2full", args.densify), ("resplat", args.splat)):
+        if requested:
+            ensure_deps(stage)
 
     t_wall_start = time.perf_counter()  # wall-clock incl. all I/O
     model_fwd_time = 0.0  # model forward (set in the live-run branch)

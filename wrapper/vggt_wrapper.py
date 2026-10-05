@@ -100,13 +100,11 @@ class VGGTWrapper(BaseWrapper):
         model = VGGT()
         # mmap reads the tensors straight from the file instead of copying the
         # whole checkpoint through host memory (1.40s -> 0.06s here). It needs a
-        # path, so only load_state_dict_from_url's *download* is used, and only
-        # when the weights are not cached yet.
+        # path, so weights that are not on disk yet are downloaded first.
         local_file = self._resolve_weights_file(model_path)
-        if local_file is not None:
-            state_dict = torch.load(local_file, map_location="cpu", mmap=True)
-        else:
-            state_dict = torch.hub.load_state_dict_from_url(model_path)
+        if local_file is None:
+            local_file = self._download_weights(model_path)
+        state_dict = torch.load(local_file, map_location="cpu", mmap=True)
         model.load_state_dict(state_dict)
         model.eval()
         model = model.to(self.device)

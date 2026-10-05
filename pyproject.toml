@@ -9,17 +9,60 @@ description = "Edge-based Pose Optimization for 3D foundation model reconstructi
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Mattia D'Urso", email = "mattiadurso98@gmail.com" }]
+# EPO itself. Each 3D foundation model / post-processing stage has an extra
+# below, which demo_epo.py pip-installs on first use (wrapper/deps.py), so
+# `pip install -e .` is all a fresh env needs.
 dependencies = [
-    "torch>=2.4",
+    # < 2.14: its headers need C++20, which gsplat 1.5.3 (--3dgsfy) can't build with.
+    "torch>=2.4,<2.14",
     "torchvision>=0.19",
-    "triton>=3.0",
+    "triton>=3.0; sys_platform == 'linux'",
     "kornia>=0.7",
     "pycolmap>=4.0",
     "numpy>=1.26",
     "tqdm>=4.66",
     "matplotlib>=3.8",
     "pandas>=2.0",
+    "pillow",
+    "opencv-python",
+    "scikit-learn",
+    "joblib",
+    "rerun-sdk",
+    "huggingface_hub",
+    "packaging",
+    "tomli; python_version < '3.11'",
 ]
+
+# Per model (wrapper/__init__.py's WRAPPERS keys) and post-processing stage
+# (--densify: any2full, --3dgsfy: resplat). Only what the code EPO runs
+# imports, not the upstream repos' full requirement lists.
+[project.optional-dependencies]
+vggt = ["einops"]
+vggt_omega = ["einops"]
+dvlt = ["accelerate", "hydra-core", "open3d"]
+da3 = ["moviepy<2", "addict", "evo", "omegaconf", "plyfile", "trimesh"]
+mapanything = ["hydra-core", "uniception==0.1.7"]
+pi3x = ["safetensors"]
+any2full = []
+# gsplat + pointops are CUDA builds (scripts/install_resplat.sh, run on first
+# --3dgsfy); gsplat goes in with --no-deps, so its runtime dep rich is listed here.
+resplat = [
+    "colorspacious==1.1.2",
+    "dacite==1.8.1",
+    "e3nn==0.5.1",
+    "einops",
+    "hydra-core",
+    "jaxtyping",
+    "lpips==0.1.4",
+    "moviepy",
+    "plyfile",
+    "pytorch-lightning",
+    "rich",
+    "scikit-image",
+    "sk-video==1.1.10",
+    "wandb",
+]
+all = ["epo[vggt,vggt_omega,dvlt,da3,mapanything,pi3x,any2full,resplat]"]
 
 [tool.setuptools]
 py-modules = ["epo"]

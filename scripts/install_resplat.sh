@@ -16,6 +16,13 @@ RESPLAT="$ROOT/third_party/resplat"
 PATCH="$ROOT/third_party/patches/resplat_many_views.patch"
 PY="${PYTHON:-python}"
 
+# gsplat 1.5.3 forces C++17, but torch >= 2.14's headers need C++20.
+if ! "$PY" -c "import sys, torch; sys.exit(tuple(map(int, torch.__version__.split('.')[:2])) >= (2, 14))"; then
+  echo "ReSplat's gsplat 1.5.3 cannot be built against torch $("$PY" -c 'import torch; print(torch.__version__)')." >&2
+  echo "Use torch < 2.14 (environment.yml pins 2.11), e.g. pip install 'torch<2.14' 'torchvision<0.29'." >&2
+  exit 1
+fi
+
 # 1. Source + patch: chunks the cost volume, the point transformer and the
 #    renderer over views/points so ~150 views fit in 24 GB (same maths).
 git -C "$ROOT" submodule update --init third_party/resplat
@@ -42,13 +49,16 @@ export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-$ARCH}"
 
 # 3. CUDA extensions. gsplat 1.5.3 is the version the EPO numbers used;
 #    pointops is built from a clean copy so no stale objects get reused.
+#    ninja parallelizes the compile (pip's copy if there is none on PATH).
+command -v ninja >/dev/null || "$PY" -m pip install ninja
 "$PY" -m pip install --no-build-isolation --no-deps --no-binary gsplat gsplat==1.5.3
 cp -r "$RESPLAT/src/model/encoder/pointops" "$BUILD/pointops"
 rm -rf "$BUILD/pointops/build" "$BUILD"/pointops/*.egg-info
 "$PY" -m pip install --no-build-isolation --no-deps "$BUILD/pointops"
 
-# 4. Pure-Python deps imported by ReSplat's config / model modules.
-"$PY" -m pip install dacite==1.8.1 e3nn==0.5.1 sk-video==1.1.10 lpips==0.1.4 \
-  colorspacious==1.1.2
+# 4. Pure-Python deps imported by ReSplat's config / model modules: the
+#    missing ones of pyproject.toml's [resplat] extra.
+"$PY" -c "import sys; sys.path.insert(0, '$ROOT'); \
+from wrapper.deps import ensure_extra; ensure_extra('resplat')"
 
 "$PY" -c "import gsplat, pointops, e3nn; print('ReSplat ready: demo_epo.py --3dgsfy')"

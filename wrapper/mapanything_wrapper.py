@@ -1,9 +1,9 @@
 """Standalone MapAnything wrapper for EPO.
 
 Drop-in replacement for ``VGGTWrapper`` backed by the pristine
-facebookresearch/map-anything clone at ``third_party/mapanything``
-(pip-installed editable, no-deps). Same ``forward()`` signature and
-``(ff_data, reconstruction, depths)`` return, so the two wrappers swap 1:1:
+facebookresearch/map-anything clone at ``third_party/mapanything``. Same
+``forward()`` signature and ``(ff_data, reconstruction, depths)`` return, so
+the two wrappers swap 1:1:
 
     from wrapper.mapanything_wrapper import MapAnythingWrapper
 
@@ -34,11 +34,14 @@ repo id (default ``facebook/map-anything``; the Apache-licensed variant is
 import os
 import sys
 
-# Make this folder importable for the local ``np_to_colmap`` companion,
-# regardless of caller CWD (``mapanything`` itself is pip-installed).
+# Make this folder importable for the local ``np_to_colmap`` companion and the
+# pristine map-anything submodule importable as ``mapanything``, regardless of
+# caller CWD (no pip install of the submodule needed).
 _HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+_ROOT = os.path.dirname(_HERE)
+for _p in (_HERE, os.path.join(_ROOT, "third_party", "mapanything")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import gc  # noqa: E402
 import time  # noqa: E402
