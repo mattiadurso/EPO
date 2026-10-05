@@ -104,9 +104,12 @@ This writes a `dense_<model>_epo` COLMAP model next to `sparse_<model>_epo`. See
 
 ### Prerequisites
 
-- Python 3.10
-- CUDA-compatible GPU
-- One of: [Conda](https://docs.conda.io/en/latest/) **or** `python3-venv` (any pip-only flow)
+- Linux with an NVIDIA GPU (EPO needs CUDA; CPU is not supported). `pip` installs torch built for CUDA 13, which needs NVIDIA driver ≥ 580 (shown by `nvidia-smi`). With an older driver, install the CUDA 12.6 build before `pip install -e .`, which then keeps it (`--3dgsfy`'s one-time build expects the CUDA 13 wheels):
+  ```bash
+  pip install "torch<2.14" "torchvision<0.29" --index-url https://download.pytorch.org/whl/cu126
+  ```
+- Python ≥ 3.10 (tested on 3.10), via [Conda](https://docs.conda.io/en/latest/) or `python3-venv`.
+- `git`, to fetch a model's submodule on its first use, and for `--3dgsfy` only a C++ compiler (`g++`) for ReSplat's one-time CUDA build.
 
 ### Quick start (recommended)
 
@@ -132,8 +135,6 @@ conda env create -f environment.yml
 conda activate epo
 pip install -e .
 ```
-
-> ℹ️ `triton` is Linux-only (pyproject only installs it there) and requires a CUDA build of `torch`. On systems without CUDA, install `torch` from the [official selector](https://pytorch.org/get-started/locally/) first, then run `pip install -e .`; EPO will fall back to the PyTorch reference path (`backend="torch"`).
 
 ### Submodules
 
