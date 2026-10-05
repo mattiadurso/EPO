@@ -1,4 +1,4 @@
-"""SIMPLE_RADIAL cameras on EPO's GD path (``radial_distortion=True``).
+"""SIMPLE_RADIAL cameras on EPO's GD path (``camera_model="SIMPLE_RADIAL"``).
 
 Checks:
   1. ``undistort_pixels`` inverts the distortion the projection applies.
@@ -10,6 +10,7 @@ Checks:
      (the k1 / focal gradient flows through the undistorted pixels).
   6. ``k1 = 0`` reproduces the pinhole kernels.
   7. ``CameraModule(radial=True)`` exposes k1 and a SIMPLE_RADIAL export.
+  8. ``EPO(camera_model=...)`` rejects models it cannot refine.
 """
 
 from __future__ import annotations
@@ -223,3 +224,12 @@ def test_camera_module_radial():
                        grad=False, device="cpu")  # fmt: skip
     assert pin.get_k1(None) is None
     assert pin.get_camera_parameters("a")[0] == "SIMPLE_PINHOLE"
+
+
+@cuda
+def test_epo_rejects_unknown_camera_model():
+    """Only SIMPLE_PINHOLE / SIMPLE_RADIAL; checked before anything is loaded."""
+    from epo import EPO
+
+    with pytest.raises(ValueError, match="camera_model"):
+        EPO(reconstruction_path="/nonexistent", camera_model="OPENCV")

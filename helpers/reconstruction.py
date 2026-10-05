@@ -314,9 +314,10 @@ def build_reconstruction(
         params[2] = (params[2] + 0.5) / sy  # cy
         scale = sx
         model = pycolmap.CameraModelId.SIMPLE_PINHOLE
-        # The self-calibrated radial term is defined on normalised
-        # coordinates, so it carries over unchanged (COLMAP SIMPLE_RADIAL).
-        if k1 != 0.0:
+        # Exported in the camera model EPO refined; the self-calibrated
+        # radial term is defined on normalised coordinates, so it carries
+        # over unchanged (COLMAP SIMPLE_RADIAL).
+        if epo.camera_model == "SIMPLE_RADIAL":
             model = pycolmap.CameraModelId.SIMPLE_RADIAL
             params = np.append(params, k1)
 

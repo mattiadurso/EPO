@@ -75,6 +75,10 @@ warnings.filterwarnings(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Camera models EPO can refine (and exports in). SIMPLE_RADIAL adds one radial
+# distortion term k1 per camera, self-calibrated with the focal.
+CAMERA_MODELS = ("SIMPLE_PINHOLE", "SIMPLE_RADIAL")
+
 
 class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
     """Edge-based Pose Optimization (EPO).
@@ -134,11 +138,11 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             ``use_mlp_pose_refinement`` is True.
         grad_t_offset: Whether to optimize the per-image translation offset.
         grad_k: Whether to optimize camera intrinsics.
-        radial_distortion: If True (default), each camera also
-            self-calibrates one radial distortion term ``k1`` (COLMAP
-            ``SIMPLE_RADIAL``, ``x_d = x_u (1 + k1 r_u^2)``), starting at 0
-            and trained with the focal (needs ``grad_k``). The export then
-            writes SIMPLE_RADIAL cameras. False gives the pinhole model.
+        camera_model: Camera model refined and exported, one of
+            :data:`CAMERA_MODELS`. ``"SIMPLE_RADIAL"`` (default): each camera
+            also self-calibrates one radial distortion term ``k1`` (``x_d =
+            x_u (1 + k1 r_u^2)``), starting at 0 and trained with the focal
+            (needs ``grad_k``). ``"SIMPLE_PINHOLE"``: focal only.
         grad_z: Whether to optimize per-pixel depth.
         use_mlp_pose_refinement: If True, refine poses via an MLP residual
             instead of the raw q/t parameters.
@@ -210,7 +214,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         grad_t=False,
         grad_t_offset=True,
         grad_k=True,
-        radial_distortion=True,
+        camera_model="SIMPLE_RADIAL",
         grad_z=True,
         use_mlp_pose_refinement=True,
         backend="torch",
@@ -236,6 +240,10 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             raise ValueError(
                 f"EPO requires a CUDA device (got device={device!r}, "
                 f"cuda available={torch.cuda.is_available()})."
+            )
+        if camera_model not in CAMERA_MODELS:
+            raise ValueError(
+                f"camera_model must be one of {CAMERA_MODELS}, got {camera_model!r}"
             )
         self.device = device
         self.dtype = torch.float32
@@ -373,7 +381,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
         self.grad_t = grad_t
         self.grad_t_offset = grad_t_offset
         self.grad_k = grad_k
-        self.radial_distortion = radial_distortion
+        self.camera_model = camera_model
         self.grad_z = grad_z
         self.use_mlp_pose_refinement = use_mlp_pose_refinement
         # BF16 autocast for the pose-refinement MLP's linear stack.
@@ -1714,7 +1722,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             grad=self.grad_k,
             max_num_iterations=self.max_num_iterations,
             warmup_steps=self.warmup_steps,
-            radial=self.radial_distortion,
+            radial=self.camera_model == "SIMPLE_RADIAL",
         )
 
         # Read poses from images
@@ -1950,7 +1958,7 @@ class EPO(nn.Module, MiscModule, ReconstructAndVizModule):
             grad=self.grad_k,
             max_num_iterations=self.max_num_iterations,
             warmup_steps=self.warmup_steps,
-            radial=self.radial_distortion,
+            radial=self.camera_model == "SIMPLE_RADIAL",
         )
 
         # Build PoseModule (world-to-camera convention, same as COLMAP).

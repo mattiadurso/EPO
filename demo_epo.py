@@ -35,7 +35,7 @@ import time
 
 import torch
 
-from epo import EPO
+from epo import CAMERA_MODELS, EPO
 from wrapper import WRAPPERS, ensure_deps, load_wrapper_class
 
 
@@ -70,6 +70,14 @@ def main():
     )
     parser.add_argument(
         "--edges", type=str, default="canny", help="Edge detector for EPO."
+    )
+    parser.add_argument(
+        "--camera_model",
+        type=str,
+        default="SIMPLE_RADIAL",
+        choices=CAMERA_MODELS,
+        help="Camera model EPO refines and exports: SIMPLE_RADIAL (focal + one "
+        "radial distortion term) or SIMPLE_PINHOLE (focal only).",
     )
     parser.add_argument(
         "--max_iterations",
@@ -142,6 +150,7 @@ def main():
     # Shared EPO settings for both the in-memory and disk init paths.
     epo_kwargs = dict(
         detector=args.edges,
+        camera_model=args.camera_model,
         fuse_reduction=True,
         backend="triton",
         use_amp=True,
